@@ -1,3 +1,6 @@
 [submodule "sms-port"]
 	path = sms-port
 	url = https://github.com/chasem-dev/sms-pc-port.git
+[submodule "third_party/nx-hbloader"]
+	path = third_party/nx-hbloader
+	url = https://github.com/switchbrew/nx-hbloader.git

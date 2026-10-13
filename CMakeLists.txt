@@ -37,20 +37,36 @@ target_include_directories(sms PRIVATE ${SMS_SWITCH_DIR}/src)
 # $(DEVKITPRO), so the libraries are named directly; order matters.
 target_link_libraries(sms PRIVATE EGL glapi drm_nouveau)
 
-# The icon: from the disc image given for sms-standalone.nro (the game's
-# memory-card Mario, tools/make_icon.py), else libnx's default; never stored
-# in the repository, and CI builds (no disc) keep the default.
-set(SMS_SWITCH_ICON ${NX_DEFAULT_ICON})
-if(SMS_SWITCH_BUNDLE_DISC AND EXISTS "${SMS_SWITCH_BUNDLE_DISC}")
+# The icon (homebrew menu, HOME menu): SMS_SWITCH_ICON=
+#   steamgriddb (default)  the box art from SteamGridDB, fetched at build time,
+#                          else the disc's memory-card Mario (with a disc)
+#   disc                   the memory-card Mario from SMS_SWITCH_BUNDLE_DISC
+#   default                libnx's icon (what CI and releases use)
+#   /path/to/icon.jpg      your own 256x256 JPEG
+# (tools/make_icon.py; no art is kept in this repository.)
+set(SMS_SWITCH_ICON "steamgriddb" CACHE STRING "steamgriddb, disc, default, or a 256x256 JPEG")
+set(_icon_args "")
+if(SMS_SWITCH_ICON STREQUAL "steamgriddb")
+  list(APPEND _icon_args --steamgriddb)
+endif()
+if(SMS_SWITCH_ICON MATCHES "^(steamgriddb|disc)$" AND SMS_SWITCH_BUNDLE_DISC AND EXISTS "${SMS_SWITCH_BUNDLE_DISC}")
+  list(APPEND _icon_args --disc "${SMS_SWITCH_BUNDLE_DISC}")
+endif()
+set(SMS_SWITCH_ICON_FILE ${NX_DEFAULT_ICON})
+if(SMS_SWITCH_ICON MATCHES "\\.(jpg|jpeg)$")
+  set(SMS_SWITCH_ICON_FILE "${SMS_SWITCH_ICON}")
+elseif(_icon_args)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   execute_process(
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_icon.py
-            --disc "${SMS_SWITCH_BUNDLE_DISC}" --out ${CMAKE_BINARY_DIR}/icon.jpg
-    RESULT_VARIABLE _icon_rc OUTPUT_QUIET ERROR_VARIABLE _icon_err)
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_icon.py ${_icon_args}
+            --out ${CMAKE_BINARY_DIR}/icon.jpg
+    RESULT_VARIABLE _icon_rc OUTPUT_VARIABLE _icon_out ERROR_VARIABLE _icon_err)
   if(_icon_rc EQUAL 0)
-    set(SMS_SWITCH_ICON ${CMAKE_BINARY_DIR}/icon.jpg)
+    set(SMS_SWITCH_ICON_FILE ${CMAKE_BINARY_DIR}/icon.jpg)
+    string(STRIP "${_icon_out}" _icon_out)
+    message(STATUS "sms-switch: ${_icon_out}")
   else()
-    message(WARNING "sms-switch: no icon from the disc (${_icon_err}); using libnx's default")
+    message(WARNING "sms-switch: no icon (${_icon_err}); using libnx's default")
   endif()
 endif()
 
@@ -61,7 +77,7 @@ nx_generate_nacp(sms.nacp
 nx_create_nro(sms
   OUTPUT ${CMAKE_BINARY_DIR}/sms.nro
   NACP sms.nacp
-  ICON ${SMS_SWITCH_ICON})
+  ICON ${SMS_SWITCH_ICON_FILE})
 
 # sms-standalone.nro (optional): the same program with your disc image inside
 # its RomFS, so the SD card needs no image beside it. For your own use only:
@@ -92,7 +108,7 @@ if(SMS_SWITCH_BUNDLE_DISC)
     TARGET sms
     OUTPUT ${CMAKE_BINARY_DIR}/sms-standalone.nro
     NACP sms.nacp
-    ICON ${SMS_SWITCH_ICON}
+    ICON ${SMS_SWITCH_ICON_FILE}
     ROMFS ${_romfs})
   message(STATUS "sms-switch: also building sms-standalone.nro with ${SMS_SWITCH_BUNDLE_DISC} inside")
 endif()

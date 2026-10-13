@@ -37,7 +37,8 @@ jobs:
           set -euo pipefail
           # The job runs as root in the container; the checkout belongs to the runner.
           git config --global --add safe.directory '*'
-          SMS_SWITCH_NATIVE=1 JOBS=$(nproc) ./build.sh
+          # Releases keep libnx's icon: no third-party art is redistributed.
+          SMS_SWITCH_NATIVE=1 JOBS=$(nproc) ./build.sh -DSMS_SWITCH_ICON=default
       - name: Package
         run: |
           set -euo pipefail

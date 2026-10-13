@@ -30,8 +30,20 @@ The first build compiles about 600 game files; later builds only rebuild what ch
 | `SMS_SWITCH_NATIVE=1 ./build.sh` | use an installed devkitPro (`$DEVKITPRO`) instead of Docker |
 | `SMS_SWITCH_DISC=/path/GMSE01.iso ./build.sh` | also build `build/sms-standalone.nro` with that image inside (see below); remembered for later builds, `SMS_SWITCH_DISC=` stops it |
 
+The icon is SteamGridDB's box art for the game (`SMS_SWITCH_ICON=steamgriddb`, the default for local builds), fetched at build time and never stored here; `disc` uses the memory-card Mario from your disc, `default` libnx's icon (what releases use), or give a 256x256 JPEG.
+
 Builds use ccache (in the `sms-switch-build` image, devkitA64 plus ccache, which `build.sh` makes the first time; the cache is `~/.cache/sms-switch/ccache`).
 On a 4-core i5-6600K a first build takes about 3 minutes, a rebuild from scratch from the cache about 30 seconds, and a one-file change about 10 seconds.
+
+### Installed on the HOME menu (NSP)
+
+`SMS_SWITCH_KEYS=/path/to/prod.keys ./build.sh` also packs `build/nsp/sms-switch.nsp`: an installable title with its own HOME menu icon that starts the game with a game's full memory, no R-hold needed.
+Its program is [nx-hbloader](https://github.com/switchbrew/nx-hbloader) (`third_party/`, the homebrew menu's own loader) set to start `sdmc:/switch/sms/sms-standalone.nro` (with `SMS_SWITCH_DISC`) or `sdmc:/switch/sms/sms.nro`; `SMS_SWITCH_NSP_NRO=sdmc:/...` picks another.
+Install it with Goldleaf or DBI; the NRO stays on the SD card, so updating the game is copying a new NRO.
+
+- The keys are your console's: boot the Lockpick_RCM payload from Hekate and dump them to `sdmc:/switch/prod.keys`. Only their path is remembered (`.switch-keys`); they are mounted read-only into the build and never leave your machine.
+- Installing a self-made NSP needs sigpatches on the console.
+- The icon is `SMS_SWITCH_ICON` (below), for the NRO and the NSP alike.
 
 ### With your disc image inside (personal use)
 
