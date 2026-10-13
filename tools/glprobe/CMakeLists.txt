@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(glprobe CXX)
+add_executable(glprobe glprobe.cpp)
+find_package(SDL2 REQUIRED)
+target_include_directories(glprobe PRIVATE ${DEVKITPRO}/portlibs/switch/include)
+target_link_libraries(glprobe PRIVATE SDL2::SDL2 glad EGL glapi drm_nouveau)
+nx_create_nro(glprobe NOICON NONACP OUTPUT ${CMAKE_BINARY_DIR}/glprobe.nro)

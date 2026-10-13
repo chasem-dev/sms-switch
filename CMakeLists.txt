@@ -1,0 +1,72 @@
+cmake_minimum_required(VERSION 3.20)
+project(sms_switch VERSION 0.1.0 LANGUAGES C CXX ASM)
+
+if(NOT NINTENDO_SWITCH)
+  message(FATAL_ERROR "Configure with the devkitPro toolchain: "
+    "-DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake (or use ./build.sh)")
+endif()
+
+set(SMS_SWITCH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/switch)
+
+# The game is built as on the 64-bit PC builds: everything it can point at is
+# kept below 4 GiB (switch/src/low_memory.cpp moves the program there).
+set(SMS_ARCH 64 CACHE STRING "" FORCE)
+# The GameCube compiler's char is signed (-char signed); AArch64's is not.
+add_compile_options(-fsigned-char)
+# Host headers newlib does not have (dlfcn.h, execinfo.h, sys/mman.h, ...),
+# searched after the system's, so the port's own wrappers' #include_next
+# reaches them too.
+add_compile_options("SHELL:-idirafter ${SMS_SWITCH_DIR}/include")
+# Mesa's GL/EGL headers (their pkg-config files are unusable, see below).
+include_directories(SYSTEM ${DEVKITPRO}/portlibs/switch/include)
+
+# No libdl: dlopen/dlsym are switch/src/posix_shims.cpp.
+set(CMAKE_DL_LIBS "")
+# The GX self-tests are desktop programs.
+set(SMS_GX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(sms-port ${CMAKE_BINARY_DIR}/port)
+
+target_sources(sms PRIVATE
+  ${SMS_SWITCH_DIR}/src/low_memory.cpp
+  ${SMS_SWITCH_DIR}/src/posix_shims.cpp
+  ${SMS_SWITCH_DIR}/src/stack_switch.cpp
+  ${SMS_SWITCH_DIR}/src/switch_main.cpp)
+target_include_directories(sms PRIVATE ${SMS_SWITCH_DIR}/src)
+
+# Mesa (OpenGL over nouveau). Its pkg-config files carry an unexpanded
+# $(DEVKITPRO), so the libraries are named directly; order matters.
+target_link_libraries(sms PRIVATE EGL glapi drm_nouveau)
+
+nx_generate_nacp(sms.nacp
+  NAME "Super Mario Sunshine"
+  AUTHOR "sms-switch"
+  VERSION "${PROJECT_VERSION}")
+nx_create_nro(sms
+  OUTPUT ${CMAKE_BINARY_DIR}/sms.nro
+  NACP sms.nacp
+  ICON ${NX_DEFAULT_ICON})
+
+# gx_selftest.nro: the port's GX self-test on the Switch's GL stack (diagnosis).
+option(SMS_SWITCH_GX_SELFTEST "Also build gx_selftest.nro" ON)
+if(SMS_SWITCH_GX_SELFTEST)
+  set(_gx ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/gx)
+  add_executable(gx_selftest
+    ${_gx}/tests/gx_selftest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/msl_math.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/port_cheats.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/port_warp.cpp
+    ${SMS_SWITCH_DIR}/src/gx_selftest_main.cpp
+    ${SMS_SWITCH_DIR}/src/low_memory.cpp
+    ${SMS_SWITCH_DIR}/src/posix_shims.cpp)
+  set_source_files_properties(${_gx}/tests/gx_selftest.cpp PROPERTIES COMPILE_DEFINITIONS main=gx_selftest_main)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/msl_math.c PROPERTIES
+    COMPILE_OPTIONS -ffp-contract=off INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/src)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/port_warp.cpp PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/src/port_include)
+  target_include_directories(gx_selftest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/decomp/include ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/decomp/libs/dolphin/include
+    ${_gx}/src ${SMS_SWITCH_DIR}/src)
+  target_compile_features(gx_selftest PRIVATE cxx_std_17)
+  target_link_libraries(gx_selftest PRIVATE sms_gx EGL glapi drm_nouveau)
+  nx_create_nro(gx_selftest OUTPUT ${CMAKE_BINARY_DIR}/gx_selftest.nro NOICON NONACP)
+endif()

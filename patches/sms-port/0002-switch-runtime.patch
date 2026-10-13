@@ -1,0 +1,305 @@
+Switch runtime hooks in the platform layer (__SWITCH__).
+
+- threads that run game code switch onto their low stacks themselves
+  (PORT_LOW_STACK_CALL, as on 64-bit Windows; sms-switch stack_switch.cpp),
+  since libnx maps every thread stack again above 4 GiB
+- sleep with nanosleep (newlib has no clock_nanosleep), time zone offset from
+  the console (no tm_gmtoff), no signal crash handler (Horizon has no
+  signals), memory probing through sms_switch_read_memory
+- MEM1 from sms_switch_mem1_window: at 0x80000000 unless the loader is there,
+  else another window below 4 GiB, with the SDK's address translations, J3D
+  texture commands, boot info and the renderer following it (decomp-patches
+  switch-01/02, the Android branch's android-02/03 for the Switch)
+
+diff --git a/decomp-patches/switch-01-mem1-addresses.patch b/decomp-patches/switch-01-mem1-addresses.patch
+new file mode 100644
+index 0000000..0eb3e54
+--- /dev/null
++++ b/decomp-patches/switch-01-mem1-addresses.patch
+@@ -0,0 +1,17 @@
++Reason: Android and Switch MEM1 relocation must keep SDK physical/cached aliases consistent with the arena and renderer, without truncating high heap pointers.
++--- a/libs/dolphin/include/dolphin/os.h
+++++ b/libs/dolphin/include/dolphin/os.h
++@@ -174 +174,12 @@
++-#if !DEBUG
+++#if defined(TARGET_PC) && (defined(__ANDROID__) || defined(__SWITCH__))
+++// Android or the Switch may occupy the GameCube addresses. The port reserves
+++// another arena that fits raw u32 pointer slots; CPU cached/uncached aliases
+++// share that mapping, and physical addresses are relative to its base.
+++extern u8* port_mem1_base;
+++#define OSPhysicalToCached(paddr) ((void*)((u64)port_mem1_base + (u32)(paddr)))
+++#define OSPhysicalToUncached(paddr) OSPhysicalToCached(paddr)
+++#define OSCachedToPhysical(caddr) ((u32)((u64)(caddr) - (u64)port_mem1_base))
+++#define OSUncachedToPhysical(ucaddr) OSCachedToPhysical(ucaddr)
+++#define OSCachedToUncached(caddr) ((void*)(caddr))
+++#define OSUncachedToCached(ucaddr) ((void*)(ucaddr))
+++#elif !DEBUG
+diff --git a/decomp-patches/switch-02-j3d-texture-addresses.patch b/decomp-patches/switch-02-j3d-texture-addresses.patch
+new file mode 100644
+index 0000000..bdc1636
+--- /dev/null
++++ b/decomp-patches/switch-02-j3d-texture-addresses.patch
+@@ -0,0 +1,17 @@
++Reason: J3D texture and palette commands must encode MEM1-relative addresses when Android or the Switch relocates the arena.
++--- a/libs/JSystem/src/JRenderer.cpp
+++++ b/libs/JSystem/src/JRenderer.cpp
++@@ -282,0 +283,4 @@
+++#if defined(TARGET_PC) && (defined(__ANDROID__) || defined(__SWITCH__))
+++		// The command needs an arena offset, not a cached CPU pointer.
+++		(u32) (OSCachedToPhysical(image) >> 5) |
+++#else
++@@ -283,0 +288 @@
+++#endif
++@@ -318,0 +324,4 @@
+++#if defined(TARGET_PC) && (defined(__ANDROID__) || defined(__SWITCH__))
+++		// The command needs an arena offset, not a cached CPU pointer.
+++		(u32) (OSCachedToPhysical(tlut) >> 5) |
+++#else
++@@ -319,0 +329 @@
+++#endif
+diff --git a/platform/mods/modhooks.cpp b/platform/mods/modhooks.cpp
+index 2dbb913..45c9ef0 100644
+--- a/platform/mods/modhooks.cpp
++++ b/platform/mods/modhooks.cpp
+@@ -248,6 +248,9 @@ extern "C" void sms_mod_activate(void)
+ 
+ extern "C" uint32_t __OSBusClock;
+ extern "C" uint32_t __OSCoreClock;
++#ifdef __SWITCH__
++extern "C" uint8_t* port_mem1_base;
++#endif
+ extern "C" unsigned long OSGetConsoleType(void);
+ extern "C" void* DVDGetCurrentDiskID(void);
+ 
+@@ -259,6 +262,9 @@ namespace {
+ void fill_boot_info()
+ {
+ 	uint8_t* low = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(0x80000000u));
++#ifdef __SWITCH__
++	low = port_mem1_base; // MEM1 may be elsewhere (port_runtime.cpp)
++#endif
+ 	memcpy(low, DVDGetCurrentDiskID(), 0x20);
+ 	const uint32_t words[][2] = {
+ 		{0x28, 0x01800000u},               // physical memory size
+diff --git a/platform/os/crash_info.cpp b/platform/os/crash_info.cpp
+index 56ff7cc..f7099c1 100644
+--- a/platform/os/crash_info.cpp
++++ b/platform/os/crash_info.cpp
+@@ -85,6 +85,11 @@ void port_crash_emit(PortCrashLine& line)
+ 	line.length = 0;
+ }
+ 
++#ifdef __SWITCH__
++// Copies only from mapped, readable memory (the Switch runtime, sms-switch).
++extern "C" bool sms_switch_read_memory(void* to, uintptr_t from, size_t size);
++#endif
++
+ bool port_crash_read(void* to, uintptr_t from, size_t size)
+ {
+ #ifdef _WIN32
+@@ -94,6 +99,8 @@ bool port_crash_read(void* to, uintptr_t from, size_t size)
+ 	vm_size_t copied = 0;
+ 	return vm_read_overwrite(mach_task_self(), (vm_address_t)from, size, (vm_address_t)to, &copied) == KERN_SUCCESS &&
+ 	       copied == size;
++#elif defined(__SWITCH__)
++	return sms_switch_read_memory(to, from, size);
+ #else
+ 	// The kernel checks the source and fails with EFAULT instead of faulting.
+ 	struct iovec local = {to, size}, remote = {(void*)from, size};
+diff --git a/platform/os/os_core.cpp b/platform/os/os_core.cpp
+index b3a27d9..0ccaf85 100644
+--- a/platform/os/os_core.cpp
++++ b/platform/os/os_core.cpp
+@@ -16,6 +16,9 @@
+ #include <execinfo.h>
+ 
+ extern "C" void port_os_threads_init(void);
++#ifdef __SWITCH__
++extern "C" long sms_switch_utc_offset(time_t t); // the Switch runtime (sms-switch)
++#endif
+ 
+ static void* s_arena_lo;
+ static void* s_arena_hi;
+@@ -39,6 +42,10 @@ extern "C" void port_os_init(void)
+ #ifdef _WIN32
+ 	localtime_s(&lt, &now);
+ 	s64 local = (s64)_mkgmtime(&lt) - 946684800LL;
++#elif defined(__SWITCH__)
++	// newlib has no tm_gmtoff; the console's own time zone rule gives it.
++	(void)lt;
++	s64 local = (s64)now + sms_switch_utc_offset(now) - 946684800LL;
+ #else
+ 	localtime_r(&now, &lt);
+ 	s64 local = (s64)now + lt.tm_gmtoff - 946684800LL;
+diff --git a/platform/os/os_thread.cpp b/platform/os/os_thread.cpp
+index 193c3a7..460bfc4 100644
+--- a/platform/os/os_thread.cpp
++++ b/platform/os/os_thread.cpp
+@@ -184,7 +184,7 @@ LowStack* low_stack()
+ 	g_low_stacks.push_back(ls);
+ 	return ls;
+ }
+-#ifdef _WIN64
++#ifdef PORT_LOW_STACK_CALL
+ void* windows_host_entry(void* argument)
+ {
+ 	LowStack* stack = (LowStack*)argument;
+@@ -261,7 +261,7 @@ void switch_to(OSThread* self, OSThread* next, bool exiting)
+ 		pthread_attr_init(&a);
+ #if UINTPTR_MAX > 0xFFFFFFFFu
+ 		LowStack* ls = low_stack();
+-#ifdef _WIN64
++#ifdef PORT_LOW_STACK_CALL
+ 		pthread_attr_setstacksize(&a, kLowStackSize);
+ 		ls->argument = next;
+ #else
+@@ -271,7 +271,7 @@ void switch_to(OSThread* self, OSThread* next, bool exiting)
+ 		pthread_attr_setstacksize(&a, 1 << 20);
+ 		pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+ #endif
+-#ifdef _WIN64
++#ifdef PORT_LOW_STACK_CALL
+ 		int create_result = pthread_create(&hn->th, &a, windows_host_entry, ls);
+ #else
+ 		int create_result = pthread_create(&hn->th, &a, host_entry, next);
+@@ -289,7 +289,7 @@ void switch_to(OSThread* self, OSThread* next, bool exiting)
+ 	}
+ 	if (exiting) {
+ 		pthread_mutex_unlock(&g_cpu);
+-#ifdef _WIN64
++#ifdef PORT_LOW_STACK_CALL
+ 		port_win64_thread_exit();
+ #else
+ 		pthread_exit(NULL);
+@@ -309,7 +309,7 @@ void switch_to(OSThread* self, OSThread* next, bool exiting)
+ 		// has since been recreated and scheduled (it then has a new Host).
+ 		if (hs->cancelled && (g_cur != self || host_of(self) != hs)) {
+ 			pthread_mutex_unlock(&g_cpu);
+-#ifdef _WIN64
++#ifdef PORT_LOW_STACK_CALL
+ 			port_win64_thread_exit();
+ #else
+ 			pthread_exit(NULL);
+diff --git a/platform/port_runtime.cpp b/platform/port_runtime.cpp
+index cecfc98..58a96d3 100644
+--- a/platform/port_runtime.cpp
++++ b/platform/port_runtime.cpp
+@@ -134,7 +134,9 @@ extern "C" void port_stub_report(void)
+ // atos on macOS) so a crash report names functions and source lines without
+ // the exact binary at hand. Not async-signal-safe: it runs last, after the
+ // rest of the report is written.
+-#ifndef _WIN32
++// Horizon (the Switch) delivers no signals: its crashes are reported by the
++// system (Atmosphere's crash reports), so none of this is built there.
++#if !defined(_WIN32) && !defined(__SWITCH__)
+ static void crash_symbolise(void** bt, int n)
+ {
+ 	char exe[512];
+@@ -341,7 +343,7 @@ static void crash_handler(int sig)
+ 	signal(sig, SIG_DFL);
+ 	raise(sig);
+ }
+-#else
++#elif !defined(__SWITCH__)
+ static void crash_handler(int sig, siginfo_t* si, void* uc)
+ {
+ 	// A fault while reporting ends the process with the original signal;
+@@ -438,7 +440,7 @@ static void crash_handler(int sig, siginfo_t* si, void* uc)
+ 
+ void port_crash_thread_init()
+ {
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__SWITCH__)
+ 	// A separate stack allows the first diagnostic to survive stack exhaustion.
+ 	alignas(16) static thread_local unsigned char crash_stack[64 * 1024];
+ 	stack_t stack = {};
+@@ -457,7 +459,7 @@ void port_install_crash_handlers()
+ 	// Native hardware exceptions keep their Windows status. Translating them
+ 	// through a CRT signal handler would replace it with a generic abort code.
+ 	signal(SIGABRT, crash_handler);
+-#else
++#elif !defined(__SWITCH__)
+ 	// The first backtrace() loads the unwinder, which allocates: do it now.
+ 	void* warm[1];
+ 	backtrace(warm, 1);
+@@ -475,6 +477,10 @@ void port_install_crash_handlers()
+ // few raw low-memory reads (e.g. *(OSModuleInfo**)0x800030C8) work unchanged.
+ u8* port_mem1_base;
+ u32 port_mem1_size;
++#ifdef __SWITCH__
++extern "C" void* sms_switch_mem1_window(u32 size);
++extern "C" void GXPC_SetMemoryWindow(void* base, uint32_t size);
++#endif
+ 
+ #ifndef _WIN32
+ // mmap exactly at `want` without replacing an existing mapping. Linux has
+@@ -514,6 +520,20 @@ static void map_mem1()
+ 			VirtualFree(p, 0, MEM_RELEASE);
+ 		exit(1);
+ 	}
++#elif defined(__SWITCH__)
++	// The Switch runtime (sms-switch) maps a window below 4 GiB for MEM1: at
++	// 0x80000000 unless the homebrew loader has put something there. The SDK's
++	// address translations (decomp-patches/switch-01, -02) and the renderer follow
++	// it; the game's own pointer fields only need it below 4 GiB.
++	void* p = sms_switch_mem1_window(port_mem1_size);
++	if (!p) {
++		port_log("[port] no window below 4 GiB for %u MiB of MEM1\n", mb);
++		exit(1);
++	}
++	if (p != want) {
++		port_log("[port] MEM1 at %p: 0x80000000 is occupied\n", p);
++		GXPC_SetMemoryWindow(p, port_mem1_size);
++	}
+ #else
+ 	void* p = map_exact(want, port_mem1_size);
+ 	if (p != want) {
+diff --git a/src/port_host.h b/src/port_host.h
+index f71ddd5..6c3f3b4 100644
+--- a/src/port_host.h
++++ b/src/port_host.h
+@@ -33,8 +33,9 @@ static inline int port_mkdir(const char* path, int mode)
+ }
+ static inline void port_sleep_until(const struct timespec* deadline)
+ {
+-#ifdef __APPLE__
+-	// macOS has no clock_nanosleep; sleep the remaining monotonic interval.
++#if defined(__APPLE__) || defined(__SWITCH__)
++	// macOS and the Switch's newlib have no clock_nanosleep; sleep the
++	// remaining monotonic interval.
+ 	struct timespec now, rem;
+ 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+ 		return;
+diff --git a/src/port_main.cpp b/src/port_main.cpp
+index d1bf4be..45988f2 100644
+--- a/src/port_main.cpp
++++ b/src/port_main.cpp
+@@ -45,7 +45,7 @@ int main(int argc, char** argv)
+ 		return 1;
+ 	}
+ 	Args a = {argc, argv};
+-#ifdef _WIN64
++#ifdef PORT_LOW_STACK_CALL
+ 	port_win64_stack_call(stack, size, run_game, &a);
+ 	return 0;
+ #endif
+diff --git a/src/port_win64_stack.h b/src/port_win64_stack.h
+index 69b37a1..90ca8e6 100644
+--- a/src/port_win64_stack.h
++++ b/src/port_win64_stack.h
+@@ -1,9 +1,12 @@
+ #ifndef SMS_PORT_WIN64_STACK_H
+ #define SMS_PORT_WIN64_STACK_H
+ #include <stddef.h>
+-#ifdef _WIN64
+-// winpthreads accepts pthread_attr_setstack but ignores its address. Run the
+-// game callback on an explicitly allocated low stack, with matching TEB bounds.
++#if defined(_WIN64) || defined(__SWITCH__)
++// winpthreads accepts pthread_attr_setstack but ignores its address, and libnx
++// maps every thread's stack again at an address of its own (above 4 GiB). Run
++// the game callback on an explicitly allocated low stack (on Windows with
++// matching TEB bounds).
++#define PORT_LOW_STACK_CALL 1
+ void* port_win64_stack_call(void* stack, size_t size, void* (*entry)(void*), void* argument);
+ void port_win64_thread_exit(void) __attribute__((noreturn));
+ #endif

@@ -1,0 +1,103 @@
+Renderer adjustments for the Switch's Mesa (nouveau) GL 4.3 stack (__SWITCH__).
+
+- XF block words read as a whole uvec4 plus a component select, and the copy
+  encoder's divisions by run-time values done in floats with an exact
+  correction: same results, without the code Switch emulators (Eden) misread
+  or cannot run (gx_shader.cpp, gx_render.cpp)
+- the window is the whole display from the start: the Switch's SDL sizes the
+  framebuffer once, at creation (gx_platform.cpp)
+
+diff --git a/platform/gx/src/gx_platform.cpp b/platform/gx/src/gx_platform.cpp
+index f2c1fc4..da13391 100644
+--- a/platform/gx/src/gx_platform.cpp
++++ b/platform/gx/src/gx_platform.cpp
+@@ -343,8 +343,16 @@ bool openWindow(float scale) {
+         const long requested = strtol(e, nullptr, 10);
+         if (requested > 0) windowScale = int(std::min(requested, 16L));
+     }
++#ifdef __SWITCH__
++    // The Switch's SDL sizes the screen's framebuffer once, when the window is
++    // made, so the window is the whole display from the start (a later switch
++    // to fullscreen would leave the picture clipped to the first size).
++    (void)windowScale;
++    const WindowArea layout = {desktop.x, desktop.y, desktop.w, desktop.h};
++#else
+     const WindowArea layout = initialWindowLayout({desktop.x, desktop.y, desktop.w, desktop.h},
+                                                   640.0 * GXPC_GetWidescreen() / 480.0, windowScale);
++#endif
+     s_window = SDL_CreateWindow("Super Mario Sunshine", layout.x, layout.y, layout.w, layout.h,
+                                 SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
+                                 SDL_WINDOW_HIDDEN);
+diff --git a/platform/gx/src/gx_render.cpp b/platform/gx/src/gx_render.cpp
+index bd96a35..036d6fd 100644
+--- a/platform/gx/src/gx_render.cpp
++++ b/platform/gx/src/gx_render.cpp
+@@ -506,6 +506,31 @@ void main() {
+   o_color = vec4(float(byteAt(k)), float(byteAt(k + 1)), float(byteAt(k + 2)), float(byteAt(k + 3))) / 255.0;
+ }
+ )";
++#ifdef __SWITCH__
++// The encoder with its divisions by run-time values done in floats and
++// corrected to the exact integer quotient (operands below 2^23): Mesa's
++// nouveau compiler makes an integer division a subroutine call on Maxwell,
++// which Switch emulators (Eden, yuzu forks) cannot run, and which is slow on
++// the console too. Divisions by constants are left to the compiler.
++static std::string switchEncodeFs() {
++    std::string s = kEncodeFs;
++    auto swap = [&s](const char* from, const char* to) {
++        const size_t at = s.find(from);
++        if (at != std::string::npos) s.replace(at, strlen(from), to);
++    };
++    swap("out vec4 o_color;\n",
++         "out vec4 o_color;\n"
++         "int D(int a, int b) { int q = int(float(a) / float(b)); int r = a - q * b;\n"
++         "  return r < 0 ? q - 1 : r >= b ? q + 1 : q; }\n");
++    swap("x * u_size.z / u_size.x", "D(x * u_size.z, u_size.x)");
++    swap("y * u_size.w / u_size.y", "D(y * u_size.w, u_size.y)");
++    swap("(u_size.x + tileW - 1) / tileW", "D(u_size.x + tileW - 1, tileW)");
++    swap("b / tileBytes", "D(b, tileBytes)");
++    swap("(tile % cols)", "(tile - D(tile, cols) * cols)");
++    swap("(tile / cols)", "D(tile, cols)");
++    return s;
++}
++#endif
+ static GLuint s_encProg, s_encFbo, s_encTex;
+ static GLint s_encUSize, s_encULayout, s_encUBytes;
+ static int s_encRows = 0;
+@@ -1181,7 +1206,11 @@ void rendererInit(float efbScale) {
+     s_copyUMode = glGetUniformLocation(s_copyProg, "u_mode");
+     s_copyURect = glGetUniformLocation(s_copyProg, "u_rect");
+     s_copyUAlphaOne = glGetUniformLocation(s_copyProg, "u_alphaOne");
++#ifdef __SWITCH__
++    s_encProg = compileProgram(kCopyVs, switchEncodeFs().c_str());
++#else
+     s_encProg = compileProgram(kCopyVs, kEncodeFs);
++#endif
+     glUseProgram(s_encProg);
+     glUniform1i(glGetUniformLocation(s_encProg, "u_src"), 0);
+     const GLfloat wholeRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+diff --git a/platform/gx/src/gx_shader.cpp b/platform/gx/src/gx_shader.cpp
+index 4c90bee..4caa518 100644
+--- a/platform/gx/src/gx_shader.cpp
++++ b/platform/gx/src/gx_shader.cpp
+@@ -165,6 +165,20 @@ static void emitLight(std::string& s, uint32_t ctrl, const char* comp, const cha
+ 
+ static std::string genVS(const ShaderKey& k) {
+     std::string s = kVsHeader;
++#ifdef __SWITCH__
++    // Read each XF word as a whole uvec4 and a component select: the same
++    // values, but Switch emulators (Eden, yuzu forks) read the dynamically
++    // indexed uvec4 component that Mesa's nouveau compiler emits as zero,
++    // which leaves every matrix zero and the screen black.
++    auto swap = [&s](const char* from, const char* to) {
++        const size_t at = s.find(from);
++        if (at != std::string::npos) s.replace(at, strlen(from), to);
++    };
++    swap("float X(int i) { return uintBitsToFloat(xf[i >> 2][i & 3]); }",
++         "uint XW(int i) { uvec4 v = xf[i >> 2]; int c = i & 3; return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w; }\n"
++         "float X(int i) { return uintBitsToFloat(XW(i)); }");
++    swap("vec4 C(int w) { uint u = xf[w >> 2][w & 3];", "vec4 C(int w) { uint u = XW(w);");
++#endif
+     char buf[1024];
+     s += "void main() {\n"
+          "  int pm = int(a_mtx.x & 255u);\n"

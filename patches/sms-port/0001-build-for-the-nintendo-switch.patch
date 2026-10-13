@@ -1,0 +1,70 @@
+Build sms-port with the devkitPro Switch toolchain (NINTENDO_SWITCH).
+
+- no -m64 (AArch64 compilers have none), no -fno-pie/-no-pie: an NRO is
+  position independent and the runtime moves it below 4 GiB instead
+- leave out platform/trace/trace.cpp (Linux-only), as on Windows and macOS
+- rename the game's operator new/delete with the cross toolchain's objcopy
+  (the host's cannot rewrite AArch64 objects and left them unchanged)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 091476d..ef04041 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -44,8 +44,11 @@ if(SMS_ARCH STREQUAL "auto")
+     message(WARNING "-m32 does not link here (install gcc-multilib g++-multilib); building -m64")
+   endif()
+ endif()
+-add_compile_options(-m${SMS_ARCH})
+-add_link_options(-m${SMS_ARCH})
++if(NOT NINTENDO_SWITCH)
++  # AArch64 compilers have no -m64: the Switch build is always 64-bit.
++  add_compile_options(-m${SMS_ARCH})
++  add_link_options(-m${SMS_ARCH})
++endif()
+ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+   # RUNPATH, not RPATH: a toolchain's library directory (the launcher's conda
+   # tools add one to every link) then finds only the game's own libraries.
+@@ -121,7 +124,9 @@ endif()
+ # Non-PIE: the game's code and data sit at the same addresses every run, which
+ # 64-bit builds need for pointers in u32 slots and save states need everywhere
+ # (a state holds pointers to the game's vtables and globals).
+-if(SMS_ARCH STREQUAL "64" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
++# A Switch NRO must be position independent; its runtime moves it to the same
++# low address every run instead (sms-switch, switch/src/low_memory.cpp).
++if((SMS_ARCH STREQUAL "64" OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND NOT NINTENDO_SWITCH)
+   list(APPEND SMS_GAME_FLAGS -fno-pie)
+ endif()
+ # Clang rejects the game's pointer-to-int truncations ((int)ptr, (u32)ptr) as
+@@ -302,7 +307,13 @@ elseif(WIN32)
+   set(SMS_OBJCOPY objcopy)
+ else()
+   set(_object_prefix "")
+-  set(SMS_OBJCOPY objcopy)
++  # A cross toolchain's own objcopy (the host's cannot rewrite AArch64
++  # objects for the Switch, and would leave them unchanged).
++  if(CMAKE_CROSSCOMPILING AND CMAKE_OBJCOPY)
++    set(SMS_OBJCOPY ${CMAKE_OBJCOPY})
++  else()
++    set(SMS_OBJCOPY objcopy)
++  endif()
+ endif()
+ file(WRITE ${CMAKE_BINARY_DIR}/game_new_syms.txt
+   "${_object_prefix}_Znw${_sz} __sms_game_new\n${_object_prefix}_Zna${_sz} __sms_game_new_array\n${_object_prefix}_ZdlPv __sms_game_delete\n${_object_prefix}_ZdaPv __sms_game_delete_array\n")
+@@ -321,7 +332,7 @@ list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/gx/")
+ # platform/mods/eclipse is built by cmake/eclipse.cmake, and only with SMS_ECLIPSE.
+ list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/mods/eclipse/")
+ list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/tests/")
+-if(WIN32 OR APPLE)
++if(WIN32 OR APPLE OR NINTENDO_SWITCH)
+   list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/trace/trace\\.cpp$")
+ endif()
+ add_executable(sms ${SMS_PORT_SRC}/port_main.cpp ${SMS_PLATFORM_SOURCES})
+@@ -379,7 +390,7 @@ elseif(APPLE)
+ else()
+   target_link_options(sms PRIVATE -Wl,--defsym=lbl_80004600=0x80004600)
+ endif()
+-if(SMS_ARCH STREQUAL "64" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
++if((SMS_ARCH STREQUAL "64" OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND NOT NINTENDO_SWITCH)
+   target_compile_options(sms PRIVATE -fno-pie)
+   if(NOT APPLE AND NOT WIN32)
+     target_link_options(sms PRIVATE -no-pie)

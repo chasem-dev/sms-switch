@@ -1,0 +1,166 @@
+// Switch start-up and shut-down around the port's own main()
+// (sms-port src/port_main.cpp).
+//
+// Files live beside the NRO (libnx makes its folder the working directory),
+// normally sdmc:/switch/sms/:
+//   *.iso / *.gcm / *.ciso   the disc image (also in rom/)
+//   settings.txt, bindings.txt
+//   save/    memory card files      cache/   shader cache
+//   sms.log  the port's log (stderr), unless started with nxlink
+#include <switch.h>
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string>
+#include "low_memory.h"
+
+
+// A line in the emulator's or debugger's log, before stderr is set up.
+void sms_switch_trace(const char* text)
+{
+	svcOutputDebugString(text, strlen(text));
+}
+
+namespace {
+// Plain storage: switch_start runs before other constructors.
+char g_dir_buf[512] = "sdmc:/switch/sms";
+int g_nxlink_socket = -1;
+
+bool is_disc_image(const char* name)
+{
+	const char* dot = strrchr(name, '.');
+	return dot && (!strcasecmp(dot, ".iso") || !strcasecmp(dot, ".gcm") || !strcasecmp(dot, ".ciso"));
+}
+
+std::string find_disc_image()
+{
+	const std::string g_dir = g_dir_buf;
+	for (const std::string& dir : {g_dir, g_dir + "/rom"}) {
+		DIR* d = opendir(dir.c_str());
+		if (!d)
+			continue;
+		std::string found;
+		while (dirent* e = readdir(d)) {
+			if (is_disc_image(e->d_name)) {
+				found = dir + "/" + e->d_name;
+				break;
+			}
+		}
+		closedir(d);
+		if (!found.empty())
+			return found;
+	}
+	return std::string();
+}
+
+// env.txt beside the NRO: NAME=value lines become environment variables
+// (the PC port's switches, docs/DEVELOPMENT.md in sms-port), as a shell
+// would set them. # starts a comment.
+void load_env_file(const std::string& path)
+{
+	FILE* f = fopen(path.c_str(), "r");
+	if (!f)
+		return;
+	char line[1024];
+	while (fgets(line, sizeof line, f)) {
+		char* s = line;
+		while (*s == ' ' || *s == '\t')
+			s++;
+		if (*s == '#' || *s == '\n' || *s == '\r' || !*s)
+			continue;
+		char* eq = strchr(s, '=');
+		if (!eq)
+			continue;
+		*eq = 0;
+		char* value = eq + 1;
+		for (size_t n = strlen(value); n && (value[n - 1] == '\n' || value[n - 1] == '\r');)
+			value[--n] = 0;
+		for (size_t n = strlen(s); n && (s[n - 1] == ' ' || s[n - 1] == '\t');)
+			s[--n] = 0;
+		setenv(s, value, 1);
+		fprintf(stderr, "[switch] env.txt: %s=%s\n", s, value);
+	}
+	fclose(f);
+}
+
+void log_layout()
+{
+	const LowMemoryInfo* m = sms_switch_low_memory();
+	fprintf(stderr, "[switch] image at 0x%lx (%lu KiB)%s, loaded at 0x%lx\n", (unsigned long)m->image_base,
+	        (unsigned long)(m->image_size >> 10), m->image_moved ? ", moved below 4 GiB" : "",
+	        (unsigned long)m->loaded_at);
+	for (int i = 0; i < m->zone_count; i++)
+		fprintf(stderr, "[switch] low window 0x%lx-0x%lx\n", (unsigned long)m->zones[i].base,
+		        (unsigned long)(m->zones[i].base + m->zones[i].size));
+	fprintf(stderr, "[switch] heap 0x%lx, %lu MiB\n", (unsigned long)m->heap_base,
+	        (unsigned long)(m->heap_size >> 20));
+	if (m->image_base + m->image_size > 0x100000000ULL)
+		fprintf(stderr, "[switch] warning: the program is above 4 GiB; the game will stop at its first "
+		                "pointer that does not fit. Start it again.\n");
+}
+} // namespace
+
+// Before the game's constructors and main().
+__attribute__((constructor(101))) static void switch_start(void)
+{
+	sms_switch_trace("[switch] start");
+	char cwd[512];
+	if (getcwd(cwd, sizeof cwd) && strncmp(cwd, "sdmc:/", 6) == 0 && strlen(cwd) > 6) {
+		snprintf(g_dir_buf, sizeof g_dir_buf, "%s", cwd);
+		for (size_t n = strlen(g_dir_buf); n > 6 && g_dir_buf[n - 1] == '/';)
+			g_dir_buf[--n] = 0;
+	}
+	const std::string g_dir = g_dir_buf;
+	mkdir(g_dir.c_str(), 0777);
+	chdir(g_dir.c_str());
+
+	extern struct in_addr __nxlink_host;
+	if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault()))
+		g_nxlink_socket = nxlinkStdio();
+	if (g_nxlink_socket < 0 && !freopen((g_dir + "/sms.log").c_str(), "w", stderr)) {
+		char line[600];
+		snprintf(line, sizeof line, "[switch] cannot write %s/sms.log (cwd %s): %s", g_dir.c_str(), cwd,
+		         strerror(errno));
+		sms_switch_trace(line);
+	}
+	setvbuf(stderr, NULL, _IONBF, 0);
+	log_layout();
+
+	load_env_file(g_dir + "/env.txt");
+	setenv("HOME", g_dir.c_str(), 0);
+	// The whole screen, at the console's resolution (720p handheld, 1080p
+	// docked); the game's 4:3 picture is centred, or wide with widescreen.
+	setenv("SMS_FULLSCREEN", "1", 0);
+	setenv("XDG_DATA_HOME", (g_dir + "/save").c_str(), 0);
+	setenv("XDG_CACHE_HOME", (g_dir + "/cache").c_str(), 0);
+	if (!getenv("SMS_DISC_IMAGE") && !getenv("SMS_DISC_ROOT")) {
+		std::string disc = find_disc_image();
+		if (!disc.empty())
+			setenv("SMS_DISC_IMAGE", disc.c_str(), 1);
+		else
+			fprintf(stderr, "[switch] no disc image (.iso, .gcm, .ciso) in %s or %s/rom\n", g_dir.c_str(),
+			        g_dir.c_str());
+	}
+}
+
+// The game's threads keep running until the process ends, and the low windows
+// alias the loader's heap, so the program does not return to the homebrew
+// loader: it ends the process, as closing a game does.
+extern "C" void __appExit(void);
+extern "C" void NX_NORETURN __libnx_exit(int rc)
+{
+	char line[64];
+	snprintf(line, sizeof line, "[switch] exit %d", rc);
+	sms_switch_trace(line);
+	fflush(NULL);
+	if (g_nxlink_socket >= 0)
+		close(g_nxlink_socket);
+	__appExit();
+	svcExitProcess();
+}
