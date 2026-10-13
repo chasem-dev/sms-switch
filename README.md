@@ -101,6 +101,12 @@ This repository adds what the Switch needs:
 - **Graphics**: the PC renderer unchanged in kind: OpenGL 3.3 core through SDL2 on devkitPro's Mesa (nouveau, OpenGL 4.3 on the Tegra X1).
   The GX shaders are generated at run time, which rules out deko3d without a shader compiler in the game.
 
+## HD textures
+
+The PC port's texture packs work here too (`sdmc:/switch/sms/mods/textures/`), but a pack made for PCs has textures far larger than the Switch can hold: the UHD pack's 157 textures of 4096-16384 pixels are 2.1 GiB of its 3 GiB, up to 256 MiB of GPU memory each.
+`tools/texpack/make-switch-pack.sh PACK_DIR OUT_DIR [MAX]` makes the Switch's copy: those cut to at most 2048 pixels (their own mip levels where they have them, else decoded, halved and encoded again with [bc7enc](https://github.com/richgel999/bc7enc_rdo)), everything else as it is. The UHD pack becomes 1.3 GiB in about 90 seconds.
+Copy OUT_DIR's contents to `sdmc:/switch/sms/mods/textures/`; `SMS_TEXTURE_PACKS=0` turns them off for a comparison, and at most 1 GiB is kept in memory (`SMS_TEXTURE_PACK_MB`).
+
 ## Quick test loop (nxlink)
 
 To try a build or an option without copying anything to the SD card:

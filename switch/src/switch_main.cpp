@@ -286,6 +286,10 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// stage load) stalled a load for 6 s. Serial: a stage's own programs, and
 	// extras only within 250 ms.
 	setenv("SMS_GX_SHADER_WARMUP_SERIAL", "1", 0);
+	// HD texture packs (mods/textures here): at most 1 GiB resident, not the
+	// PC's 1.5 GiB; the console has about 3 GiB for everything.
+	if (!getenv("SMS_TEXTURE_PACK_MB") && !settings_has(g_dir, "texture_pack_mb"))
+		setenv("SMS_TEXTURE_PACK_MB", "1024", 1);
 	sms_switch_spread_main_thread();
 	sms_switch_start_clocks();
 	if (applet_mode()) {
