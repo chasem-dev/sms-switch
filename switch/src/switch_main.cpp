@@ -121,6 +121,36 @@ std::string find_bundled_disc_image()
 	return std::string();
 }
 
+// Started from the Album (applet mode) instead of through a game (title
+// takeover, hold R): far less memory, too little for the game and Mesa's
+// GPU context (on a 16.0.2 console: 86 MiB left after the game's MEM1,
+// and the window surface could not be made). Say so on screen and wait.
+bool applet_mode()
+{
+	const AppletType type = appletGetAppletType();
+	return type != AppletType_Application && type != AppletType_SystemApplication;
+}
+
+void explain_applet_mode()
+{
+	consoleInit(NULL);
+	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+	PadState pad;
+	padInitializeDefault(&pad);
+	printf("\n\n  Super Mario Sunshine needs more memory than the Album gives homebrew.\n\n"
+	       "  Start it through a game instead: hold R while you start any game,\n"
+	       "  keep holding until the homebrew menu appears, then pick it there.\n\n"
+	       "  (The log is sms.log beside the NRO.)\n\n"
+	       "  Press + to close.\n");
+	while (appletMainLoop()) {
+		padUpdate(&pad);
+		if (padGetButtonsDown(&pad) & (HidNpadButton_Plus | HidNpadButton_A | HidNpadButton_B))
+			break;
+		consoleUpdate(NULL);
+	}
+	consoleExit(NULL);
+}
+
 void log_layout()
 {
 	const LowMemoryInfo* m = sms_switch_low_memory();
@@ -165,6 +195,15 @@ __attribute__((constructor(101))) static void switch_start(void)
 	log_layout();
 
 	load_env_file(g_dir + "/env.txt");
+	if (applet_mode()) {
+		const char* allow = getenv("SMS_SWITCH_ALLOW_APPLET");
+		fprintf(stderr, "[switch] started in applet mode (applet type %d)%s\n", (int)appletGetAppletType(),
+		        allow && *allow == '1' ? "; going on (SMS_SWITCH_ALLOW_APPLET=1)" : "; start it through a game (hold R)");
+		if (!(allow && *allow == '1')) {
+			explain_applet_mode();
+			exit(1);
+		}
+	}
 	setenv("HOME", g_dir.c_str(), 0);
 	// The whole screen, at the console's resolution (720p handheld, 1080p
 	// docked); the game's 4:3 picture is centred, or wide with widescreen.

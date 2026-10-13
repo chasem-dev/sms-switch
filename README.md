@@ -43,7 +43,8 @@ Re-packing the image adds a few seconds to builds that change the program.
 
 1. Download `sms-switch.zip` from the [latest release](https://github.com/chasem-dev/sms-switch/releases) and extract it to the root of the SD card (it holds `switch/sms/sms.nro`), or copy your own `build/sms.nro` to `sdmc:/switch/sms/sms.nro`.
 2. Put the disc image beside it: `sdmc:/switch/sms/` (or `sdmc:/switch/sms/rom/`), as `.iso`, `.gcm` or Dolphin `.ciso`, any file name.
-3. Start it from the homebrew menu. **Use title takeover** (hold R while starting a game, then pick it in the menu) rather than the album applet: the game, its MEM1, the renderer and the disc reads want more memory than applet mode gives.
+3. Start it from the homebrew menu **through a game**: on the HOME menu hold R while starting any game (installed or cartridge) until the homebrew menu appears, then pick it. Nothing is installed; homebrew started that way gets the game's memory.
+   Started from the Album (applet mode) it only shows a message: on a console it had 86 MiB left there, and Mesa could not create the window surface.
 
 Everything else lives in the same folder:
 
