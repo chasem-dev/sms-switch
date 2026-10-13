@@ -19,6 +19,7 @@ cd sms-switch
 ```
 
 That produces `build/sms.nro`.
+[GitHub Actions](.github/workflows/build.yml) builds the same way on every push; pushing a `v*` tag (or running the workflow by hand with a version) publishes a release with `sms-switch.zip`, `sms.nro` and `gx_selftest.nro`.
 The first build compiles about 600 game files; later builds only rebuild what changed.
 
 | Command | What it does |
@@ -30,7 +31,7 @@ The first build compiles about 600 game files; later builds only rebuild what ch
 
 ## Install and play
 
-1. Copy `build/sms.nro` to `sdmc:/switch/sms/sms.nro` on the SD card.
+1. Download `sms-switch.zip` from the [latest release](https://github.com/chasem-dev/sms-switch/releases) and extract it to the root of the SD card (it holds `switch/sms/sms.nro`), or copy your own `build/sms.nro` to `sdmc:/switch/sms/sms.nro`.
 2. Put the disc image beside it: `sdmc:/switch/sms/` (or `sdmc:/switch/sms/rom/`), as `.iso`, `.gcm` or Dolphin `.ciso`, any file name.
 3. Start it from the homebrew menu. **Use title takeover** (hold R while starting a game, then pick it in the menu) rather than the album applet: the game, its MEM1, the renderer and the disc reads want more memory than applet mode gives.
 

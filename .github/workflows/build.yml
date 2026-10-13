@@ -1,0 +1,101 @@
+name: Build
+# Builds sms.nro in the devkitPro image (the same image ./build.sh uses) on
+# every push and pull request, and uploads it as an artifact. A v* tag, or a
+# manual run given a version, also publishes it as a GitHub release: an
+# SD-card-ready zip (switch/sms/sms.nro), the bare sms.nro, and
+# gx_selftest.nro (the renderer's self-test, for diagnosis).
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to create at this commit (for example v0.2.0); leave empty to build only'
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: devkitpro/devkita64:latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build sms.nro
+        run: |
+          set -euo pipefail
+          # The job runs as root in the container; the checkout belongs to the runner.
+          git config --global --add safe.directory '*'
+          SMS_SWITCH_NATIVE=1 JOBS=$(nproc) ./build.sh
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist/sd/switch/sms
+          cp build/sms.nro dist/sd/switch/sms/sms.nro
+          (cd dist/sd && zip -r -9 ../sms-switch.zip switch)
+          cp build/sms.nro build/gx_selftest.nro dist/
+          {
+            echo "sms-switch $(git rev-parse --short HEAD)"
+            echo "sms-port $(git -C sms-port rev-parse --short HEAD)"
+            echo "decomp $(git -C sms-port/decomp rev-parse --short HEAD)"
+          } > dist/versions.txt
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sms-switch
+          path: |
+            dist/sms-switch.zip
+            dist/sms.nro
+            dist/gx_selftest.nro
+            dist/versions.txt
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.version != '')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sms-switch
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          versions=$(cat dist/versions.txt)
+          cat > notes.md <<EOF
+          Super Mario Sunshine PC port as Nintendo Switch homebrew. **No game data is included**: it plays your own GMSE01 (North America, Rev 0) disc image.
+
+          **Install:** extract \`sms-switch.zip\` to the root of the SD card (it holds \`switch/sms/sms.nro\`), put your \`.iso\`, \`.gcm\` or \`.ciso\` in \`sdmc:/switch/sms/\`, and start it from the homebrew menu through title takeover (hold R while starting a game), not the album applet.
+
+          This is an early build: it has run in an emulator (Eden) through the opening, not yet on a console. \`sms.log\` beside the NRO records each run; please attach it to bug reports.
+
+          \`gx_selftest.nro\` is a diagnostic: run it from the same folder and it writes \`gx_selftest.log\` (renderer pixel checks).
+
+          Built from:
+          \`\`\`
+          ${versions}
+          \`\`\`
+          EOF
+          # v0.x releases are pre-releases until the build has run on a console.
+          pre=()
+          [[ "$TAG" == v0.* || "$TAG" == *-* ]] && pre=(--prerelease)
+          gh release create "$TAG" --repo "$REPO" --target "$SHA" --title "sms-switch $TAG" \
+            --notes-file notes.md "${pre[@]}" \
+            dist/sms-switch.zip dist/sms.nro dist/gx_selftest.nro
