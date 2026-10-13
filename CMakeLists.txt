@@ -46,6 +46,40 @@ nx_create_nro(sms
   NACP sms.nacp
   ICON ${NX_DEFAULT_ICON})
 
+# sms-standalone.nro (optional): the same program with your disc image inside
+# its RomFS, so the SD card needs no image beside it. For your own use only:
+# it contains the game, so it must never be shared (CI never builds it).
+#   -DSMS_SWITCH_BUNDLE_DISC=/path/to/GMSE01.iso   (.iso, .gcm or .ciso)
+set(SMS_SWITCH_BUNDLE_DISC "" CACHE FILEPATH "Disc image to pack into sms-standalone.nro (personal use only)")
+# A standalone NRO left from another image (or none now) would be stale:
+# elf2nro reruns only when the program changes.
+if(NOT "${SMS_SWITCH_BUNDLE_DISC}" STREQUAL "${_SMS_SWITCH_BUNDLED}")
+  file(REMOVE ${CMAKE_BINARY_DIR}/sms-standalone.nro)
+  set(_SMS_SWITCH_BUNDLED "${SMS_SWITCH_BUNDLE_DISC}" CACHE INTERNAL "")
+endif()
+if(SMS_SWITCH_BUNDLE_DISC)
+  if(NOT EXISTS "${SMS_SWITCH_BUNDLE_DISC}")
+    message(FATAL_ERROR "SMS_SWITCH_BUNDLE_DISC: ${SMS_SWITCH_BUNDLE_DISC} does not exist")
+  endif()
+  get_filename_component(_disc_ext "${SMS_SWITCH_BUNDLE_DISC}" LAST_EXT)
+  string(TOLOWER "${_disc_ext}" _disc_ext)
+  if(NOT _disc_ext MATCHES "^\\.(iso|gcm|ciso)$")
+    message(FATAL_ERROR "SMS_SWITCH_BUNDLE_DISC: expected an .iso, .gcm or .ciso file")
+  endif()
+  # The RomFS holds only the image, as romfs:/disc<ext> (a link, not a copy).
+  set(_romfs ${CMAKE_BINARY_DIR}/standalone-romfs)
+  file(REMOVE_RECURSE ${_romfs})
+  file(MAKE_DIRECTORY ${_romfs})
+  file(CREATE_LINK "${SMS_SWITCH_BUNDLE_DISC}" ${_romfs}/disc${_disc_ext} SYMBOLIC)
+  nx_create_nro(sms_standalone
+    TARGET sms
+    OUTPUT ${CMAKE_BINARY_DIR}/sms-standalone.nro
+    NACP sms.nacp
+    ICON ${NX_DEFAULT_ICON}
+    ROMFS ${_romfs})
+  message(STATUS "sms-switch: also building sms-standalone.nro with ${SMS_SWITCH_BUNDLE_DISC} inside")
+endif()
+
 # gx_selftest.nro: the port's GX self-test on the Switch's GL stack (diagnosis).
 option(SMS_SWITCH_GX_SELFTEST "Also build gx_selftest.nro" ON)
 if(SMS_SWITCH_GX_SELFTEST)

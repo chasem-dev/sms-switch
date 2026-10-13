@@ -3,7 +3,8 @@
 //
 // Files live beside the NRO (libnx makes its folder the working directory),
 // normally sdmc:/switch/sms/:
-//   *.iso / *.gcm / *.ciso   the disc image (also in rom/)
+//   *.iso / *.gcm / *.ciso   the disc image (also in rom/), unless this is
+//                            sms-standalone.nro, which carries it in its RomFS
 //   settings.txt, bindings.txt
 //   save/    memory card files      cache/   shader cache
 //   sms.log  the port's log (stderr), unless started with nxlink
@@ -89,6 +90,37 @@ void load_env_file(const std::string& path)
 	fclose(f);
 }
 
+// The image packed into sms-standalone.nro's RomFS (romfs:/disc.iso, .gcm or
+// .ciso; CMake's SMS_SWITCH_BUNDLE_DISC), if this is that build.
+std::string find_bundled_disc_image()
+{
+	// hbmenu: the NRO's own file (argv[0]). An emulator starting the NRO
+	// directly passes no path but serves it as the process's data storage
+	// (libnx would take that path itself had low_memory.cpp not given the
+	// moved program a homebrew context).
+	if (R_FAILED(romfsInit())) {
+		if (envHasArgv())
+			return std::string(); // hbmenu started an NRO without a RomFS: sms.nro
+		FsStorage storage;
+		if (R_FAILED(fsOpenDataStorageByCurrentProcess(&storage)))
+			return std::string(); // sms.nro: no RomFS
+		if (R_FAILED(romfsMountFromStorage(storage, 0, "romfs"))) {
+			fsStorageClose(&storage);
+			return std::string();
+		}
+	}
+	for (const char* name : {"romfs:/disc.iso", "romfs:/disc.gcm", "romfs:/disc.ciso"}) {
+		struct stat st;
+		if (stat(name, &st) == 0 && S_ISREG(st.st_mode)) {
+			fprintf(stderr, "[switch] disc image packed in this NRO (%s, %lld MiB)\n", name,
+			        (long long)(st.st_size >> 20));
+			return name;
+		}
+	}
+	romfsExit();
+	return std::string();
+}
+
 void log_layout()
 {
 	const LowMemoryInfo* m = sms_switch_low_memory();
@@ -140,7 +172,10 @@ __attribute__((constructor(101))) static void switch_start(void)
 	setenv("XDG_DATA_HOME", (g_dir + "/save").c_str(), 0);
 	setenv("XDG_CACHE_HOME", (g_dir + "/cache").c_str(), 0);
 	if (!getenv("SMS_DISC_IMAGE") && !getenv("SMS_DISC_ROOT")) {
-		std::string disc = find_disc_image();
+		// sms-standalone.nro carries the image in its RomFS; else the SD card.
+		std::string disc = find_bundled_disc_image();
+		if (disc.empty())
+			disc = find_disc_image();
 		if (!disc.empty())
 			setenv("SMS_DISC_IMAGE", disc.c_str(), 1);
 		else

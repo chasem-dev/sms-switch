@@ -28,6 +28,16 @@ The first build compiles about 600 game files; later builds only rebuild what ch
 | `./build.sh --clean` | delete `build/` first |
 | `JOBS=2 ./build.sh` | limit parallel compiler jobs |
 | `SMS_SWITCH_NATIVE=1 ./build.sh` | use an installed devkitPro (`$DEVKITPRO`) instead of Docker |
+| `SMS_SWITCH_DISC=/path/GMSE01.iso ./build.sh` | also build `build/sms-standalone.nro` with that image inside (see below); remembered for later builds, `SMS_SWITCH_DISC=` stops it |
+
+Builds use ccache (in the `sms-switch-build` image, devkitA64 plus ccache, which `build.sh` makes the first time; the cache is `~/.cache/sms-switch/ccache`).
+On a 4-core i5-6600K a first build takes about 3 minutes, a rebuild from scratch from the cache about 30 seconds, and a one-file change about 10 seconds.
+
+### With your disc image inside (personal use)
+
+`SMS_SWITCH_DISC=/path/to/your.iso ./build.sh` also builds `build/sms-standalone.nro`: the same program with the image packed into its RomFS (the NRO's own read-only file system), so the SD card needs only that one file in `sdmc:/switch/sms/`.
+It contains the game: keep it to yourself, never upload or share it (CI and releases never build it).
+Re-packing the image adds a few seconds to builds that change the program.
 
 ## Install and play
 
