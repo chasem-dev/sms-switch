@@ -28,10 +28,13 @@ add_subdirectory(sms-port ${CMAKE_BINARY_DIR}/port)
 
 target_sources(sms PRIVATE
   ${SMS_SWITCH_DIR}/src/low_memory.cpp
+  ${SMS_SWITCH_DIR}/src/performance.cpp
   ${SMS_SWITCH_DIR}/src/posix_shims.cpp
   ${SMS_SWITCH_DIR}/src/stack_switch.cpp
   ${SMS_SWITCH_DIR}/src/switch_main.cpp)
 target_include_directories(sms PRIVATE ${SMS_SWITCH_DIR}/src)
+# Every thread spread over cores 0-2 (switch/src/performance.cpp).
+target_link_options(sms PRIVATE -Wl,--wrap=threadCreate)
 
 # Mesa (OpenGL over nouveau). Its pkg-config files carry an unexpanded
 # $(DEVKITPRO), so the libraries are named directly; order matters.

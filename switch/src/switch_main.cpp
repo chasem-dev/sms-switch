@@ -22,6 +22,9 @@
 #include "low_memory.h"
 
 
+extern "C" void sms_switch_spread_main_thread(void); // performance.cpp
+extern "C" void sms_switch_start_clocks(void);
+
 // A line in the emulator's or debugger's log, before stderr is set up.
 void sms_switch_trace(const char* text)
 {
@@ -151,6 +154,25 @@ void explain_applet_mode()
 	consoleExit(NULL);
 }
 
+// True if settings.txt in `dir` sets `name` (then it, not a Switch default, wins).
+bool settings_has(const std::string& dir, const char* name)
+{
+	FILE* f = fopen((dir + "/settings.txt").c_str(), "r");
+	if (!f)
+		return false;
+	char line[512];
+	bool found = false;
+	const size_t n = strlen(name);
+	while (!found && fgets(line, sizeof line, f)) {
+		const char* s = line;
+		while (*s == ' ' || *s == '\t')
+			s++;
+		found = strncmp(s, name, n) == 0 && (s[n] == ' ' || s[n] == '\t' || s[n] == '=');
+	}
+	fclose(f);
+	return found;
+}
+
 void log_layout()
 {
 	const LowMemoryInfo* m = sms_switch_low_memory();
@@ -195,6 +217,12 @@ __attribute__((constructor(101))) static void switch_start(void)
 	log_layout();
 
 	load_env_file(g_dir + "/env.txt");
+	// Gameplay at the GameCube's 30 fps unless settings.txt or env.txt asks
+	// for 60 or 120 (the PC port's default is 60, twice the work per second).
+	if (!getenv("SMS_FRAME_RATE") && !settings_has(g_dir, "frame_rate"))
+		setenv("SMS_FRAME_RATE", "30", 1);
+	sms_switch_spread_main_thread();
+	sms_switch_start_clocks();
 	if (applet_mode()) {
 		const char* allow = getenv("SMS_SWITCH_ALLOW_APPLET");
 		fprintf(stderr, "[switch] started in applet mode (applet type %d)%s\n", (int)appletGetAppletType(),
