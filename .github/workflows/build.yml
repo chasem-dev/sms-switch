@@ -25,8 +25,11 @@ jobs:
     runs-on: ubuntu-24.04
     container: devkitpro/devkita64:latest
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - name: Build sms.nro
