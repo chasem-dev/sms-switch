@@ -71,6 +71,17 @@ Everything else lives in the same folder:
 The game fills the screen (720p handheld, 1080p docked) with its 4:3 picture centred; `widescreen = 16:9` in `settings.txt` gives the PC port's widescreen.
 Leaving through HOME ends the game as closing any game does; it does not return to the homebrew menu.
 
+## Controls
+
+Joy-Con and Pro Controllers work as the GameCube controller (the PC port's mapping: A/B/X/Y, + = Start, R = Z, ZL/ZR = L/R, sticks, d-pad).
+
+| | |
+| --- | --- |
+| **L3 + R3** (press both sticks) | show or hide the performance overlay (frame rate, where each frame's time goes) |
+| **−** with the overlay shown | the warp menu (stages and episodes) |
+
+`SMS_OVERLAY=1` in `env.txt` shows the overlay from the start.
+
 ## How it works
 
 The PC port is a native build of the decompilation: game code runs as AArch64 code, with the GameCube SDK replaced by host code (`sms-port/platform/`).

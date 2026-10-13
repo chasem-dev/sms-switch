@@ -8,9 +8,11 @@ Renderer adjustments for the Switch's Mesa (nouveau) GL 4.3 stack (__SWITCH__).
   values, and half the GLSL link time per program on the console's Mesa
 - the window is the whole display from the start: the Switch's SDL sizes the
   framebuffer once, at creation (gx_platform.cpp)
+- both sticks pressed together (L3 + R3) toggle the debug overlay, as the
+  backtick key does on a PC (gx_platform.cpp)
 
 diff --git a/platform/gx/src/gx_platform.cpp b/platform/gx/src/gx_platform.cpp
-index f2c1fc4..da13391 100644
+index f2c1fc4..f61038d 100644
 --- a/platform/gx/src/gx_platform.cpp
 +++ b/platform/gx/src/gx_platform.cpp
 @@ -343,8 +343,16 @@ bool openWindow(float scale) {
@@ -30,6 +32,28 @@ index f2c1fc4..da13391 100644
      s_window = SDL_CreateWindow("Super Mario Sunshine", layout.x, layout.y, layout.w, layout.h,
                                  SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
                                  SDL_WINDOW_HIDDEN);
+@@ -858,6 +866,21 @@ void sms_gx_pump_events(void) {
+             if (ev.type == SDL_KEYDOWN && !ev.key.repeat) GXPC_OverlayToggle();
+             continue;
+         }
++#ifdef __SWITCH__
++        // Both sticks pressed together toggle the debug overlay: the Switch
++        // has no backtick key, and the GameCube controller no stick clicks
++        // (L3/R3 are unbound by default, so the presses still reach the pad
++        // layer for anyone who binds them).
++        if ((ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) &&
++            (ev.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSTICK ||
++             ev.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSTICK)) {
++            static bool stickHeld[2];
++            const int i = ev.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSTICK;
++            const bool down = ev.type == SDL_CONTROLLERBUTTONDOWN;
++            if (down && !stickHeld[i] && stickHeld[!i]) GXPC_OverlayToggle();
++            stickHeld[i] = down;
++        }
++#endif
+         // F9 opens and closes the cheat menu and is kept from the pad layer
+         if ((ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) && ev.key.keysym.scancode == SDL_SCANCODE_F9) {
+             if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
 diff --git a/platform/gx/src/gx_render.cpp b/platform/gx/src/gx_render.cpp
 index bd96a35..036d6fd 100644
 --- a/platform/gx/src/gx_render.cpp
