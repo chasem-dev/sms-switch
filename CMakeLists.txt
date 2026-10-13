@@ -37,6 +37,23 @@ target_include_directories(sms PRIVATE ${SMS_SWITCH_DIR}/src)
 # $(DEVKITPRO), so the libraries are named directly; order matters.
 target_link_libraries(sms PRIVATE EGL glapi drm_nouveau)
 
+# The icon: from the disc image given for sms-standalone.nro (the game's
+# memory-card Mario, tools/make_icon.py), else libnx's default; never stored
+# in the repository, and CI builds (no disc) keep the default.
+set(SMS_SWITCH_ICON ${NX_DEFAULT_ICON})
+if(SMS_SWITCH_BUNDLE_DISC AND EXISTS "${SMS_SWITCH_BUNDLE_DISC}")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_icon.py
+            --disc "${SMS_SWITCH_BUNDLE_DISC}" --out ${CMAKE_BINARY_DIR}/icon.jpg
+    RESULT_VARIABLE _icon_rc OUTPUT_QUIET ERROR_VARIABLE _icon_err)
+  if(_icon_rc EQUAL 0)
+    set(SMS_SWITCH_ICON ${CMAKE_BINARY_DIR}/icon.jpg)
+  else()
+    message(WARNING "sms-switch: no icon from the disc (${_icon_err}); using libnx's default")
+  endif()
+endif()
+
 nx_generate_nacp(sms.nacp
   NAME "Super Mario Sunshine"
   AUTHOR "sms-switch"
@@ -44,7 +61,7 @@ nx_generate_nacp(sms.nacp
 nx_create_nro(sms
   OUTPUT ${CMAKE_BINARY_DIR}/sms.nro
   NACP sms.nacp
-  ICON ${NX_DEFAULT_ICON})
+  ICON ${SMS_SWITCH_ICON})
 
 # sms-standalone.nro (optional): the same program with your disc image inside
 # its RomFS, so the SD card needs no image beside it. For your own use only:
@@ -75,7 +92,7 @@ if(SMS_SWITCH_BUNDLE_DISC)
     TARGET sms
     OUTPUT ${CMAKE_BINARY_DIR}/sms-standalone.nro
     NACP sms.nacp
-    ICON ${NX_DEFAULT_ICON}
+    ICON ${SMS_SWITCH_ICON}
     ROMFS ${_romfs})
   message(STATUS "sms-switch: also building sms-standalone.nro with ${SMS_SWITCH_BUNDLE_DISC} inside")
 endif()

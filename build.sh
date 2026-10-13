@@ -14,7 +14,9 @@
 #                         SMS_SWITCH_DISC= (empty) turns it off.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-image="${SMS_SWITCH_IMAGE:-sms-switch-build}"
+# The build image, rebuilt whenever tools/docker/Dockerfile changes.
+build_image="sms-switch-build:$(sha256sum "$here/tools/docker/Dockerfile" | cut -c1-12)"
+image="${SMS_SWITCH_IMAGE:-$build_image}"
 # Compiled objects are cached here across builds (and ./build.sh --clean).
 ccache_dir="${SMS_SWITCH_CCACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sms-switch/ccache}"
 jobs="${JOBS:-$(nproc)}"
@@ -67,9 +69,9 @@ if [[ "${SMS_SWITCH_NATIVE:-0}" == 1 ]]; then
 		-DCMAKE_BUILD_TYPE=Release -DSMS_COMPILER_CACHE="$(command -v ccache || true)" "${disc_args[@]}" "$@"
 	cmake --build "$here/build" -j "$jobs"
 else
-	if [[ "$image" == sms-switch-build ]] && ! docker image inspect sms-switch-build >/dev/null 2>&1; then
-		echo "build.sh: building the sms-switch-build image (devkitA64 + ccache), once"
-		docker build -q -t sms-switch-build "$here/tools/docker" >/dev/null
+	if [[ "$image" == "$build_image" ]] && ! docker image inspect "$image" >/dev/null 2>&1; then
+		echo "build.sh: building the $image image (devkitA64 + ccache + Pillow)"
+		docker build -q -t "$image" "$here/tools/docker" >/dev/null
 	fi
 	mkdir -p "$ccache_dir"
 	docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
