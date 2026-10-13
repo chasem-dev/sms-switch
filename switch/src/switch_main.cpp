@@ -225,6 +225,11 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// the middle (widescreen = off in settings.txt for the original 4:3).
 	if (!getenv("SMS_WIDESCREEN") && !settings_has(g_dir, "widescreen"))
 		setenv("SMS_WIDESCREEN", "16:9", 1);
+	// Mesa here advertises parallel shader compiles but compiles one at a
+	// time: the warm-up's parallel mode (batches of 32 extra programs per
+	// stage load) stalled a load for 6 s. Serial: a stage's own programs, and
+	// extras only within 250 ms.
+	setenv("SMS_GX_SHADER_WARMUP_SERIAL", "1", 0);
 	sms_switch_spread_main_thread();
 	sms_switch_start_clocks();
 	if (applet_mode()) {

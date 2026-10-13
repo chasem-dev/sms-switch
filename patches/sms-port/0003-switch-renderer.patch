@@ -4,6 +4,8 @@ Renderer adjustments for the Switch's Mesa (nouveau) GL 4.3 stack (__SWITCH__).
   encoder's divisions by run-time values done in floats with an exact
   correction: same results, without the code Switch emulators (Eden) misread
   or cannot run (gx_shader.cpp, gx_render.cpp)
+- matrix rows (R4) and normal rows (R3) read as whole uvec4 loads: the same
+  values, and half the GLSL link time per program on the console's Mesa
 - the window is the whole display from the start: the Switch's SDL sizes the
   framebuffer once, at creation (gx_platform.cpp)
 
@@ -77,10 +79,10 @@ index bd96a35..036d6fd 100644
      glUniform1i(glGetUniformLocation(s_encProg, "u_src"), 0);
      const GLfloat wholeRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
 diff --git a/platform/gx/src/gx_shader.cpp b/platform/gx/src/gx_shader.cpp
-index 4c90bee..4caa518 100644
+index 4c90bee..34ce82f 100644
 --- a/platform/gx/src/gx_shader.cpp
 +++ b/platform/gx/src/gx_shader.cpp
-@@ -165,6 +165,20 @@ static void emitLight(std::string& s, uint32_t ctrl, const char* comp, const cha
+@@ -165,6 +165,29 @@ static void emitLight(std::string& s, uint32_t ctrl, const char* comp, const cha
  
  static std::string genVS(const ShaderKey& k) {
      std::string s = kVsHeader;
@@ -97,6 +99,15 @@ index 4c90bee..4caa518 100644
 +         "uint XW(int i) { uvec4 v = xf[i >> 2]; int c = i & 3; return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w; }\n"
 +         "float X(int i) { return uintBitsToFloat(XW(i)); }");
 +    swap("vec4 C(int w) { uint u = xf[w >> 2][w & 3];", "vec4 C(int w) { uint u = XW(w);");
++    // Rows and normal rows as whole uvec4 loads instead of 3-4 selected
++    // words: the same values (every R4 starts at a multiple of 4; R3 picks the
++    // same three words), and half the GLSL linking time on the console's Mesa
++    // (measured per program: 153 ms with selected words, 76 ms like this).
++    swap("vec4 R4(int w) { return vec4(X(w), X(w + 1), X(w + 2), X(w + 3)); }",
++         "vec4 R4(int w) { return uintBitsToFloat(xf[w >> 2]); }");
++    swap("vec3 R3(int w) { return vec3(X(w), X(w + 1), X(w + 2)); }",
++         "vec3 R3(int w) { uvec4 a = xf[w >> 2], b = xf[(w >> 2) + 1]; int c = w & 3;\n"
++         "  return uintBitsToFloat(c == 0 ? a.xyz : c == 1 ? a.yzw : c == 2 ? uvec3(a.zw, b.x) : uvec3(a.w, b.xy)); }");
 +#endif
      char buf[1024];
      s += "void main() {\n"
