@@ -8,6 +8,9 @@ Renderer adjustments for the Switch's Mesa (nouveau) GL 4.3 stack (__SWITCH__).
   values, and half the GLSL link time per program on the console's Mesa
 - the window is the whole display from the start: the Switch's SDL sizes the
   framebuffer once, at creation (gx_platform.cpp)
+- the shader warm-up draws once with each program it makes (nothing is
+  rasterised), so Mesa's nouveau makes its GPU code during the load instead
+  of at the program's first draw in gameplay (gx_shader.cpp)
 - both sticks pressed together (L3 + R3) toggle the debug overlay, as the
   backtick key does on a PC (gx_platform.cpp)
 
@@ -103,7 +106,7 @@ index bd96a35..036d6fd 100644
      glUniform1i(glGetUniformLocation(s_encProg, "u_src"), 0);
      const GLfloat wholeRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
 diff --git a/platform/gx/src/gx_shader.cpp b/platform/gx/src/gx_shader.cpp
-index 4c90bee..34ce82f 100644
+index 4c90bee..592e9a3 100644
 --- a/platform/gx/src/gx_shader.cpp
 +++ b/platform/gx/src/gx_shader.cpp
 @@ -165,6 +165,29 @@ static void emitLight(std::string& s, uint32_t ctrl, const char* comp, const cha
@@ -136,3 +139,42 @@ index 4c90bee..34ce82f 100644
      char buf[1024];
      s += "void main() {\n"
           "  int pm = int(a_mtx.x & 255u);\n"
+@@ -851,6 +874,28 @@ static void warmIssue(WarmJob* j) {  // GL thread; with parallel compiles, retur
+     s_inFlight.push_back(j);
+ }
+ 
++#ifdef __SWITCH__
++// Mesa's nouveau driver makes a program's GPU code at its first draw, not at
++// link time, so a warmed-up program still cost a hitch the first time the
++// game drew with it (up to a second on a console with no compiles counted).
++// One draw of three identical vertices (no attributes enabled: all at the
++// same point, so nothing is rasterised) makes it now, during the load. The
++// program and vertex array bindings are put back as they were, so the
++// renderer's tracking of them stays true.
++static void warmBackendCompile(GLuint prog) {
++    static GLuint vao = 0;
++    if (!vao) glGenVertexArrays(1, &vao);
++    GLint prevProgram = 0, prevVao = 0;
++    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
++    glUseProgram(prog);
++    glBindVertexArray(vao);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    glBindVertexArray(GLuint(prevVao));
++    glUseProgram(GLuint(prevProgram));
++}
++#endif
++
+ static void warmFinish(WarmJob* j) {  // GL thread
+     GLint ok = 0;
+     glGetProgramiv(j->prog, GL_LINK_STATUS, &ok);
+@@ -865,6 +910,9 @@ static void warmFinish(WarmJob* j) {  // GL thread
+     Warmed w{j->key, ShaderProgram(), ok != 0};
+     if (ok) {
+         setupProgram(j->prog, w.sp, true);
++#ifdef __SWITCH__
++        warmBackendCompile(j->prog);
++#endif
+         w.sp.id = 0;
+         programCacheStore(j->key, sourceHash(j->vs, j->fs), j->prog);
+     }

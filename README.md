@@ -101,6 +101,16 @@ This repository adds what the Switch needs:
 - **Graphics**: the PC renderer unchanged in kind: OpenGL 3.3 core through SDL2 on devkitPro's Mesa (nouveau, OpenGL 4.3 on the Tegra X1).
   The GX shaders are generated at run time, which rules out deko3d without a shader compiler in the game.
 
+## Quick test loop (nxlink)
+
+To try a build or an option without copying anything to the SD card:
+
+1. Once: `sms-standalone.nro` (or a disc image) in `sdmc:/switch/sms/`.
+2. On the Switch: open the homebrew menu through a game (hold R), press **Y** (network loader).
+3. Here: `./build.sh && tools/nxlink.sh SMS_GX_SCALE=2` sends the 12 MB `build/sms.nro` over Wi-Fi to `sdmc:/switch/sms/sms.nro`, starts it with those options, and shows its log as it runs.
+
+`NAME=value` arguments act as `env.txt` lines; a plain `sms.nro` there takes its disc from `sms-standalone.nro` beside it.
+
 ## Testing without a console
 
 `tools/emu/` runs `sms.nro` in [Eden](https://eden-emu.dev) (a yuzu-derived emulator), which loads NROs without keys or firmware:

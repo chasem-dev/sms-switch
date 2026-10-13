@@ -9,6 +9,7 @@
 //   save/    memory card files      cache/   shader cache
 //   sms.log  the port's log (stderr), unless started with nxlink
 #include <switch.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
@@ -22,6 +23,8 @@
 #include "low_memory.h"
 
 
+extern "C" int __system_argc; // libnx's argv, before main
+extern "C" char** __system_argv;
 extern "C" void sms_switch_spread_main_thread(void); // performance.cpp
 extern "C" void sms_switch_start_clocks(void);
 
@@ -173,6 +176,58 @@ bool settings_has(const std::string& dir, const char* name)
 	return found;
 }
 
+// NAME=value launch arguments (nxlink --args, tools/nxlink.sh) act as env.txt
+// lines, and are taken out of argv: the port reads its other arguments as a
+// disc path.
+void take_env_arguments()
+{
+	int out = 1;
+	for (int i = 1; i < __system_argc; i++) {
+		char* a = __system_argv[i];
+		const char* eq = strchr(a, '=');
+		bool name = eq && eq != a && (isupper((unsigned char)a[0]) || a[0] == '_');
+		for (const char* c = a; name && c < eq; c++)
+			name = isupper((unsigned char)*c) || isdigit((unsigned char)*c) || *c == '_';
+		if (!name) {
+			__system_argv[out++] = a;
+			continue;
+		}
+		*(char*)eq = 0;
+		setenv(a, eq + 1, 1);
+		fprintf(stderr, "[switch] argument: %s=%s\n", a, eq + 1);
+	}
+	__system_argc = out;
+	__system_argv[out] = NULL;
+}
+
+// The image packed into sms-standalone.nro beside this NRO: a quick-to-send
+// sms.nro (nxlink) uses its disc without a 1.4 GB image of its own.
+std::string find_standalone_disc_image(const std::string& dir)
+{
+	const std::string path = dir + "/sms-standalone.nro";
+	FILE* f = fopen(path.c_str(), "rb");
+	if (!f)
+		return std::string();
+	NroStart start;
+	NroHeader header;
+	NroAssetHeader assets;
+	bool ok = fread(&start, sizeof start, 1, f) == 1 && fread(&header, sizeof header, 1, f) == 1 &&
+	          header.magic == 0x304f524e && fseek(f, header.size, SEEK_SET) == 0 &&
+	          fread(&assets, sizeof assets, 1, f) == 1 && assets.magic == 0x54455341 && assets.romfs.size;
+	fclose(f);
+	if (!ok || R_FAILED(romfsMountFromFsdev(path.c_str(), header.size + assets.romfs.offset, "standalone")))
+		return std::string();
+	for (const char* name : {"standalone:/disc.iso", "standalone:/disc.gcm", "standalone:/disc.ciso"}) {
+		struct stat st;
+		if (stat(name, &st) == 0 && S_ISREG(st.st_mode)) {
+			fprintf(stderr, "[switch] disc image from %s (%s)\n", path.c_str(), name);
+			return name;
+		}
+	}
+	romfsUnmount("standalone");
+	return std::string();
+}
+
 void log_layout()
 {
 	const LowMemoryInfo* m = sms_switch_low_memory();
@@ -217,6 +272,7 @@ __attribute__((constructor(101))) static void switch_start(void)
 	log_layout();
 
 	load_env_file(g_dir + "/env.txt");
+	take_env_arguments();
 	// Gameplay at the GameCube's 30 fps unless settings.txt or env.txt asks
 	// for 60 or 120 (the PC port's default is 60, twice the work per second).
 	if (!getenv("SMS_FRAME_RATE") && !settings_has(g_dir, "frame_rate"))
@@ -252,6 +308,8 @@ __attribute__((constructor(101))) static void switch_start(void)
 		std::string disc = find_bundled_disc_image();
 		if (disc.empty())
 			disc = find_disc_image();
+		if (disc.empty())
+			disc = find_standalone_disc_image(g_dir);
 		if (!disc.empty())
 			setenv("SMS_DISC_IMAGE", disc.c_str(), 1);
 		else
