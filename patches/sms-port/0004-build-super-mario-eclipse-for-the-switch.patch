@@ -1,0 +1,207 @@
+Build Super Mario Eclipse (-DSMS_ECLIPSE=ON) for the Nintendo Switch.
+
+- the mods' library: clang for aarch64-none-elf with devkitA64's newlib
+  headers (no -m64), partially linked with devkitA64's ld and archived with
+  its ar; clang and clang++ also found as clang-19/clang-22
+- mod_ctors.ld also gathers .init_array: clang's bare-metal driver ignores
+  -fno-use-init-array, and the mods' constructors otherwise ran at process
+  start, with no sms_mod_ctors section for the port to find
+- the mods' new/delete are renamed to the game's whenever their library is
+  written (a post-build command in platform/mods/eclipse/lib), not in an
+  ExternalProject step that ran only on the first build: a rebuilt library
+  freed game-heap blocks with the host's free() (any host, any rebuild)
+- the boot information the mods read at 0x800000xx (bus and core clocks,
+  console type, the disc ID and its audio streaming flag) is read from
+  port_mem1_base, which is not 0x80000000 where the loader is in the way
+- SunshineHeaderInterface's TSmallEnemy::changeByJuice, doKeepDistance,
+  isFindMario (u32, the game's bool) and isInhibitedForceMove (bool, the
+  game's BOOL) declared as the decomp declares them (abi_check.py failed)
+- BetterSunshineEngine's itoa(dst, num, base) renamed (sms_bse_itoa): linked
+  into the program it replaced the C library's itoa(num, dst, base), which
+  the Switch's SDL2 calls at start-up (a crash at address 0 on the console)
+
+diff --git a/cmake/eclipse.cmake b/cmake/eclipse.cmake
+index 386511c..bc901b0 100644
+--- a/cmake/eclipse.cmake
++++ b/cmake/eclipse.cmake
+@@ -11,8 +11,8 @@
+ # Their headers describe the GameCube's layout; platform/mods/eclipse/shi-layout.patch
+ # (tools/mods/shi_layout) re-lays their classes out as the port lays out the
+ # game's, on 32- and 64-bit hosts.
+-find_program(SMS_CLANGXX NAMES clang++)
+-find_program(SMS_CLANG NAMES clang)
++find_program(SMS_CLANGXX NAMES clang++ clang++-22 clang++-19)
++find_program(SMS_CLANG NAMES clang clang-22 clang-19)
+ if(NOT SMS_CLANGXX OR NOT SMS_CLANG)
+   message(FATAL_ERROR "SMS_ECLIPSE needs clang/clang++ (Eclipse's sources are written for clang)")
+ endif()
+@@ -84,10 +84,22 @@ set(_eclipse_lib "${CMAKE_BINARY_DIR}/eclipse-build/libsms_eclipse.a")
+ if(APPLE)
+   set(_eclipse_platform_args -DCMAKE_OBJCOPY=${SMS_OBJCOPY} -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
+     -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT})
++elseif(NINTENDO_SWITCH)
++  # The Switch: clang for AArch64 with devkitA64's newlib headers, and
++  # devkitA64's binutils for the partial links and the archive (the host's
++  # do not know AArch64 objects).
++  set(_eclipse_platform_args -DCMAKE_SYSTEM_NAME=Generic -DCMAKE_SYSTEM_PROCESSOR=aarch64
++    -DCMAKE_C_COMPILER_TARGET=aarch64-none-elf -DCMAKE_CXX_COMPILER_TARGET=aarch64-none-elf
++    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DNINTENDO_SWITCH=ON
++    -DSMS_MODS_SYSROOT=${DEVKITPRO}/devkitA64/aarch64-none-elf
++    -DCMAKE_OBJCOPY=${CMAKE_OBJCOPY} -DCMAKE_LINKER=${CMAKE_LINKER}
++    -DCMAKE_AR=${DEVKITPRO}/devkitA64/bin/aarch64-none-elf-ar
++    -DCMAKE_RANLIB=${DEVKITPRO}/devkitA64/bin/aarch64-none-elf-ranlib)
+ else()
+   set(_eclipse_platform_args -DCMAKE_OBJCOPY=${CMAKE_OBJCOPY})
+ endif()
+-list(APPEND _eclipse_platform_args -DPython3_EXECUTABLE=${Python3_EXECUTABLE})
++list(APPEND _eclipse_platform_args -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
++  -DSMS_GAME_NEW_SYMS=${CMAKE_BINARY_DIR}/game_new_syms.txt)
+ ExternalProject_Add(sms_eclipse_build
+   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/platform/mods/eclipse/lib
+   BINARY_DIR ${CMAKE_BINARY_DIR}/eclipse-build
+@@ -101,14 +113,14 @@ ExternalProject_Add(sms_eclipse_build
+   INSTALL_COMMAND ""
+   BUILD_BYPRODUCTS ${_eclipse_lib})
+ # The mods' plain new/delete go to the game's heaps, like the game's own
+-# (see the sms_game rename above). Their static constructors run when the
+-# modules load (sms_mod_start), not at process start (platform/mods/eclipse/lib
++# (see the sms_game rename above): platform/mods/eclipse/lib renames them
++# whenever it writes the library (SMS_GAME_NEW_SYMS). Done here as a step
++# after the build, it ran only the first time, and a rebuilt library deleted
++# the game's blocks with the host's free(). Their static constructors run when
++# the modules load (sms_mod_start), not at process start (platform/mods/eclipse/lib
+ # moves them to their own section): Kuribo runs a module's constructors when
+ # it loads it, and BetterSunshineEngine's start threads and allocate from the
+ # game's heaps.
+-ExternalProject_Add_Step(sms_eclipse_build rename_new
+-  COMMAND ${SMS_OBJCOPY} --redefine-syms=${CMAKE_BINARY_DIR}/game_new_syms.txt ${_eclipse_lib}
+-  DEPENDEES build)
+ 
+ # Functions the mods call out of line that the decomp only has inline, and
+ # SDK functions the retail game never needed: built with the game's flags.
+diff --git a/platform/mods/eclipse/fixup_sources.py b/platform/mods/eclipse/fixup_sources.py
+index c339605..6c9a3b2 100644
+--- a/platform/mods/eclipse/fixup_sources.py
++++ b/platform/mods/eclipse/fixup_sources.py
+@@ -163,6 +163,9 @@ SHI_GAME_TYPES = [
+     game_types("include/SMS/rand.h", r'extern "C" u16 rand\(\);', 'extern "C" int rand();'),
+     game_types("include/SMS/System/Resolution.hxx", r"\bint(\s+SMSGet(?:Title|Game)Render(?:Width|Height)\s*\(\s*\);)",
+                r"u16\1"),
++    game_types("include/SMS/Enemy/SmallEnemy.hxx", r"\bvirtual u32(\s+(?:changeByJuice|doKeepDistance|isFindMario)\s*\()",
++               r"virtual bool\1"),
++    game_types("include/SMS/Enemy/SmallEnemy.hxx", r"\bvirtual bool(\s+isInhibitedForceMove\s*\()", r"virtual int\1"),
+     game_types("include/SMS/MapObj/MapObjBase.hxx", r"\bvirtual u32(\s+getHitObjNumMax\s*\()", r"virtual u16\1"),
+     game_types("include/SMS/MoveBG/EggYoshi.hxx", r"\bvirtual u32(\s+getHitObjNumMax\s*\()", r"virtual u16\1"),
+     game_types("include/SMS/MSound/MSound.hxx", r"\bbool(\s+getMapInfoGround\s*\(u32\);)", r"u32\1"),
+@@ -337,6 +340,22 @@ ECLIPSE_FIXES = optional(TEXTURE_FIXES) + CARD_IMAGE_FIXES + PARTICLE_FIXES + DE
+      "Eclipse's settings group knows its module"),
+ ]
+ BSE_FIXES = TEXTURE_FIXES + CARD_IMAGE_FIXES + optional([RAWADDR_FIX]) + [RAWDATA_FIX, RAWDATA_REGION_FIX] + BSE_BE_FIXES + PATCH_TYPE_FIXES + [
++    # BSE's itoa(dst, num, base) is linked into the program, where it took
++    # the place of the C library's itoa(num, dst, base) for every caller:
++    # newlib has one, and the Switch's SDL2 calls it (SDL_itoa, naming the
++    # display), which wrote the digits to address 0 and crashed at start-up.
++    # The mods never call it; renamed, the C library's is left alone.
++    ("src/cstd/stdlib.c", r"\bvoid itoa\(char \*dst,", "void sms_bse_itoa(char *dst,",
++     "BSE's itoa does not replace the C library's"),
++    ("include/BetterSMS/cstd/stdlib.h", r"\bvoid itoa\(char \*dst,", "void sms_bse_itoa(char *dst,",
++     "BSE's itoa does not replace the C library's"),
++    ("src/module.cpp", r"\bKURIBO_EXPORT\(itoa\);", 'KURIBO_EXPORT_AS(sms_bse_itoa, "itoa");',
++     "BSE's itoa does not replace the C library's"),
++    # The disc ID and its audio streaming flag, likewise.
++    ("src/settings.cpp", r"#define DISK_GAME_ID \(void \*\)0x80000000\b", "#define DISK_GAME_ID (void *)port_mem1_base",
++     "the disc ID is read from the port's MEM1"),
++    ("src/globals.cpp", r"reinterpret_cast<bool \*>\(0x80000008\)", "reinterpret_cast<bool *>(port_mem1_base + 8)",
++     "the disc ID is read from the port's MEM1"),
+     # J2DTextBox owns and deletes its string. The setting label and shadow
+     # cannot share a heap buffer; keep independent 100-byte allocations and
+     # mirror edits into the shadow so it still displays the current value.
+@@ -432,6 +451,11 @@ BSE_FIXES = TEXTURE_FIXES + CARD_IMAGE_FIXES + optional([RAWADDR_FIX]) + [RAWDAT
+ ] + FRAME_RATE_FIXES + ASPECT_RATIO_FIXES
+ MOVESET_FIXES = optional(TEXTURE_FIXES + [RAWADDR_FIX]) + CARD_IMAGE_FIXES
+ SHI_FIXES = BOOL_RET_FIXES + SHI_WORD_FIXES + SHI_GAME_TYPES + [
++    # The boot information at the bottom of MEM1 (clocks, console type),
++    # where the port keeps MEM1: not always 0x80000000 (on the Switch the
++    # homebrew loader may be there; modhooks.cpp's fill_boot_info).
++    ("include/Dolphin/OS.h", r"\((\w+ \*)\)0x800000([0-9A-Fa-f]{2})\b", r"(\1)(port_mem1_base + 0x\2)",
++     "boot information is read from the port's MEM1"),
+     # The SDK's OSMessage is a void *, as the port's OS keeps it; declared u32,
+     # it was half the size in the 64-bit build. BSE's music streamer queues 16
+     # of them in a u32 array, which the port wrote 8 bytes apiece, over the
+diff --git a/platform/mods/eclipse/lib/CMakeLists.txt b/platform/mods/eclipse/lib/CMakeLists.txt
+index 4ad103b..283eee2 100644
+--- a/platform/mods/eclipse/lib/CMakeLists.txt
++++ b/platform/mods/eclipse/lib/CMakeLists.txt
+@@ -38,7 +38,15 @@ set(_defs NTSCU KURIBO_NO_TYPES "BETTER_SMS_VERSION=\"v2.0\"" BETTER_SMS_CUSTOM_
+ if(NOT SMS_ARCH)
+   set(SMS_ARCH 32)
+ endif()
+-set(_arch -m${SMS_ARCH})
++if(NINTENDO_SWITCH)
++  # AArch64 has no -m64. The game's CPU and code model (devkitA64's
++  # NintendoSwitch.cmake): position independent, as an NRO is; newlib's
++  # headers in place of the host's.
++  set(_arch -march=armv8-a+crc+crypto -mtune=cortex-a57 -fPIE -ffunction-sections -fdata-sections
++    -D__SWITCH__ -nostdlibinc -isystem ${SMS_MODS_SYSROOT}/include)
++else()
++  set(_arch -m${SMS_ARCH})
++endif()
+ if(SMS_ARCH STREQUAL "32")
+   # SSE float math, as the game is built (x87 would round differently)
+   list(APPEND _arch -malign-double -msse2 -mfpmath=sse)
+@@ -92,6 +100,9 @@ target_compile_options(eclipse_objs PRIVATE ${_opts})
+ # The partial links below run the compiler driver as a linker, for this target.
+ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+   set(_ld_arch -arch ${CMAKE_OSX_ARCHITECTURES})
++elseif(NINTENDO_SWITCH)
++  # devkitA64's ld (clang's bare-metal driver would pick ld.lld).
++  set(_ld_arch --target=aarch64-none-elf --ld-path=${CMAKE_LINKER})
+ else()
+   set(_ld_arch -m${SMS_ARCH})
+ endif()
+@@ -161,3 +172,10 @@ add_custom_command(OUTPUT ${_obj}
+   COMMAND_EXPAND_LISTS VERBATIM)
+ add_library(sms_eclipse STATIC ${_obj})
+ set_target_properties(sms_eclipse PROPERTIES LINKER_LANGUAGE CXX)
++# The mods' plain new/delete renamed to the game's (cmake/eclipse.cmake), each
++# time the library is written.
++if(SMS_GAME_NEW_SYMS)
++  add_custom_command(TARGET sms_eclipse POST_BUILD
++    COMMAND ${CMAKE_OBJCOPY} --redefine-syms=${SMS_GAME_NEW_SYMS} $<TARGET_FILE:sms_eclipse>
++    COMMENT "Renaming the mods' global operator new/delete to the game's" VERBATIM)
++endif()
+diff --git a/platform/mods/eclipse/lib/mod_ctors.ld b/platform/mods/eclipse/lib/mod_ctors.ld
+index f0637a4..97bb72f 100644
+--- a/platform/mods/eclipse/lib/mod_ctors.ld
++++ b/platform/mods/eclipse/lib/mod_ctors.ld
+@@ -1,6 +1,8 @@
+ /* Partial link of the code mods (-r): their static constructors, which the
+- * port runs when the modules load (sms_mod_start), not at process start. */
++ * port runs when the modules load (sms_mod_start), not at process start.
++ * .init_array too: clang's bare-metal driver (the Switch's aarch64-none-elf)
++ * ignores -fno-use-init-array; elsewhere the mods have none. */
+ SECTIONS
+ {
+-	sms_mod_ctors : { *(.ctors) *(SORT(.ctors.*)) }
++	sms_mod_ctors : { *(.ctors) *(SORT(.ctors.*)) *(SORT(.init_array.*)) *(.init_array) }
+ }
+diff --git a/platform/mods/eclipse/shim/sms_mod_prelude.h b/platform/mods/eclipse/shim/sms_mod_prelude.h
+index 42fcfe1..bb48eae 100644
+--- a/platform/mods/eclipse/shim/sms_mod_prelude.h
++++ b/platform/mods/eclipse/shim/sms_mod_prelude.h
+@@ -21,6 +21,15 @@ extern "C"
+ #endif
+ void* sms_mod_rawdata(unsigned int addr);
+ 
++// Where the port keeps MEM1 (platform/port_runtime.cpp), whose bottom holds
++// the boot information the mods read (fixup_sources.py rewrites 0x800000xx).
++#ifdef __cplusplus
++extern "C"
++#else
++extern
++#endif
++unsigned char* port_mem1_base;
++
+ // SMS_OFFSET(Class, retail offset): where the port keeps a member the mods
+ // address by retail offset (tools/mods/shi_layout/offsets.py).
+ #ifdef __cplusplus

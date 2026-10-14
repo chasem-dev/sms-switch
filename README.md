@@ -19,7 +19,8 @@ cd sms-switch
 ```
 
 That produces `build/sms.nro`.
-[GitHub Actions](.github/workflows/build.yml) builds the same way on every push; pushing a `v*` tag (or running the workflow by hand with a version) publishes a release with `sms-switch.zip`, `sms.nro` and `gx_selftest.nro`.
+[GitHub Actions](.github/workflows/build.yml) builds the same way on every push, `sms.nro` and (with [eclipse.yml](.github/workflows/eclipse.yml)) `sms-eclipse.nro`; pushing a `v*` tag (or running the workflow by hand with a version) publishes a release with `sms-switch.zip` (both NROs), `sms.nro`, `sms-eclipse.nro` and `gx_selftest.nro`.
+Releases carry NROs only: no game data, no art (libnx's icon), and no NSPs, which need a console's keys (build them yourself, below).
 The first build compiles about 600 game files; later builds only rebuild what changed.
 
 | Command | What it does |
@@ -29,6 +30,8 @@ The first build compiles about 600 game files; later builds only rebuild what ch
 | `JOBS=2 ./build.sh` | limit parallel compiler jobs |
 | `SMS_SWITCH_NATIVE=1 ./build.sh` | use an installed devkitPro (`$DEVKITPRO`) instead of Docker |
 | `SMS_SWITCH_DISC=/path/GMSE01.iso ./build.sh` | also build `build/sms-standalone.nro` with that image inside (see below); remembered for later builds, `SMS_SWITCH_DISC=` stops it |
+| `SMS_SWITCH_ECLIPSE=1 ./build.sh` | also build `build/eclipse/sms-eclipse.nro`, Super Mario Eclipse (see below); remembered, `SMS_SWITCH_ECLIPSE=0` stops it |
+| `SMS_SWITCH_ECLIPSE_DISC=/path/eclipse.iso ./build.sh` | that, and `build/eclipse/sms-eclipse-standalone.nro` with the Eclipse image inside; remembered, `SMS_SWITCH_ECLIPSE_DISC=` stops it |
 
 The icon is SteamGridDB's box art for the game (`SMS_SWITCH_ICON=steamgriddb`, the default for local builds), fetched at build time and never stored here; `disc` uses the memory-card Mario from your disc, `default` libnx's icon (what releases use), or give a 256x256 JPEG.
 
@@ -40,6 +43,7 @@ On a 4-core i5-6600K a first build takes about 3 minutes, a rebuild from scratch
 `SMS_SWITCH_KEYS=/path/to/prod.keys ./build.sh` also packs `build/nsp/sms-switch.nsp`: an installable title with its own HOME menu icon that starts the game with a game's full memory, no R-hold needed.
 Its program is [nx-hbloader](https://github.com/switchbrew/nx-hbloader) (`third_party/`, the homebrew menu's own loader) set to start `sdmc:/switch/sms/sms-standalone.nro` (with `SMS_SWITCH_DISC`) or `sdmc:/switch/sms/sms.nro`; `SMS_SWITCH_NSP_NRO=sdmc:/...` picks another.
 Install it with Goldleaf or DBI; the NRO stays on the SD card, so updating the game is copying a new NRO.
+With the Eclipse build (below) it also packs `build/nsp/sms-eclipse.nsp`, a second title ("Super Mario Eclipse", its own icon) that starts `sdmc:/switch/sms/sms-eclipse-standalone.nro` (with `SMS_SWITCH_ECLIPSE_DISC`) or `sdmc:/switch/sms-eclipse/sms-eclipse.nro`; `SMS_SWITCH_ECLIPSE_NSP_NRO=sdmc:/...` picks another.
 
 - The keys are your console's: boot the Lockpick_RCM payload from Hekate and dump them to `sdmc:/switch/prod.keys`. Only their path is remembered (`.switch-keys`); they are mounted read-only into the build and never leave your machine.
 - Installing a self-made NSP needs sigpatches on the console.
@@ -51,9 +55,18 @@ Install it with Goldleaf or DBI; the NRO stays on the SD card, so updating the g
 It contains the game: keep it to yourself, never upload or share it (CI and releases never build it).
 Re-packing the image adds a few seconds to builds that change the program.
 
+### Super Mario Eclipse (`sms-eclipse.nro`)
+
+`SMS_SWITCH_ECLIPSE=1 ./build.sh` also builds `build/eclipse/sms-eclipse.nro`: the PC port's [Super Mario Eclipse build](sms-port/docs/ECLIPSE.md), in which the mod's code (Eclipse, BetterSunshineEngine and BetterSunshineMoveset, fetched at pinned revisions on the first build into `build/eclipse/eclipse-src/`) is compiled with clang for AArch64 and linked into the game.
+It is a second program, in its own build tree (`build/eclipse/`, with the same compiler cache), and needs the build image's clang (`tools/docker/Dockerfile`).
+It plays the Eclipse disc (`GMSE04`), which you make from your own Sunshine image with the mod's patch (`python3 sms-port/tools/mods/get.py eclipse`, see `ECLIPSE.md`).
+It lives in its own folder, `sdmc:/switch/sms-eclipse/` (disc image, `settings.txt`, `env.txt`, saves and shader cache as for `sms.nro`, below), so the two games never share a memory card or settings.
+`SMS_SWITCH_ECLIPSE_DISC=/path/to/eclipse.iso` also packs that image into `build/eclipse/sms-eclipse-standalone.nro`, as `SMS_SWITCH_DISC` does for Sunshine (personal use only).
+Its icon is the Eclipse disc's memory-card icon, or `SMS_SWITCH_ECLIPSE_ICON=/path/to/icon.jpg` (256x256, for the NRO and its NSP; remembered, `SMS_SWITCH_ECLIPSE_ICON=` stops it).
+
 ## Install and play
 
-1. Download `sms-switch.zip` from the [latest release](https://github.com/chasem-dev/sms-switch/releases) and extract it to the root of the SD card (it holds `switch/sms/sms.nro`), or copy your own `build/sms.nro` to `sdmc:/switch/sms/sms.nro`.
+1. Download `sms-switch.zip` from the [latest release](https://github.com/chasem-dev/sms-switch/releases) and extract it to the root of the SD card (it holds `switch/sms/sms.nro`, and `switch/sms-eclipse/sms-eclipse.nro` for Super Mario Eclipse, below), or copy your own `build/sms.nro` to `sdmc:/switch/sms/sms.nro`.
 2. Put the disc image beside it: `sdmc:/switch/sms/` (or `sdmc:/switch/sms/rom/`), as `.iso`, `.gcm` or Dolphin `.ciso`, any file name.
 3. Start it from the homebrew menu **through a game**: on the HOME menu hold R while starting any game (installed or cartridge) until the homebrew menu appears, then pick it. Nothing is installed; homebrew started that way gets the game's memory.
    Started from the Album (applet mode) it only shows a message: on a console it had 86 MiB left there, and Mesa could not create the window surface.
@@ -160,7 +173,8 @@ Not yet:
 - **Further in the emulator.** Past the logos Eden stops with `PRET flow analysis is not implemented`: Mesa's nouveau compiles some shader as a subroutine call, which Nintendo's compiler never emits and Eden cannot translate.
   Which shader that is was not found yet; the console runs such code natively.
 - Leaving to the homebrew menu instead of ending the process (the game's threads and the low windows would have to be torn down first).
-- An icon and a homebrew-menu entry name beyond the defaults; the PC port's HD texture packs, HD cutscenes and Eclipse mod on the Switch.
+- An icon and a homebrew-menu entry name beyond the defaults; the PC port's HD cutscenes on the Switch.
+- **Super Mario Eclipse** is barely tested. In Eden its three modules load (846 patches) and BetterSunshineEngine's first-boot settings screen draws, as on the PC, but it went no further there in two and a half minutes (Eden logs shader-decoder asserts). The first console run crashed opening the window (BetterSunshineEngine's `itoa` in place of the C library's, fixed since); the fixed build has not been run on a console yet.
 
 ## License
 
