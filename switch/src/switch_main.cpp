@@ -2,7 +2,7 @@
 // (sms-port src/port_main.cpp).
 //
 // Files live beside the NRO (libnx makes its folder the working directory),
-// normally sdmc:/switch/sms/:
+// normally sdmc:/switch/sms/ (sdmc:/switch/sms-eclipse/ for sms-eclipse.nro):
 //   *.iso / *.gcm / *.ciso   the disc image (also in rom/), unless this is
 //                            sms-standalone.nro, which carries it in its RomFS
 //   settings.txt, bindings.txt
@@ -22,6 +22,15 @@
 #include <string>
 #include "low_memory.h"
 
+// The program's name and title (CMakeLists.txt): sms and Super Mario Sunshine,
+// or sms-eclipse and Super Mario Eclipse.
+#ifndef SMS_SWITCH_APP
+#define SMS_SWITCH_APP "sms"
+#endif
+#ifndef SMS_SWITCH_TITLE
+#define SMS_SWITCH_TITLE "Super Mario Sunshine"
+#endif
+
 
 extern "C" int __system_argc; // libnx's argv, before main
 extern "C" char** __system_argv;
@@ -36,7 +45,7 @@ void sms_switch_trace(const char* text)
 
 namespace {
 // Plain storage: switch_start runs before other constructors.
-char g_dir_buf[512] = "sdmc:/switch/sms";
+char g_dir_buf[512] = "sdmc:/switch/" SMS_SWITCH_APP;
 int g_nxlink_socket = -1;
 
 bool is_disc_image(const char* name)
@@ -96,7 +105,7 @@ void load_env_file(const std::string& path)
 	fclose(f);
 }
 
-// The image packed into sms-standalone.nro's RomFS (romfs:/disc.iso, .gcm or
+// The image packed into sms-standalone.nro's RomFS (sms-eclipse-standalone.nro's) (romfs:/disc.iso, .gcm or
 // .ciso; CMake's SMS_SWITCH_BUNDLE_DISC), if this is that build.
 std::string find_bundled_disc_image()
 {
@@ -143,7 +152,7 @@ void explain_applet_mode()
 	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
 	PadState pad;
 	padInitializeDefault(&pad);
-	printf("\n\n  Super Mario Sunshine needs more memory than the Album gives homebrew.\n\n"
+	printf("\n\n  " SMS_SWITCH_TITLE " needs more memory than the Album gives homebrew.\n\n"
 	       "  Start it through a game instead: hold R while you start any game,\n"
 	       "  keep holding until the homebrew menu appears, then pick it there.\n\n"
 	       "  (The log is sms.log beside the NRO.)\n\n"
@@ -201,10 +210,11 @@ void take_env_arguments()
 }
 
 // The image packed into sms-standalone.nro beside this NRO: a quick-to-send
-// sms.nro (nxlink) uses its disc without a 1.4 GB image of its own.
+// sms.nro (nxlink) uses its disc without a 1.4 GB image of its own (likewise
+// sms-eclipse.nro and sms-eclipse-standalone.nro).
 std::string find_standalone_disc_image(const std::string& dir)
 {
-	const std::string path = dir + "/sms-standalone.nro";
+	const std::string path = dir + "/" SMS_SWITCH_APP "-standalone.nro";
 	FILE* f = fopen(path.c_str(), "rb");
 	if (!f)
 		return std::string();

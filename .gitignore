@@ -2,3 +2,6 @@ build/
 .bundled-disc
 .bundled-textures
 .switch-keys
+.eclipse
+.bundled-eclipse-disc
+.eclipse-icon

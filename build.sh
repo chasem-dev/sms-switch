@@ -17,13 +17,30 @@
 #                         (tools/texpack/make-switch-pack.sh's output) into
 #                         sms-standalone.nro; remembered (.bundled-textures),
 #                         SMS_SWITCH_TEXTURES= turns it off.
+#   SMS_SWITCH_ECLIPSE=1 ./build.sh
+#                         also build build/eclipse/sms-eclipse.nro: Super Mario
+#                         Eclipse's code built into the game (fetched at its
+#                         pinned revisions the first time), for the Eclipse disc
+#                         (GMSE04). Remembered (.eclipse); SMS_SWITCH_ECLIPSE=0 stops it.
+#   SMS_SWITCH_ECLIPSE_DISC=/path/eclipse.iso ./build.sh
+#                         that, and build/eclipse/sms-eclipse-standalone.nro with
+#                         that image inside (personal use only, as above).
+#                         Remembered (.bundled-eclipse-disc); SMS_SWITCH_ECLIPSE_DISC= stops it.
+#   SMS_SWITCH_ECLIPSE_ICON=/path/icon.jpg
+#                         a 256x256 JPEG for sms-eclipse.nro and its NSP (else the
+#                         Eclipse disc's memory-card icon). Remembered
+#                         (.eclipse-icon); SMS_SWITCH_ECLIPSE_ICON= stops it.
 #   SMS_SWITCH_KEYS=/path/prod.keys ./build.sh
 #                         also pack build/nsp/sms-switch.nsp, an installable title
 #                         (HOME menu icon, full memory) that starts the NRO from
 #                         SMS_SWITCH_NSP_NRO (default sdmc:/switch/sms/ and the
 #                         standalone NRO if built, else sms.nro). The keys are your
 #                         console's (Lockpick_RCM); only their path is remembered
-#                         (.switch-keys); SMS_SWITCH_KEYS= turns it off.
+#                         (.switch-keys); SMS_SWITCH_KEYS= turns it off. With the
+#                         Eclipse build, also build/nsp/sms-eclipse.nsp, starting
+#                         SMS_SWITCH_ECLIPSE_NSP_NRO (default sdmc:/switch/sms/
+#                         sms-eclipse-standalone.nro if bundled, else
+#                         sdmc:/switch/sms-eclipse/sms-eclipse.nro).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The build image, rebuilt whenever tools/docker/Dockerfile changes.
@@ -91,6 +108,57 @@ elif [[ -n "${SMS_SWITCH_TEXTURES+set}" ]]; then
 	rm -f "$textures_memory"
 fi
 
+# sms-eclipse.nro, remembered in .eclipse, and the disc image for
+# sms-eclipse-standalone.nro, in .bundled-eclipse-disc (Docker sees it at
+# /eclipse-disc/disc.<ext>).
+eclipse_memory="$here/.eclipse" eclipse_remember="$here/.bundled-eclipse-disc"
+if [[ -z "${SMS_SWITCH_ECLIPSE_DISC+set}" && -f "$eclipse_remember" ]]; then
+	SMS_SWITCH_ECLIPSE_DISC="$(cat "$eclipse_remember")"
+fi
+if [[ -z "${SMS_SWITCH_ECLIPSE+set}" && ( -f "$eclipse_memory" || -n "${SMS_SWITCH_ECLIPSE_DISC:-}" ) ]]; then
+	SMS_SWITCH_ECLIPSE=1
+fi
+eclipse_disc_args=() docker_eclipse_disc=()
+eclipse_icon_memory="$here/.eclipse-icon"
+if [[ -z "${SMS_SWITCH_ECLIPSE_ICON+set}" && -f "$eclipse_icon_memory" ]]; then
+	SMS_SWITCH_ECLIPSE_ICON="$(cat "$eclipse_icon_memory")"
+fi
+if [[ "${SMS_SWITCH_ECLIPSE:-0}" == 1 ]]; then
+	touch "$eclipse_memory"
+	if [[ -n "${SMS_SWITCH_ECLIPSE_DISC:-}" ]]; then
+		edisc="$(realpath "$SMS_SWITCH_ECLIPSE_DISC" 2>/dev/null || true)"
+		[[ -f "$edisc" ]] || { echo "build.sh: no disc image at $SMS_SWITCH_ECLIPSE_DISC (SMS_SWITCH_ECLIPSE_DISC= stops bundling)" >&2; exit 1; }
+		eext="${edisc##*.}"
+		eext="${eext,,}"
+		if [[ "${SMS_SWITCH_NATIVE:-0}" == 1 ]]; then
+			eclipse_disc_args=(-DSMS_SWITCH_BUNDLE_DISC="$edisc")
+		else
+			eclipse_disc_args=(-DSMS_SWITCH_BUNDLE_DISC="/eclipse-disc/disc.$eext")
+			docker_eclipse_disc=(-v "$edisc:/eclipse-disc/disc.$eext:ro")
+		fi
+		printf '%s\n' "$edisc" > "$eclipse_remember"
+	else
+		eclipse_disc_args=(-DSMS_SWITCH_BUNDLE_DISC=)
+		rm -f "$eclipse_remember"
+	fi
+	if [[ -n "${SMS_SWITCH_ECLIPSE_ICON:-}" ]]; then
+		eicon="$(realpath "$SMS_SWITCH_ECLIPSE_ICON" 2>/dev/null || true)"
+		[[ -f "$eicon" && "${eicon,,}" =~ \.jpe?g$ ]] || { echo "build.sh: no JPEG at $SMS_SWITCH_ECLIPSE_ICON (SMS_SWITCH_ECLIPSE_ICON= stops it)" >&2; exit 1; }
+		if [[ "${SMS_SWITCH_NATIVE:-0}" == 1 ]]; then
+			eclipse_disc_args+=(-DSMS_SWITCH_ICON="$eicon")
+		else
+			eclipse_disc_args+=(-DSMS_SWITCH_ICON=/eclipse-icon/icon.jpg)
+			docker_eclipse_disc+=(-v "$eicon:/eclipse-icon/icon.jpg:ro")
+		fi
+		printf '%s\n' "$eicon" > "$eclipse_icon_memory"
+	else
+		eclipse_disc_args+=(-DSMS_SWITCH_ICON=steamgriddb)
+		rm -f "$eclipse_icon_memory"
+	fi
+else
+	rm -f "$eclipse_memory" "$eclipse_remember"
+fi
+
 # The installable NSP (tools/make-nsp.sh), with your console's keys.
 keys_memory="$here/.switch-keys"
 if [[ -z "${SMS_SWITCH_KEYS+set}" && -f "$keys_memory" ]]; then
@@ -117,8 +185,31 @@ if [[ -n "${SMS_SWITCH_KEYS:-}" ]]; then
 	fi
 	nsp_cmd="icon=$src/build/icon.jpg; [ -f \$icon ] || icon=$icon_default; \
 		$src/tools/make-nsp.sh ${keys_in@Q} ${nro_path@Q} \$icon ${version@Q}"
+	# And Super Mario Eclipse's, another title, with the Eclipse build: its
+	# standalone NRO beside Sunshine's (the disc is inside it), else
+	# sms-eclipse.nro in its own folder (beside the Eclipse disc image).
+	if [[ "${SMS_SWITCH_ECLIPSE:-0}" == 1 ]]; then
+		if [[ -n "${SMS_SWITCH_ECLIPSE_NSP_NRO:-}" ]]; then
+			eclipse_nro_path="$SMS_SWITCH_ECLIPSE_NSP_NRO"
+		elif [[ -n "${SMS_SWITCH_ECLIPSE_DISC:-}" ]]; then
+			eclipse_nro_path="sdmc:/switch/sms/sms-eclipse-standalone.nro"
+		else
+			eclipse_nro_path="sdmc:/switch/sms-eclipse/sms-eclipse.nro"
+		fi
+		nsp_cmd+="; icon=$src/build/eclipse/icon.jpg; [ -f \$icon ] || icon=$icon_default; \
+			$src/tools/make-nsp.sh ${keys_in@Q} ${eclipse_nro_path@Q} \$icon ${version@Q} \
+			'Super Mario Eclipse' 05534D5345000000 sms-eclipse"
+	fi
 elif [[ -n "${SMS_SWITCH_KEYS+set}" ]]; then
-	rm -f "$keys_memory" "$here/build/nsp/sms-switch.nsp"
+	rm -f "$keys_memory" "$here/build/nsp/sms-switch.nsp" "$here/build/nsp/sms-eclipse.nsp"
+fi
+
+# The Eclipse build: its own tree, build/eclipse, beside the plain one.
+eclipse_cmd=""
+if [[ "${SMS_SWITCH_ECLIPSE:-0}" == 1 ]]; then
+	eclipse_cmd="cmake -S /src -B /src/build/eclipse -G Ninja -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake \\
+	-DCMAKE_BUILD_TYPE=Release -DSMS_ECLIPSE=ON -DSMS_COMPILER_CACHE=\$cache ${eclipse_disc_args[*]@Q} $*
+cmake --build /src/build/eclipse -j $jobs"
 fi
 
 # ccache, where the toolchain has it (the sms-switch-build image does).
@@ -127,6 +218,7 @@ cache=\$(command -v ccache || true)
 cmake -S /src -B /src/build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake -DCMAKE_BUILD_TYPE=Release \\
 	-DSMS_COMPILER_CACHE=\$cache ${disc_args[*]@Q} $*
 cmake --build /src/build -j $jobs
+$eclipse_cmd
 [ -z \"\$cache\" ] || ccache -s | grep -E 'Hits|Misses' | head -2
 $nsp_cmd"
 
@@ -135,6 +227,12 @@ if [[ "${SMS_SWITCH_NATIVE:-0}" == 1 ]]; then
 	cmake -S "$here" -B "$here/build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
 		-DCMAKE_BUILD_TYPE=Release -DSMS_COMPILER_CACHE="$(command -v ccache || true)" "${disc_args[@]}" "$@"
 	cmake --build "$here/build" -j "$jobs"
+	if [[ "${SMS_SWITCH_ECLIPSE:-0}" == 1 ]]; then
+		cmake -S "$here" -B "$here/build/eclipse" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
+			-DCMAKE_BUILD_TYPE=Release -DSMS_ECLIPSE=ON -DSMS_COMPILER_CACHE="$(command -v ccache || true)" \
+			"${eclipse_disc_args[@]}" "$@"
+		cmake --build "$here/build/eclipse" -j "$jobs"
+	fi
 	[[ -z "$nsp_cmd" ]] || bash -c "$nsp_cmd"
 else
 	if [[ "$image" == "$build_image" ]] && ! docker image inspect "$image" >/dev/null 2>&1; then
@@ -144,7 +242,7 @@ else
 	mkdir -p "$ccache_dir"
 	docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
 		-v "$ccache_dir:/ccache" -e CCACHE_DIR=/ccache -e CCACHE_BASEDIR=/src -e CCACHE_MAXSIZE=5G \
-		${SMS_SWITCH_DOCKER_ARGS:-} "${docker_disc[@]}" "${docker_textures[@]}" "${docker_keys[@]}" \
+		${SMS_SWITCH_DOCKER_ARGS:-} "${docker_disc[@]}" "${docker_textures[@]}" "${docker_eclipse_disc[@]}" "${docker_keys[@]}" \
 		-v "$here:/src" -w /src "$image" bash -c "$inner"
 fi
 echo "build.sh: built $here/build/sms.nro"
@@ -153,4 +251,13 @@ if [[ -n "$nsp_cmd" && -f "$here/build/nsp/sms-switch.nsp" ]]; then
 fi
 if [[ -f "$here/build/sms-standalone.nro" && -f "$remember" ]]; then
 	echo "build.sh: built $here/build/sms-standalone.nro with $(cat "$remember") inside (personal use only)"
+fi
+if [[ -f "$here/build/eclipse/sms-eclipse.nro" && "${SMS_SWITCH_ECLIPSE:-0}" == 1 ]]; then
+	echo "build.sh: built $here/build/eclipse/sms-eclipse.nro (Super Mario Eclipse; copy it to sdmc:/switch/sms-eclipse/)"
+fi
+if [[ -f "$here/build/eclipse/sms-eclipse-standalone.nro" && -f "$eclipse_remember" ]]; then
+	echo "build.sh: built $here/build/eclipse/sms-eclipse-standalone.nro with $(cat "$eclipse_remember") inside (personal use only)"
+fi
+if [[ -n "$nsp_cmd" && "${SMS_SWITCH_ECLIPSE:-0}" == 1 && -f "$here/build/nsp/sms-eclipse.nsp" ]]; then
+	echo "build.sh: built $here/build/nsp/sms-eclipse.nsp (starts $eclipse_nro_path; install it with Goldleaf or DBI)"
 fi

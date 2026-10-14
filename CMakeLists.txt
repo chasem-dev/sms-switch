@@ -8,6 +8,19 @@ endif()
 
 set(SMS_SWITCH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/switch)
 
+# -DSMS_ECLIPSE=ON (the port's option, sms-port docs/ECLIPSE.md): Super Mario
+# Eclipse's code built into the game, as sms-eclipse.nro, for the Eclipse disc
+# (GMSE04). It is its own program, so it gets its own name and folder
+# (sdmc:/switch/sms-eclipse/: settings, saves and shader cache apart).
+option(SMS_ECLIPSE "Build Super Mario Eclipse in (sms-eclipse.nro)" OFF)
+if(SMS_ECLIPSE)
+  set(SMS_SWITCH_APP sms-eclipse)
+  set(SMS_SWITCH_TITLE "Super Mario Eclipse")
+else()
+  set(SMS_SWITCH_APP sms)
+  set(SMS_SWITCH_TITLE "Super Mario Sunshine")
+endif()
+
 # The game is built as on the 64-bit PC builds: everything it can point at is
 # kept below 4 GiB (switch/src/low_memory.cpp moves the program there).
 set(SMS_ARCH 64 CACHE STRING "" FORCE)
@@ -33,6 +46,8 @@ target_sources(sms PRIVATE
   ${SMS_SWITCH_DIR}/src/stack_switch.cpp
   ${SMS_SWITCH_DIR}/src/switch_main.cpp)
 target_include_directories(sms PRIVATE ${SMS_SWITCH_DIR}/src)
+set_source_files_properties(${SMS_SWITCH_DIR}/src/switch_main.cpp TARGET_DIRECTORY sms PROPERTIES COMPILE_DEFINITIONS
+  "SMS_SWITCH_APP=\"${SMS_SWITCH_APP}\";SMS_SWITCH_TITLE=\"${SMS_SWITCH_TITLE}\"")
 # Every thread spread over cores 0-2 (switch/src/performance.cpp).
 target_link_options(sms PRIVATE -Wl,--wrap=threadCreate)
 
@@ -67,14 +82,15 @@ target_link_libraries(sms PRIVATE ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouv
 
 # The icon (homebrew menu, HOME menu): SMS_SWITCH_ICON=
 #   steamgriddb (default)  the box art from SteamGridDB, fetched at build time,
-#                          else the disc's memory-card Mario (with a disc)
+#                          else the disc's memory-card Mario (with a disc);
+#                          Sunshine's art, so for Eclipse only the disc's
 #   disc                   the memory-card Mario from SMS_SWITCH_BUNDLE_DISC
 #   default                libnx's icon (what CI and releases use)
 #   /path/to/icon.jpg      your own 256x256 JPEG
 # (tools/make_icon.py; no art is kept in this repository.)
 set(SMS_SWITCH_ICON "steamgriddb" CACHE STRING "steamgriddb, disc, default, or a 256x256 JPEG")
 set(_icon_args "")
-if(SMS_SWITCH_ICON STREQUAL "steamgriddb")
+if(SMS_SWITCH_ICON STREQUAL "steamgriddb" AND NOT SMS_ECLIPSE)
   list(APPEND _icon_args --steamgriddb)
 endif()
 if(SMS_SWITCH_ICON MATCHES "^(steamgriddb|disc)$" AND SMS_SWITCH_BUNDLE_DISC AND EXISTS "${SMS_SWITCH_BUNDLE_DISC}")
@@ -82,7 +98,9 @@ if(SMS_SWITCH_ICON MATCHES "^(steamgriddb|disc)$" AND SMS_SWITCH_BUNDLE_DISC AND
 endif()
 set(SMS_SWITCH_ICON_FILE ${NX_DEFAULT_ICON})
 if(SMS_SWITCH_ICON MATCHES "\\.(jpg|jpeg)$")
-  set(SMS_SWITCH_ICON_FILE "${SMS_SWITCH_ICON}")
+  # Copied to icon.jpg, which the NSP (tools/make-nsp.sh) takes as well.
+  configure_file("${SMS_SWITCH_ICON}" ${CMAKE_BINARY_DIR}/icon.jpg COPYONLY)
+  set(SMS_SWITCH_ICON_FILE ${CMAKE_BINARY_DIR}/icon.jpg)
 elseif(_icon_args)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   execute_process(
@@ -99,18 +117,20 @@ elseif(_icon_args)
 endif()
 
 nx_generate_nacp(sms.nacp
-  NAME "Super Mario Sunshine"
+  NAME "${SMS_SWITCH_TITLE}"
   AUTHOR "sms-switch"
   VERSION "${PROJECT_VERSION}")
 nx_create_nro(sms
-  OUTPUT ${CMAKE_BINARY_DIR}/sms.nro
+  OUTPUT ${CMAKE_BINARY_DIR}/${SMS_SWITCH_APP}.nro
   NACP sms.nacp
   ICON ${SMS_SWITCH_ICON_FILE})
 
-# sms-standalone.nro (optional): the same program with your disc image inside
+# sms-standalone.nro (optional; sms-eclipse-standalone.nro with SMS_ECLIPSE and
+# the Eclipse disc): the same program with your disc image inside
 # its RomFS, so the SD card needs no image beside it. For your own use only:
 # it contains the game, so it must never be shared (CI never builds it).
 #   -DSMS_SWITCH_BUNDLE_DISC=/path/to/GMSE01.iso   (.iso, .gcm or .ciso)
+set(_standalone ${CMAKE_BINARY_DIR}/${SMS_SWITCH_APP}-standalone.nro)
 set(SMS_SWITCH_BUNDLE_DISC "" CACHE FILEPATH "Disc image to pack into sms-standalone.nro (personal use only)")
 #   -DSMS_SWITCH_BUNDLE_TEXTURES=/path/to/pack   an HD texture pack (the
 #   Switch's copy, tools/texpack/make-switch-pack.sh) packed beside it, as
@@ -119,7 +139,7 @@ set(SMS_SWITCH_BUNDLE_TEXTURES "" CACHE PATH "HD texture pack to pack into sms-s
 # A standalone NRO left from another image or pack (or none now) would be
 # stale: elf2nro reruns only when the program changes.
 if(NOT "${SMS_SWITCH_BUNDLE_DISC}|${SMS_SWITCH_BUNDLE_TEXTURES}" STREQUAL "${_SMS_SWITCH_BUNDLED}")
-  file(REMOVE ${CMAKE_BINARY_DIR}/sms-standalone.nro)
+  file(REMOVE ${_standalone})
   set(_SMS_SWITCH_BUNDLED "${SMS_SWITCH_BUNDLE_DISC}|${SMS_SWITCH_BUNDLE_TEXTURES}" CACHE INTERNAL "")
 endif()
 if(SMS_SWITCH_BUNDLE_DISC)
@@ -146,15 +166,18 @@ if(SMS_SWITCH_BUNDLE_DISC)
   endif()
   nx_create_nro(sms_standalone
     TARGET sms
-    OUTPUT ${CMAKE_BINARY_DIR}/sms-standalone.nro
+    OUTPUT ${_standalone}
     NACP sms.nacp
     ICON ${SMS_SWITCH_ICON_FILE}
     ROMFS ${_romfs})
-  message(STATUS "sms-switch: also building sms-standalone.nro with ${SMS_SWITCH_BUNDLE_DISC} inside")
+  message(STATUS "sms-switch: also building ${SMS_SWITCH_APP}-standalone.nro with ${SMS_SWITCH_BUNDLE_DISC} inside")
 endif()
 
 # gx_selftest.nro: the port's GX self-test on the Switch's GL stack (diagnosis).
 option(SMS_SWITCH_GX_SELFTEST "Also build gx_selftest.nro" ON)
+if(SMS_ECLIPSE)
+  set(SMS_SWITCH_GX_SELFTEST OFF) # the same as the plain build's
+endif()
 if(SMS_SWITCH_GX_SELFTEST)
   set(_gx ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/gx)
   add_executable(gx_selftest
