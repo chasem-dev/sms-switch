@@ -112,11 +112,15 @@ nx_create_nro(sms
 # it contains the game, so it must never be shared (CI never builds it).
 #   -DSMS_SWITCH_BUNDLE_DISC=/path/to/GMSE01.iso   (.iso, .gcm or .ciso)
 set(SMS_SWITCH_BUNDLE_DISC "" CACHE FILEPATH "Disc image to pack into sms-standalone.nro (personal use only)")
-# A standalone NRO left from another image (or none now) would be stale:
-# elf2nro reruns only when the program changes.
-if(NOT "${SMS_SWITCH_BUNDLE_DISC}" STREQUAL "${_SMS_SWITCH_BUNDLED}")
+#   -DSMS_SWITCH_BUNDLE_TEXTURES=/path/to/pack   an HD texture pack (the
+#   Switch's copy, tools/texpack/make-switch-pack.sh) packed beside it, as
+#   romfs:/textures: one file to copy instead of thousands
+set(SMS_SWITCH_BUNDLE_TEXTURES "" CACHE PATH "HD texture pack to pack into sms-standalone.nro")
+# A standalone NRO left from another image or pack (or none now) would be
+# stale: elf2nro reruns only when the program changes.
+if(NOT "${SMS_SWITCH_BUNDLE_DISC}|${SMS_SWITCH_BUNDLE_TEXTURES}" STREQUAL "${_SMS_SWITCH_BUNDLED}")
   file(REMOVE ${CMAKE_BINARY_DIR}/sms-standalone.nro)
-  set(_SMS_SWITCH_BUNDLED "${SMS_SWITCH_BUNDLE_DISC}" CACHE INTERNAL "")
+  set(_SMS_SWITCH_BUNDLED "${SMS_SWITCH_BUNDLE_DISC}|${SMS_SWITCH_BUNDLE_TEXTURES}" CACHE INTERNAL "")
 endif()
 if(SMS_SWITCH_BUNDLE_DISC)
   if(NOT EXISTS "${SMS_SWITCH_BUNDLE_DISC}")
@@ -127,11 +131,19 @@ if(SMS_SWITCH_BUNDLE_DISC)
   if(NOT _disc_ext MATCHES "^\\.(iso|gcm|ciso)$")
     message(FATAL_ERROR "SMS_SWITCH_BUNDLE_DISC: expected an .iso, .gcm or .ciso file")
   endif()
-  # The RomFS holds only the image, as romfs:/disc<ext> (a link, not a copy).
+  # The RomFS holds the image, as romfs:/disc<ext>, and the texture pack, as
+  # romfs:/textures/ (links, not copies; build_romfs follows them).
   set(_romfs ${CMAKE_BINARY_DIR}/standalone-romfs)
   file(REMOVE_RECURSE ${_romfs})
   file(MAKE_DIRECTORY ${_romfs})
   file(CREATE_LINK "${SMS_SWITCH_BUNDLE_DISC}" ${_romfs}/disc${_disc_ext} SYMBOLIC)
+  if(SMS_SWITCH_BUNDLE_TEXTURES)
+    if(NOT IS_DIRECTORY "${SMS_SWITCH_BUNDLE_TEXTURES}")
+      message(FATAL_ERROR "SMS_SWITCH_BUNDLE_TEXTURES: ${SMS_SWITCH_BUNDLE_TEXTURES} is not a directory")
+    endif()
+    file(CREATE_LINK "${SMS_SWITCH_BUNDLE_TEXTURES}" ${_romfs}/textures SYMBOLIC)
+    message(STATUS "sms-switch: and the texture pack ${SMS_SWITCH_BUNDLE_TEXTURES}")
+  endif()
   nx_create_nro(sms_standalone
     TARGET sms
     OUTPUT ${CMAKE_BINARY_DIR}/sms-standalone.nro

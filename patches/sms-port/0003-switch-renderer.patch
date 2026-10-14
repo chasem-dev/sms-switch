@@ -22,9 +22,28 @@ Renderer adjustments for the Switch's Mesa (nouveau) GL 4.3 stack (__SWITCH__).
 - the program cache keeps the whole records before a damaged one, and is
   closed and opened again after each stage's warm-up: a game closed from the
   HOME menu leaves its open files at an older size (gx_shader.cpp)
+- SMS_TEXTURE_PACKS separated by ';' only: Switch paths begin with a device
+  name and a colon (romfs:/textures) (gx_hires.cpp)
 - both sticks pressed together (L3 + R3) toggle the debug overlay, as the
   backtick key does on a PC (gx_platform.cpp)
 
+diff --git a/platform/gx/src/gx_hires.cpp b/platform/gx/src/gx_hires.cpp
+index bcd4174..2fe02b4 100644
+--- a/platform/gx/src/gx_hires.cpp
++++ b/platform/gx/src/gx_hires.cpp
+@@ -184,7 +184,12 @@ static void scan() {
+     if (e && *e) {
+         std::string all = e, cur;
+         for (char c : all + ";") {
++#ifdef __SWITCH__
++            // paths begin with a device (sdmc:/, romfs:/): ';' only
++            if (c == ';') {
++#else
+             if (c == ';' || (c == ':' && !(cur.size() == 1 && isalpha(uint8_t(cur[0]))))) {
++#endif
+                 if (!cur.empty()) dirs.push_back(cur);
+                 cur.clear();
+             } else {
 diff --git a/platform/gx/src/gx_platform.cpp b/platform/gx/src/gx_platform.cpp
 index f2c1fc4..f61038d 100644
 --- a/platform/gx/src/gx_platform.cpp

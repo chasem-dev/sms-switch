@@ -324,6 +324,18 @@ __attribute__((constructor(101))) static void switch_start(void)
 			fprintf(stderr, "[switch] no disc image (.iso, .gcm, .ciso) in %s or %s/rom\n", g_dir.c_str(),
 			        g_dir.c_str());
 	}
+	// An HD texture pack packed with the image (SMS_SWITCH_BUNDLE_TEXTURES),
+	// read after one on the SD card (mods/textures/, the PC port's place).
+	if (!getenv("SMS_TEXTURE_PACKS")) {
+		for (const char* dir : {"romfs:/textures", "standalone:/textures"}) {
+			struct stat st;
+			if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+				setenv("SMS_TEXTURE_PACKS", (std::string("mods/textures;") + dir).c_str(), 1);
+				fprintf(stderr, "[switch] HD texture pack packed in this NRO (%s)\n", dir);
+				break;
+			}
+		}
+	}
 }
 
 // The game's threads keep running until the process ends, and the low windows

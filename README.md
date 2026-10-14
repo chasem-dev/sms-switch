@@ -105,7 +105,7 @@ This repository adds what the Switch needs:
 
 The PC port's texture packs work here too (`sdmc:/switch/sms/mods/textures/`), but a pack made for PCs has textures far larger than the Switch can hold: the UHD pack's 157 textures of 4096-16384 pixels are 2.1 GiB of its 3 GiB, up to 256 MiB of GPU memory each.
 `tools/texpack/make-switch-pack.sh PACK_DIR OUT_DIR [MAX]` makes the Switch's copy: those cut to at most 2048 pixels (their own mip levels where they have them, else decoded, halved and encoded again with [bc7enc](https://github.com/richgel999/bc7enc_rdo)), everything else as it is. The UHD pack becomes 1.3 GiB in about 90 seconds.
-Copy OUT_DIR's contents to `sdmc:/switch/sms/mods/textures/`; `SMS_TEXTURE_PACKS=0` turns them off for a comparison, and at most 1 GiB is kept in memory (`SMS_TEXTURE_PACK_MB`).
+Copy OUT_DIR's contents to `sdmc:/switch/sms/mods/textures/`, or pack them into `sms-standalone.nro` with `SMS_SWITCH_TEXTURES=OUT_DIR ./build.sh` (with `SMS_SWITCH_DISC`; remembered like it): one 2.9 GB file copies over USB (MTP) in about 4 minutes, where its 2400 files one by one take hours. A pack on the SD card is read first, then the packed one; `SMS_TEXTURE_PACKS=0` turns them off for a comparison, and at most 1 GiB is kept in memory (`SMS_TEXTURE_PACK_MB`).
 
 ## Shader cache
 

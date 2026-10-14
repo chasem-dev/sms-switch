@@ -12,6 +12,11 @@
 #                         inside (personal use only: never share it). Once given,
 #                         it is remembered (.bundled-disc, kept by --clean);
 #                         SMS_SWITCH_DISC= (empty) turns it off.
+#   SMS_SWITCH_TEXTURES=/path/pack ./build.sh
+#                         with SMS_SWITCH_DISC, also pack that HD texture pack
+#                         (tools/texpack/make-switch-pack.sh's output) into
+#                         sms-standalone.nro; remembered (.bundled-textures),
+#                         SMS_SWITCH_TEXTURES= turns it off.
 #   SMS_SWITCH_KEYS=/path/prod.keys ./build.sh
 #                         also pack build/nsp/sms-switch.nsp, an installable title
 #                         (HOME menu icon, full memory) that starts the NRO from
@@ -62,6 +67,28 @@ if [[ -n "${SMS_SWITCH_DISC:-}" ]]; then
 elif [[ -n "${SMS_SWITCH_DISC+set}" ]]; then
 	disc_args=(-DSMS_SWITCH_BUNDLE_DISC=)
 	rm -f "$remember"
+fi
+
+# The texture pack for sms-standalone.nro, remembered in .bundled-textures
+# (Docker sees it at /textures).
+textures_memory="$here/.bundled-textures"
+if [[ -z "${SMS_SWITCH_TEXTURES+set}" && -f "$textures_memory" ]]; then
+	SMS_SWITCH_TEXTURES="$(cat "$textures_memory")"
+fi
+docker_textures=()
+if [[ -n "${SMS_SWITCH_TEXTURES:-}" ]]; then
+	textures="$(realpath "$SMS_SWITCH_TEXTURES" 2>/dev/null || true)"
+	[[ -d "$textures" ]] || { echo "build.sh: no texture pack at $SMS_SWITCH_TEXTURES (SMS_SWITCH_TEXTURES= stops bundling it)" >&2; exit 1; }
+	if [[ "${SMS_SWITCH_NATIVE:-0}" == 1 ]]; then
+		disc_args+=(-DSMS_SWITCH_BUNDLE_TEXTURES="$textures")
+	else
+		disc_args+=(-DSMS_SWITCH_BUNDLE_TEXTURES=/textures)
+		docker_textures=(-v "$textures:/textures:ro")
+	fi
+	printf '%s\n' "$textures" > "$textures_memory"
+elif [[ -n "${SMS_SWITCH_TEXTURES+set}" ]]; then
+	disc_args+=(-DSMS_SWITCH_BUNDLE_TEXTURES=)
+	rm -f "$textures_memory"
 fi
 
 # The installable NSP (tools/make-nsp.sh), with your console's keys.
@@ -117,7 +144,7 @@ else
 	mkdir -p "$ccache_dir"
 	docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
 		-v "$ccache_dir:/ccache" -e CCACHE_DIR=/ccache -e CCACHE_BASEDIR=/src -e CCACHE_MAXSIZE=5G \
-		${SMS_SWITCH_DOCKER_ARGS:-} "${docker_disc[@]}" "${docker_keys[@]}" \
+		${SMS_SWITCH_DOCKER_ARGS:-} "${docker_disc[@]}" "${docker_textures[@]}" "${docker_keys[@]}" \
 		-v "$here:/src" -w /src "$image" bash -c "$inner"
 fi
 echo "build.sh: built $here/build/sms.nro"
