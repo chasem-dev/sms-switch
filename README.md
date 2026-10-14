@@ -40,13 +40,12 @@ On a 4-core i5-6600K a first build takes about 3 minutes, a rebuild from scratch
 
 ### Installed on the HOME menu (NSP)
 
-`SMS_SWITCH_KEYS=/path/to/prod.keys ./build.sh` also packs `build/nsp/sms-switch.nsp`: an installable title with its own HOME menu icon that starts the game with a game's full memory, no R-hold needed.
+`SMS_SWITCH_KEYS=/path/to/prod.keys ./build.sh` also packs `build/nsp/sms-switch.nsp` ([installing it](#install-on-the-home-menu-nsp-with-dbi)): an installable title with its own HOME menu icon that starts the game with a game's full memory, no R-hold needed.
 Its program is [nx-hbloader](https://github.com/switchbrew/nx-hbloader) (`third_party/`, the homebrew menu's own loader) set to start `sdmc:/switch/sms/sms-standalone.nro` (with `SMS_SWITCH_DISC`) or `sdmc:/switch/sms/sms.nro`; `SMS_SWITCH_NSP_NRO=sdmc:/...` picks another.
 Install it with Goldleaf or DBI; the NRO stays on the SD card, so updating the game is copying a new NRO.
 With the Eclipse build (below) it also packs `build/nsp/sms-eclipse.nsp`, a second title ("Super Mario Eclipse", its own icon) that starts `sdmc:/switch/sms/sms-eclipse-standalone.nro` (with `SMS_SWITCH_ECLIPSE_DISC`) or `sdmc:/switch/sms-eclipse/sms-eclipse.nro`; `SMS_SWITCH_ECLIPSE_NSP_NRO=sdmc:/...` picks another.
 
-- The keys are your console's: boot the Lockpick_RCM payload from Hekate and dump them to `sdmc:/switch/prod.keys`. Only their path is remembered (`.switch-keys`); they are mounted read-only into the build and never leave your machine.
-- Installing a self-made NSP needs sigpatches on the console.
+- Only the keys' path is remembered (`.switch-keys`); they are mounted read-only into the build and never leave your machine.
 - The icon is `SMS_SWITCH_ICON` (below), for the NRO and the NSP alike.
 
 ### With your disc image inside (personal use)
@@ -68,7 +67,7 @@ Its icon is the Eclipse disc's memory-card icon, or `SMS_SWITCH_ECLIPSE_ICON=/pa
 
 1. Download `sms-switch.zip` from the [latest release](https://github.com/chasem-dev/sms-switch/releases) and extract it to the root of the SD card (it holds `switch/sms/sms.nro`, and `switch/sms-eclipse/sms-eclipse.nro` for Super Mario Eclipse, below), or copy your own `build/sms.nro` to `sdmc:/switch/sms/sms.nro`.
 2. Put the disc image beside it: `sdmc:/switch/sms/` (or `sdmc:/switch/sms/rom/`), as `.iso`, `.gcm` or Dolphin `.ciso`, any file name.
-3. Start it from the homebrew menu **through a game**: on the HOME menu hold R while starting any game (installed or cartridge) until the homebrew menu appears, then pick it. Nothing is installed; homebrew started that way gets the game's memory.
+3. Start it from the homebrew menu **through a game**: on the HOME menu hold R while starting any game (installed or cartridge) until the homebrew menu appears, then pick it. Nothing is installed; homebrew started that way gets the game's memory. Or [install it on the HOME menu](#install-on-the-home-menu-nsp-with-dbi), with no R-hold.
    Started from the Album (applet mode) it only shows a message: on a console it had 86 MiB left there, and Mesa could not create the window surface.
 
 Everything else lives in the same folder:
@@ -83,6 +82,36 @@ Everything else lives in the same folder:
 
 The game fills the screen (720p handheld, 1080p docked) in 16:9 widescreen at 30 fps, with the gameplay HUD at the screen's edges and the camera stick inverted on both axes; `settings.txt` changes any of that (`widescreen = off` for the original 4:3, `widescreen_hud = centre`, `frame_rate = 60`, `camera_invert_x = 0`, `camera_invert_y = 0`).
 Leaving through HOME ends the game as closing any game does; it does not return to the homebrew menu.
+
+## Install on the HOME menu (NSP, with DBI)
+
+An NSP puts the game on the HOME menu with its own icon, so it starts like any installed game, with no R-hold.
+It is a small launcher: the game itself stays the NRO on the SD card.
+Releases include no NSPs, because making one takes your own console's keys; you build them yourself, once.
+
+You need a Switch running Atmosphère with sigpatches (a self-made NSP is not signed by Nintendo), [DBI](https://github.com/rashevskyv/dbi) or Goldleaf, and a computer with Docker and git.
+
+1. **Dump your keys.** In Hekate, run the Lockpick_RCM payload and dump the keys; it writes `sdmc:/switch/prod.keys`. Copy that file to your computer, and keep it private.
+2. **Build the NSPs:**
+   ```sh
+   git clone --recursive https://github.com/chasem-dev/sms-switch.git
+   cd sms-switch
+   SMS_SWITCH_KEYS=/path/to/prod.keys SMS_SWITCH_ECLIPSE=1 ./build.sh
+   ```
+   That makes `build/nsp/sms-switch.nsp` (Super Mario Sunshine) and `build/nsp/sms-eclipse.nsp` (Super Mario Eclipse); leave out `SMS_SWITCH_ECLIPSE=1` for Sunshine alone.
+3. **Put the games on the SD card**, as in [Install and play](#install-and-play) (the NSPs start these files):
+
+   | Game | Folder | Files |
+   | --- | --- | --- |
+   | Super Mario Sunshine | `sdmc:/switch/sms/` | `sms.nro` and your GMSE01 disc image |
+   | Super Mario Eclipse | `sdmc:/switch/sms-eclipse/` | `sms-eclipse.nro` and your GMSE04 Eclipse disc image |
+
+4. **Copy the `.nsp` files** to the SD card (anywhere, for example its root).
+5. **Install them with DBI:** open DBI from the homebrew menu, browse the SD card, select each `.nsp` and install it. Delete the `.nsp` files afterwards if you like.
+6. **Play:** start "Super Mario Sunshine" or "Super Mario Eclipse" from the HOME menu.
+
+To update a game, copy its new NRO over the old one; the installed NSP keeps working.
+Build and install the NSP again only to change its icon or the file it starts (see [Installed on the HOME menu](#installed-on-the-home-menu-nsp)).
 
 ## Controls
 
