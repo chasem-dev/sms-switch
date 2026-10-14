@@ -285,6 +285,14 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// right) rather than the 4:3 middle (widescreen_hud = centre for that).
 	if (!getenv("SMS_WIDESCREEN_HUD") && !settings_has(g_dir, "widescreen_hud"))
 		setenv("SMS_WIDESCREEN_HUD", "edges", 1);
+	// The camera stick inverted on both axes (camera_invert_x / _y = 0 in
+	// settings.txt, or SMS_CAMERA_INVERT_X=0 in env.txt, for the game's own).
+	for (const char* axis : {"X", "Y"}) {
+		const std::string name = std::string("SMS_CAMERA_INVERT_") + axis;
+		const std::string key = std::string("camera_invert_") + char(axis[0] - 'A' + 'a');
+		if (!getenv(name.c_str()) && !settings_has(g_dir, key.c_str()))
+			setenv(name.c_str(), "1", 1);
+	}
 	// Mesa here advertises parallel shader compiles but compiles one at a
 	// time: the warm-up's parallel mode (batches of 32 extra programs per
 	// stage load) stalled a load for 6 s. Serial: a stage's own programs, and
