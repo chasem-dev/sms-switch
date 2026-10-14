@@ -204,11 +204,13 @@ elif [[ -n "${SMS_SWITCH_KEYS+set}" ]]; then
 	rm -f "$keys_memory" "$here/build/nsp/sms-switch.nsp" "$here/build/nsp/sms-eclipse.nsp"
 fi
 
-# The Eclipse build: its own tree, build/eclipse, beside the plain one.
+# The Eclipse build: its own tree, build/eclipse, beside the plain one, with
+# the same Mesa (build/mesa from tools/mesa/build-mesa.sh, when it is there).
 eclipse_cmd=""
 if [[ "${SMS_SWITCH_ECLIPSE:-0}" == 1 ]]; then
 	eclipse_cmd="cmake -S /src -B /src/build/eclipse -G Ninja -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake \\
-	-DCMAKE_BUILD_TYPE=Release -DSMS_ECLIPSE=ON -DSMS_COMPILER_CACHE=\$cache ${eclipse_disc_args[*]@Q} $*
+	-DCMAKE_BUILD_TYPE=Release -DSMS_ECLIPSE=ON -DSMS_SWITCH_MESA_DIR=/src/build/mesa -DSMS_COMPILER_CACHE=\$cache \\
+	${eclipse_disc_args[*]@Q} $*
 cmake --build /src/build/eclipse -j $jobs"
 fi
 
@@ -229,7 +231,8 @@ if [[ "${SMS_SWITCH_NATIVE:-0}" == 1 ]]; then
 	cmake --build "$here/build" -j "$jobs"
 	if [[ "${SMS_SWITCH_ECLIPSE:-0}" == 1 ]]; then
 		cmake -S "$here" -B "$here/build/eclipse" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
-			-DCMAKE_BUILD_TYPE=Release -DSMS_ECLIPSE=ON -DSMS_COMPILER_CACHE="$(command -v ccache || true)" \
+			-DCMAKE_BUILD_TYPE=Release -DSMS_ECLIPSE=ON -DSMS_SWITCH_MESA_DIR="$here/build/mesa" \
+			-DSMS_COMPILER_CACHE="$(command -v ccache || true)" \
 			"${eclipse_disc_args[@]}" "$@"
 		cmake --build "$here/build/eclipse" -j "$jobs"
 	fi

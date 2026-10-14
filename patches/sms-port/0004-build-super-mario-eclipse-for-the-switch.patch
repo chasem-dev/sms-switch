@@ -16,6 +16,9 @@ Build Super Mario Eclipse (-DSMS_ECLIPSE=ON) for the Nintendo Switch.
 - SunshineHeaderInterface's TSmallEnemy::changeByJuice, doKeepDistance,
   isFindMario (u32, the game's bool) and isInhibitedForceMove (bool, the
   game's BOOL) declared as the decomp declares them (abi_check.py failed)
+- BetterSunshineEngine's itoa(dst, num, base) renamed (sms_bse_itoa): linked
+  into the program it replaced the C library's itoa(num, dst, base), which
+  the Switch's SDL2 calls at start-up (a crash at address 0 on the console)
 
 diff --git a/cmake/eclipse.cmake b/cmake/eclipse.cmake
 index 386511c..bc901b0 100644
@@ -77,7 +80,7 @@ index 386511c..bc901b0 100644
  # Functions the mods call out of line that the decomp only has inline, and
  # SDK functions the retail game never needed: built with the game's flags.
 diff --git a/platform/mods/eclipse/fixup_sources.py b/platform/mods/eclipse/fixup_sources.py
-index c339605..a79348f 100644
+index c339605..6c9a3b2 100644
 --- a/platform/mods/eclipse/fixup_sources.py
 +++ b/platform/mods/eclipse/fixup_sources.py
 @@ -163,6 +163,9 @@ SHI_GAME_TYPES = [
@@ -90,10 +93,21 @@ index c339605..a79348f 100644
      game_types("include/SMS/MapObj/MapObjBase.hxx", r"\bvirtual u32(\s+getHitObjNumMax\s*\()", r"virtual u16\1"),
      game_types("include/SMS/MoveBG/EggYoshi.hxx", r"\bvirtual u32(\s+getHitObjNumMax\s*\()", r"virtual u16\1"),
      game_types("include/SMS/MSound/MSound.hxx", r"\bbool(\s+getMapInfoGround\s*\(u32\);)", r"u32\1"),
-@@ -337,6 +340,11 @@ ECLIPSE_FIXES = optional(TEXTURE_FIXES) + CARD_IMAGE_FIXES + PARTICLE_FIXES + DE
+@@ -337,6 +340,22 @@ ECLIPSE_FIXES = optional(TEXTURE_FIXES) + CARD_IMAGE_FIXES + PARTICLE_FIXES + DE
       "Eclipse's settings group knows its module"),
  ]
  BSE_FIXES = TEXTURE_FIXES + CARD_IMAGE_FIXES + optional([RAWADDR_FIX]) + [RAWDATA_FIX, RAWDATA_REGION_FIX] + BSE_BE_FIXES + PATCH_TYPE_FIXES + [
++    # BSE's itoa(dst, num, base) is linked into the program, where it took
++    # the place of the C library's itoa(num, dst, base) for every caller:
++    # newlib has one, and the Switch's SDL2 calls it (SDL_itoa, naming the
++    # display), which wrote the digits to address 0 and crashed at start-up.
++    # The mods never call it; renamed, the C library's is left alone.
++    ("src/cstd/stdlib.c", r"\bvoid itoa\(char \*dst,", "void sms_bse_itoa(char *dst,",
++     "BSE's itoa does not replace the C library's"),
++    ("include/BetterSMS/cstd/stdlib.h", r"\bvoid itoa\(char \*dst,", "void sms_bse_itoa(char *dst,",
++     "BSE's itoa does not replace the C library's"),
++    ("src/module.cpp", r"\bKURIBO_EXPORT\(itoa\);", 'KURIBO_EXPORT_AS(sms_bse_itoa, "itoa");',
++     "BSE's itoa does not replace the C library's"),
 +    # The disc ID and its audio streaming flag, likewise.
 +    ("src/settings.cpp", r"#define DISK_GAME_ID \(void \*\)0x80000000\b", "#define DISK_GAME_ID (void *)port_mem1_base",
 +     "the disc ID is read from the port's MEM1"),
@@ -102,7 +116,7 @@ index c339605..a79348f 100644
      # J2DTextBox owns and deletes its string. The setting label and shadow
      # cannot share a heap buffer; keep independent 100-byte allocations and
      # mirror edits into the shadow so it still displays the current value.
-@@ -432,6 +440,11 @@ BSE_FIXES = TEXTURE_FIXES + CARD_IMAGE_FIXES + optional([RAWADDR_FIX]) + [RAWDAT
+@@ -432,6 +451,11 @@ BSE_FIXES = TEXTURE_FIXES + CARD_IMAGE_FIXES + optional([RAWADDR_FIX]) + [RAWDAT
  ] + FRAME_RATE_FIXES + ASPECT_RATIO_FIXES
  MOVESET_FIXES = optional(TEXTURE_FIXES + [RAWADDR_FIX]) + CARD_IMAGE_FIXES
  SHI_FIXES = BOOL_RET_FIXES + SHI_WORD_FIXES + SHI_GAME_TYPES + [
