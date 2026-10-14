@@ -215,12 +215,12 @@ void take_env_arguments()
 // The image packed into sms-standalone.nro beside this NRO: a quick-to-send
 // sms.nro (nxlink) uses its disc without a 1.4 GB image of its own (likewise
 // sms-eclipse.nro and sms-eclipse-standalone.nro).
-std::string find_standalone_disc_image(const std::string& dir)
+// Mounts the RomFS of the NRO at `path` as `name`:; false if it has none.
+bool mount_nro_romfs(const std::string& path, const char* name)
 {
-	const std::string path = dir + "/" SMS_SWITCH_APP "-standalone.nro";
 	FILE* f = fopen(path.c_str(), "rb");
 	if (!f)
-		return std::string();
+		return false;
 	NroStart start;
 	NroHeader header;
 	NroAssetHeader assets;
@@ -228,7 +228,13 @@ std::string find_standalone_disc_image(const std::string& dir)
 	          header.magic == 0x304f524e && fseek(f, header.size, SEEK_SET) == 0 &&
 	          fread(&assets, sizeof assets, 1, f) == 1 && assets.magic == 0x54455341 && assets.romfs.size;
 	fclose(f);
-	if (!ok || R_FAILED(romfsMountFromFsdev(path.c_str(), header.size + assets.romfs.offset, "standalone")))
+	return ok && R_SUCCEEDED(romfsMountFromFsdev(path.c_str(), header.size + assets.romfs.offset, name));
+}
+
+std::string find_standalone_disc_image(const std::string& dir)
+{
+	const std::string path = dir + "/" SMS_SWITCH_APP "-standalone.nro";
+	if (!mount_nro_romfs(path, "standalone"))
 		return std::string();
 	for (const char* name : {"standalone:/disc.iso", "standalone:/disc.gcm", "standalone:/disc.ciso"}) {
 		struct stat st;
@@ -372,14 +378,29 @@ __attribute__((constructor(101))) static void switch_start(void)
 	}
 	// An HD texture pack packed with the image (SMS_SWITCH_BUNDLE_TEXTURES),
 	// read after one on the SD card (mods/textures/, the PC port's place).
+	// A program without one of its own (Super Mario Eclipse) reads the one in
+	// Sunshine's sms-standalone.nro, beside it or in sdmc:/switch/sms/: the
+	// same textures, without a second 1.4 GB copy on the card.
 	if (!getenv("SMS_TEXTURE_PACKS")) {
-		for (const char* dir : {"romfs:/textures", "standalone:/textures"}) {
+		auto is_dir = [](const char* dir) {
 			struct stat st;
-			if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-				setenv("SMS_TEXTURE_PACKS", (std::string("mods/textures;") + dir).c_str(), 1);
-				fprintf(stderr, "[switch] HD texture pack packed in this NRO (%s)\n", dir);
-				break;
-			}
+			return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+		};
+		std::string found;
+		for (const char* dir : {"romfs:/textures", "standalone:/textures"})
+			if (found.empty() && is_dir(dir))
+				found = dir;
+		if (found.empty() && strcmp(SMS_SWITCH_APP, "sms") != 0)
+			for (const std::string& nro : {g_dir + "/sms-standalone.nro", std::string("sdmc:/switch/sms/sms-standalone.nro")})
+				if (found.empty() && mount_nro_romfs(nro, "sunshine")) {
+					if (is_dir("sunshine:/textures"))
+						found = "sunshine:/textures";
+					else
+						romfsUnmount("sunshine");
+				}
+		if (!found.empty()) {
+			setenv("SMS_TEXTURE_PACKS", ("mods/textures;" + found).c_str(), 1);
+			fprintf(stderr, "[switch] HD texture pack packed in %s\n", found.c_str());
 		}
 	}
 }

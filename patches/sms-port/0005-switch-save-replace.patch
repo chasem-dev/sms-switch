@@ -1,0 +1,58 @@
+Saves on the Switch: replace the old file before renaming the new one over it
+(__SWITCH__).
+
+The Switch's file system, like Windows', does not let rename() replace an
+existing file, so every memory card save after a file's first stayed in its
+.tmp and the game read the old file back on the next start (and the card's
+index never listed files made later, such as Eclipse's). The old file now
+goes first there too, as on Windows; a .tmp left between the two steps is
+picked up on load (card.cpp, state_file.cpp).
+
+diff --git a/platform/card/card.cpp b/platform/card/card.cpp
+index 0158a03..b4774e8 100644
+--- a/platform/card/card.cpp
++++ b/platform/card/card.cpp
+@@ -126,8 +126,8 @@ bool read_all(const std::string& path, std::vector<u8>& out)
+ }
+ 
+ // Writes path through path.tmp, so a stop mid-write never leaves a cut-short
+-// file. (Windows' rename does not replace: the old file goes first, and load
+-// picks up a .tmp left between the two steps.)
++// file. (Windows' and the Switch's rename do not replace: the old file goes
++// first, and load picks up a .tmp left between the two steps.)
+ bool write_file(const std::string& path, const void* data, size_t size)
+ {
+ 	const std::string tmp = path + ".tmp";
+@@ -140,7 +140,7 @@ bool write_file(const std::string& path, const void* data, size_t size)
+ 		port_log("[card] could not write %s\n", path.c_str());
+ 		return false;
+ 	}
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__SWITCH__)
+ 	remove(path.c_str());
+ #endif
+ 	if (rename(tmp.c_str(), path.c_str()) != 0) {
+@@ -150,7 +150,7 @@ bool write_file(const std::string& path, const void* data, size_t size)
+ 	return true;
+ }
+ 
+-// a file whose write was cut between its two steps on Windows: the new one is complete
++// a file whose write was cut between its two steps on Windows or the Switch: the new one is complete
+ void finish_write(const std::string& path)
+ {
+ 	FILE* fp = fopen(path.c_str(), "rb");
+diff --git a/platform/savestate/state_file.cpp b/platform/savestate/state_file.cpp
+index 7774b0e..ac9debb 100644
+--- a/platform/savestate/state_file.cpp
++++ b/platform/savestate/state_file.cpp
+@@ -211,8 +211,8 @@ bool write_file(const std::string& path, const std::vector<Chunk>& chunks)
+ 	}
+ 	ok = fclose(f) == 0 && ok;
+ 	if (ok) {
+-#ifdef _WIN32
+-		remove(path.c_str()); // rename does not replace on Windows
++#if defined(_WIN32) || defined(__SWITCH__)
++		remove(path.c_str()); // rename does not replace on Windows or the Switch
+ #endif
+ 		ok = rename(temporary.c_str(), path.c_str()) == 0;
+ 	}
