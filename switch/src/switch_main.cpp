@@ -326,6 +326,15 @@ __attribute__((constructor(101))) static void switch_start(void)
 		if (!getenv(name.c_str()) && !settings_has(g_dir, key.c_str()))
 			setenv(name.c_str(), "1", 1);
 	}
+	// The game's A B X Y on the Switch buttons labelled so, as the prompts
+	// show them. devkitPro's SDL maps them by position as on an Xbox pad
+	// (a:b1, b:b0, x:b3, y:b2), which put the GameCube's A on the Switch's B.
+	// SDL_GAMECONTROLLERCONFIG in env.txt replaces this mapping.
+	setenv("SDL_GAMECONTROLLERCONFIG",
+	       "000038f853776974636820436f6e7400,Switch Controller,a:b0,b:b1,back:b11,dpdown:b15,dpleft:b12,"
+	       "dpright:b14,dpup:b13,leftshoulder:b6,leftstick:b4,lefttrigger:b8,leftx:a0,lefty:a1,"
+	       "rightshoulder:b7,rightstick:b5,righttrigger:b9,rightx:a2,righty:a3,start:b10,x:b2,y:b3,",
+	       0);
 	// Button prompts as the Switch's buttons (button_prompts = gamecube in
 	// settings.txt for the game's own), from prompts/switch.png beside the NRO,
 	// written there from the program's copy when missing (replace it to

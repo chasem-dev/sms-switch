@@ -82,6 +82,7 @@ Everything else lives in the same folder:
 
 The game fills the screen (720p handheld, 1080p docked) in 16:9 widescreen at 30 fps, with the gameplay HUD at the screen's edges and the camera stick inverted on both axes; `settings.txt` changes any of that (`widescreen = off` for the original 4:3, `widescreen_hud = centre`, `frame_rate = 60`, `camera_invert_x = 0`, `camera_invert_y = 0`).
 Button prompts in the game's text show the Switch's buttons (`button_prompts = gamecube` for the game's own); the images are `prompts/switch.png` beside the NRO, written there on the first start, and can be replaced (eight 64x64 icons in a row: A B X Y Z L R C-stick, here A B X Y R ZL ZR and the right stick; `tools/make_prompts.py` draws the default).
+A B X Y are the Switch buttons labelled so, as the prompts show them (devkitPro's SDL had mapped them by position, putting the GameCube's A on the Switch's B); `SDL_GAMECONTROLLERCONFIG` in `env.txt` replaces that mapping, and `bindings.txt` rebinds buttons as on the PC.
 Leaving through HOME ends the game as closing any game does; it does not return to the homebrew menu.
 
 ## Install on the HOME menu (NSP, with DBI)
