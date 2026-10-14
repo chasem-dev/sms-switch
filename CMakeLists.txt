@@ -38,7 +38,32 @@ target_link_options(sms PRIVATE -Wl,--wrap=threadCreate)
 
 # Mesa (OpenGL over nouveau). Its pkg-config files carry an unexpanded
 # $(DEVKITPRO), so the libraries are named directly; order matters.
-target_link_libraries(sms PRIVATE EGL glapi drm_nouveau)
+# tools/mesa/build-mesa.sh builds it with the disk shader cache into
+# build/mesa/; when that is there, everything that links EGL and glapi
+# (SDL2's target too) takes those instead of the installed switch-mesa.
+set(SMS_SWITCH_MESA_DIR "${CMAKE_BINARY_DIR}/mesa" CACHE PATH "Mesa built by tools/mesa/build-mesa.sh")
+if(EXISTS "${SMS_SWITCH_MESA_DIR}/lib/libEGL.a")
+  set(SMS_SWITCH_EGL "${SMS_SWITCH_MESA_DIR}/lib/libEGL.a")
+  set(SMS_SWITCH_GLAPI "${SMS_SWITCH_MESA_DIR}/lib/libglapi.a")
+  file(READ "${SMS_SWITCH_MESA_DIR}/cache-id" _mesa_id)
+  string(STRIP "${_mesa_id}" _mesa_id)
+  message(STATUS "sms-switch: Mesa with the shader cache (${_mesa_id})")
+  foreach(_t SDL2::SDL2-static SDL2::SDL2)
+    if(TARGET ${_t})
+      get_target_property(_libs ${_t} INTERFACE_LINK_LIBRARIES)
+      if(_libs)
+        list(TRANSFORM _libs REPLACE "^(-l)?EGL$" "${SMS_SWITCH_EGL}")
+        list(TRANSFORM _libs REPLACE "^(-l)?glapi$" "${SMS_SWITCH_GLAPI};z")
+        set_target_properties(${_t} PROPERTIES INTERFACE_LINK_LIBRARIES "${_libs}")
+      endif()
+    endif()
+  endforeach()
+else()
+  set(SMS_SWITCH_EGL EGL)
+  set(SMS_SWITCH_GLAPI glapi)
+  message(STATUS "sms-switch: the installed switch-mesa (no shader cache; tools/mesa/build-mesa.sh builds one)")
+endif()
+target_link_libraries(sms PRIVATE ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouveau z)
 
 # The icon (homebrew menu, HOME menu): SMS_SWITCH_ICON=
 #   steamgriddb (default)  the box art from SteamGridDB, fetched at build time,
@@ -137,6 +162,6 @@ if(SMS_SWITCH_GX_SELFTEST)
     ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/decomp/include ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/decomp/libs/dolphin/include
     ${_gx}/src ${SMS_SWITCH_DIR}/src)
   target_compile_features(gx_selftest PRIVATE cxx_std_17)
-  target_link_libraries(gx_selftest PRIVATE sms_gx EGL glapi drm_nouveau)
+  target_link_libraries(gx_selftest PRIVATE sms_gx ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouveau z)
   nx_create_nro(gx_selftest OUTPUT ${CMAKE_BINARY_DIR}/gx_selftest.nro NOICON NONACP)
 endif()

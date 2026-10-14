@@ -44,6 +44,13 @@ u32 env_mhz(const char* name, u32 fallback)
 extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem, size_t stack_sz,
                                       int prio, int cpuid)
 {
+	static int on = -1;
+	if (on < 0) {
+		const char* e = getenv("SMS_SWITCH_SPREAD_THREADS");
+		on = !(e && *e == '0');
+	}
+	if (!on)
+		return __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
 	if (prio == 0x3B) // libnx's pthread_create
 		prio = kMainPriority;
 	const bool spread = cpuid == -2;

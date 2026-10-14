@@ -11,6 +11,17 @@ Renderer adjustments for the Switch's Mesa (nouveau) GL 4.3 stack (__SWITCH__).
 - the shader warm-up draws once with each program it makes (nothing is
   rasterised), so Mesa's nouveau makes its GPU code during the load instead
   of at the program's first draw in gameplay (gx_shader.cpp)
+- the program cache's records are read into memory at the start and made
+  into programs (with the same draw) when a stage's warm-up or a draw first
+  needs them: making one from its binary costs nearly a compile on the
+  console's Mesa, so making all ~850 at the start took longer than the loads
+  they save. A record Mesa rejects (another build of it) starts the file over.
+  SMS_GX_SHADER_WARMUP_MS sets the warm-up's time for other stages' programs
+  (1000000: all known programs, to make a full cache) and
+  SMS_GX_SHADER_WARM_DRAW=0 leaves the draws out (gx_shader.cpp)
+- the program cache keeps the whole records before a damaged one, and is
+  closed and opened again after each stage's warm-up: a game closed from the
+  HOME menu leaves its open files at an older size (gx_shader.cpp)
 - both sticks pressed together (L3 + R3) toggle the debug overlay, as the
   backtick key does on a PC (gx_platform.cpp)
 
@@ -106,10 +117,21 @@ index bd96a35..036d6fd 100644
      glUniform1i(glGetUniformLocation(s_encProg, "u_src"), 0);
      const GLfloat wholeRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
 diff --git a/platform/gx/src/gx_shader.cpp b/platform/gx/src/gx_shader.cpp
-index 4c90bee..592e9a3 100644
+index 4c90bee..20da75c 100644
 --- a/platform/gx/src/gx_shader.cpp
 +++ b/platform/gx/src/gx_shader.cpp
-@@ -165,6 +165,29 @@ static void emitLight(std::string& s, uint32_t ctrl, const char* comp, const cha
+@@ -17,8 +17,10 @@
+ #include <vector>
+ #ifdef _WIN32
+ #include <direct.h>
++#include <io.h>
+ #else
+ #include <sys/stat.h>
++#include <unistd.h>
+ #endif
+ 
+ namespace gx {
+@@ -165,6 +167,29 @@ static void emitLight(std::string& s, uint32_t ctrl, const char* comp, const cha
  
  static std::string genVS(const ShaderKey& k) {
      std::string s = kVsHeader;
@@ -139,7 +161,202 @@ index 4c90bee..592e9a3 100644
      char buf[1024];
      s += "void main() {\n"
           "  int pm = int(a_mtx.x & 255u);\n"
-@@ -851,6 +874,28 @@ static void warmIssue(WarmJob* j) {  // GL thread; with parallel compiles, retur
+@@ -573,6 +598,18 @@ struct ProgramKeyHash {
+     size_t operator()(const ProgramKey& k) const { return size_t(hashBytes(&k, sizeof(k))); }
+ };
+ static std::unordered_map<ProgramKey, ShaderProgram, ProgramKeyHash> s_programs;
++#ifdef __SWITCH__
++// The cache's records, kept in memory and made into programs when a stage's
++// warm-up or a draw first needs one (programFromCache): on the console's Mesa
++// making one costs nearly what compiling it does with Mesa's own cache warm,
++// so making all of them at the start took longer than the loads they save.
++struct CachedBinary {
++    uint64_t srcHash;
++    uint32_t format;
++    std::vector<uint8_t> bin;
++};
++static std::unordered_map<ProgramKey, CachedBinary, ProgramKeyHash> s_cachedBinaries;
++#endif
+ static ProgramKey s_lastKey;
+ static const ShaderProgram* s_lastProgram = nullptr;
+ 
+@@ -632,6 +669,20 @@ static uint64_t sourceHash(const std::string& vs, const std::string& fs) {
+ static const char kCacheMagic[8] = {'S', 'M', 'S', 'G', 'X', 'P', 'B', '1'};
+ static std::string s_cachePath;
+ static FILE* s_cacheOut = nullptr;  // appended to as programs are made
++
++// Cuts the cache file to its first `size` bytes: the whole records before a
++// damaged one (the end of a file a game was stopped while writing).
++static bool programCacheTruncate(const std::string& path, long size) {
++    FILE* f = fopen(path.c_str(), "r+b");
++    if (!f) return false;
++#ifdef _WIN32
++    const bool ok = _chsize_s(_fileno(f), size) == 0;
++#else
++    const bool ok = ftruncate(fileno(f), size) == 0;
++#endif
++    fclose(f);
++    return ok;
++}
+ static int s_cacheState = -1;       // -1 not set up, 0 off, 1 on
+ 
+ static void makeDirs(const std::string& path) {
+@@ -680,9 +731,23 @@ static bool programKeyValid(const ProgramKey& key) {
+     return k.numTexGens <= 8 && k.numChans <= 3 && k.numStages >= 1 && k.numStages <= 16 && k.numInd <= 4;
+ }
+ 
++// Appends a record: srcHash, key, format, length, binary (in one write).
++static void programCacheWrite(const ProgramKey& key, uint64_t srcHash, uint32_t format, const void* bin,
++                              uint32_t len) {
++    const size_t head = 8 + sizeof key + 4 + 4;
++    std::vector<uint8_t> rec(head + len);
++    memcpy(rec.data(), &srcHash, 8);
++    memcpy(rec.data() + 8, &key, sizeof key);
++    memcpy(rec.data() + 8 + sizeof key, &format, 4);
++    memcpy(rec.data() + 8 + sizeof key + 4, &len, 4);
++    memcpy(rec.data() + head, bin, len);
++    fwrite(rec.data(), rec.size(), 1, s_cacheOut);
++}
++
+ // Loads the cached programs (on the GL thread, at the first draw).
+ static void programCacheLoad() {
+     s_cacheState = 0;
++    const auto start = std::chrono::steady_clock::now();
+     if (!glGetProgramBinary || !glProgramBinary || !glProgramParameteri) return;
+     GLint formats = 0;
+     glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &formats);
+@@ -700,6 +765,7 @@ static void programCacheLoad() {
+     unsigned loaded = 0, stale = 0;
+     bool keep = false;  // the file is this driver's: append to it
+     bool corrupt = false;
++    long goodEnd = 0;  // the end of the last whole record
+     if (FILE* in = fopen(s_cachePath.c_str(), "rb")) {
+         char magic[8];
+         uint64_t fileDriver = 0;
+@@ -709,6 +775,7 @@ static void programCacheLoad() {
+             keep = true;
+             std::vector<uint8_t> bin;
+             for (;;) {
++                goodEnd = ftell(in);
+                 uint64_t srcHash;
+                 ProgramKey key;
+                 uint32_t format, len;
+@@ -728,6 +795,13 @@ static void programCacheLoad() {
+                     corrupt = true;
+                     break;
+                 }
++#ifdef __SWITCH__
++                // a later record for the same key replaces one the driver rejected
++                if (s_cachedBinaries.count(key)) stale++;
++                else loaded++;
++                s_cachedBinaries[key] = CachedBinary{srcHash, format, bin};
++                continue;
++#endif
+                 if (s_programs.count(key) || sourceHash(genVS(key.k), genFS(key.k)) != srcHash) {
+                     stale++;
+                     continue;
+@@ -750,8 +824,26 @@ static void programCacheLoad() {
+         }
+         fclose(in);
+     }
++#ifdef __SWITCH__
++    // Another build of Mesa rejects every record: one tried tells.
++    if (!s_cachedBinaries.empty()) {
++        const CachedBinary& c = s_cachedBinaries.begin()->second;
++        GLuint p = glCreateProgram();
++        glProgramBinary(p, GLenum(c.format), c.bin.data(), GLsizei(c.bin.size()));
++        GLint ok = 0;
++        glGetProgramiv(p, GL_LINK_STATUS, &ok);
++        glDeleteProgram(p);
++        if (!ok) {
++            stale += loaded;
++            loaded = 0;
++            s_cachedBinaries.clear();
++            keep = false;
++        }
++    }
++#endif
+     if (stale > 64 && stale > loaded) keep = false;  // mostly unusable (repeated or rejected): start over
+-    if (corrupt) keep = false;
++    // A damaged record: the whole ones before it are kept, unless none loaded.
++    if (corrupt && (!keep || loaded == 0 || !programCacheTruncate(s_cachePath, goodEnd))) keep = false;
+     s_cacheOut = fopen(s_cachePath.c_str(), keep ? "ab" : "wb");
+     if (!s_cacheOut) return;
+     // Unbuffered, so that each record (programCacheStore) is one append that
+@@ -764,9 +856,17 @@ static void programCacheLoad() {
+         memcpy(head + 8, &driver, 8);
+         memcpy(head + 16, &keySize, 4);
+         fwrite(head, sizeof head, 1, s_cacheOut);
++#ifdef __SWITCH__
++        for (const auto& kv : s_cachedBinaries)  // the records still good
++            programCacheWrite(kv.first, kv.second.srcHash, kv.second.format, kv.second.bin.data(),
++                              uint32_t(kv.second.bin.size()));
++#endif
+     }
+     s_cacheState = 1;
+-    if (keep) logmsg("shader cache: %u programs loaded, %u skipped (%s)", loaded, stale, s_cachePath.c_str());
++    if (keep)
++        logmsg("shader cache: %u programs loaded, %u skipped in %.1f ms%s (%s)", loaded, stale,
++               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
++               corrupt ? ", a damaged end cut off" : "", s_cachePath.c_str());
+     else if (corrupt) logmsg("shader cache: damaged after %u programs, made anew (%s)", loaded, s_cachePath.c_str());
+     else logmsg("shader cache: new (%s)", s_cachePath.c_str());
+ }
+@@ -776,19 +876,22 @@ static void programCacheStore(const ProgramKey& key, uint64_t srcHash, GLuint p)
+     GLint len = 0;
+     glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &len);
+     if (len <= 0) return;
+-    // The record in one buffer: srcHash, key, format, length, binary.
+-    const size_t head = 8 + sizeof key + 4 + 4;
+-    std::vector<uint8_t> rec(head + static_cast<size_t>(len));
++    std::vector<uint8_t> bin(static_cast<size_t>(len));
+     GLenum format = 0;
+     GLsizei got = 0;
+-    glGetProgramBinary(p, len, &got, &format, rec.data() + head);
++    glGetProgramBinary(p, len, &got, &format, bin.data());
+     if (got <= 0) return;
+-    const uint32_t fmt = format, n = uint32_t(got);
+-    memcpy(rec.data(), &srcHash, 8);
+-    memcpy(rec.data() + 8, &key, sizeof key);
+-    memcpy(rec.data() + 8 + sizeof key, &fmt, 4);
+-    memcpy(rec.data() + 8 + sizeof key + 4, &n, 4);
+-    fwrite(rec.data(), head + n, 1, s_cacheOut);
++    programCacheWrite(key, srcHash, format, bin.data(), uint32_t(got));
++}
++
++// GL thread: closes the cache file and opens it again, so what was appended
++// is on the disk (a game ended without its files closed, as by the Switch's
++// HOME menu, can leave the file at an older size).
++static void programCacheCommit() {
++    if (!s_cacheOut) return;
++    fclose(s_cacheOut);
++    s_cacheOut = fopen(s_cachePath.c_str(), "ab");
++    if (s_cacheOut) setvbuf(s_cacheOut, nullptr, _IONBF, 0);
+ }
+ 
+ // ------------------------------------------------------------------ warm-up
+@@ -840,7 +943,20 @@ static GLuint startCompile(GLenum type, const std::string& src) {
+     return sh;
+ }
+ 
++#ifdef __SWITCH__
++static bool programFromCache(const ProgramKey& key, uint64_t srcHash, ShaderProgram& sp, bool aside);
++#endif
++
+ static void warmIssue(WarmJob* j) {  // GL thread; with parallel compiles, returns before they end
++#ifdef __SWITCH__
++    Warmed w{j->key, ShaderProgram(), false};
++    if (programFromCache(j->key, sourceHash(j->vs, j->fs), w.sp, true)) {
++        w.ok = true;
++        s_warmed.push_back(w);
++        delete j;
++        return;
++    }
++#endif
+     j->v = startCompile(GL_VERTEX_SHADER, j->vs);
+     j->f = startCompile(GL_FRAGMENT_SHADER, j->fs);
+     j->prog = glCreateProgram();
+@@ -851,6 +967,65 @@ static void warmIssue(WarmJob* j) {  // GL thread; with parallel compiles, retur
      s_inFlight.push_back(j);
  }
  
@@ -150,8 +367,14 @@ index 4c90bee..592e9a3 100644
 +// One draw of three identical vertices (no attributes enabled: all at the
 +// same point, so nothing is rasterised) makes it now, during the load. The
 +// program and vertex array bindings are put back as they were, so the
-+// renderer's tracking of them stays true.
++// renderer's tracking of them stays true. SMS_GX_SHADER_WARM_DRAW=0 leaves
++// it out (to make a cache in an emulator that cannot run every program).
++static uint32_t s_backendMade = 0;  // GL thread; read after a sync
++static double s_backendMs = 0;
 +static void warmBackendCompile(GLuint prog) {
++    static const bool on = !getenv("SMS_GX_SHADER_WARM_DRAW") || strcmp(getenv("SMS_GX_SHADER_WARM_DRAW"), "0");
++    if (!on) return;
++    const auto start = std::chrono::steady_clock::now();
 +    static GLuint vao = 0;
 +    if (!vao) glGenVertexArrays(1, &vao);
 +    GLint prevProgram = 0, prevVao = 0;
@@ -162,13 +385,44 @@ index 4c90bee..592e9a3 100644
 +    glDrawArrays(GL_TRIANGLES, 0, 3);
 +    glBindVertexArray(GLuint(prevVao));
 +    glUseProgram(GLuint(prevProgram));
++    s_backendMade++;
++    s_backendMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++}
++
++// GL thread: `key`'s program from the cache's record, with its GPU code made
++// (`aside` as for setupProgram); false if there is none, or the record is for
++// other sources (srcHash) or rejected by the driver.
++static uint32_t s_fromCache = 0;  // GL thread; read after a sync
++static double s_fromCacheMs = 0;
++static bool programFromCache(const ProgramKey& key, uint64_t srcHash, ShaderProgram& sp, bool aside) {
++    auto it = s_cachedBinaries.find(key);
++    if (it == s_cachedBinaries.end()) return false;
++    const auto start = std::chrono::steady_clock::now();
++    const CachedBinary c = std::move(it->second);
++    s_cachedBinaries.erase(it);
++    if (c.srcHash != srcHash) return false;
++    GLuint p = glCreateProgram();
++    bindAttributes(p);
++    glProgramBinary(p, GLenum(c.format), c.bin.data(), GLsizei(c.bin.size()));
++    GLint ok = 0;
++    glGetProgramiv(p, GL_LINK_STATUS, &ok);
++    if (!ok) {
++        glDeleteProgram(p);
++        return false;
++    }
++    sp.id = 0;
++    setupProgram(p, sp, aside);
++    warmBackendCompile(p);
++    s_fromCache++;
++    s_fromCacheMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++    return true;
 +}
 +#endif
 +
  static void warmFinish(WarmJob* j) {  // GL thread
      GLint ok = 0;
      glGetProgramiv(j->prog, GL_LINK_STATUS, &ok);
-@@ -865,6 +910,9 @@ static void warmFinish(WarmJob* j) {  // GL thread
+@@ -865,6 +1040,9 @@ static void warmFinish(WarmJob* j) {  // GL thread
      Warmed w{j->key, ShaderProgram(), ok != 0};
      if (ok) {
          setupProgram(j->prog, w.sp, true);
@@ -178,3 +432,68 @@ index 4c90bee..592e9a3 100644
          w.sp.id = 0;
          programCacheStore(j->key, sourceHash(j->vs, j->fs), j->prog);
      }
+@@ -958,6 +1136,9 @@ static void warmSetup() {
+     if (getenv("SMS_GX_SHADER_WARMUP_SERIAL")) s_parallel = false;  // as on drivers without it (tests)
+     size_t cached = 0;
+     for (const ProgramKey& k : s_warmKeys) cached += s_programs.count(k);
++#ifdef __SWITCH__
++    for (const ProgramKey& k : s_warmKeys) cached += !s_programs.count(k) && s_cachedBinaries.count(k);
++#endif
+     s_warmState = 1;
+     logmsg("shader warm-up: %zu known programs, %zu cached%s", s_warmKeys.size(), cached,
+            s_parallel ? ", compiled in parallel" : "");
+@@ -1004,13 +1185,19 @@ void shaderPrepareStage(int stage) {
+         warmDrain();
+     };
+     const uint32_t before = s_warmMade;
++#ifdef __SWITCH__
++    const uint32_t fromCacheBefore = s_fromCache, backendBefore = s_backendMade;
++    const double backendMsBefore = s_backendMs, fromCacheMsBefore = s_fromCacheMs;
++#endif
+     auto it = s_stageKeys.find(s_stage);
+     if (it != s_stageKeys.end())
+         for (size_t i : it->second)
+             if (!s_programs.count(s_warmKeys[i])) warmPost(s_warmKeys[i]);
+     finish();
+     const uint32_t own = s_warmMade - before;
+-    const double budget = s_parallel ? 1000 : 250;
++    // SMS_GX_SHADER_WARMUP_MS=n: the time for the others (100000 makes them all)
++    static const char* budgetEnv = getenv("SMS_GX_SHADER_WARMUP_MS");
++    const double budget = budgetEnv && *budgetEnv ? atof(budgetEnv) : s_parallel ? 1000 : 250;
+     const int batch = s_parallel ? 32 : 1;
+     while (s_warmNext < s_warmKeys.size() && elapsed() < budget) {
+         for (int n = 0; n < batch && s_warmNext < s_warmKeys.size();) {
+@@ -1024,6 +1211,13 @@ void shaderPrepareStage(int stage) {
+     if (s_warmMade != before)
+         logmsg("shader warm-up: compiled %u programs for stage %d and %u others in %.1f ms%s", own, s_stage,
+                s_warmMade - before - own, elapsed(), s_warmNext < s_warmKeys.size() ? "" : " (all known programs made)");
++#ifdef __SWITCH__
++    if (s_fromCache != fromCacheBefore || s_backendMade != backendBefore)
++        logmsg("shader warm-up: %u of them from the cache in %.1f ms; GPU code for %u in %.1f ms",
++               s_fromCache - fromCacheBefore, s_fromCacheMs - fromCacheMsBefore, s_backendMade - backendBefore,
++               s_backendMs - backendMsBefore);
++#endif
++    if (s_warmMade != before) glt::sync([] { programCacheCommit(); });
+ }
+ 
+ // ------------------------------------------------------------------ lines
+@@ -1133,6 +1327,9 @@ const ShaderProgram* shaderForCurrentState(bool depthOnly, bool lines) {
+     // made on the GL thread in one go: each query below would otherwise
+     // wait for it on its own (gx_glthread.h)
+     glt::sync([&] {
++#ifdef __SWITCH__
++        if (programFromCache(key, sourceHash(vs, fs), sp, false)) return;
++#endif
+         GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
+         GLuint p = glCreateProgram();
+         glAttachShader(p, v);
+@@ -1172,6 +1369,9 @@ void shaderShutdown() {
+     s_warmIssued.clear();
+     s_warmNext = 0;
+     s_parallel = false;
++#ifdef __SWITCH__
++    s_cachedBinaries.clear();
++#endif
+     if (s_cacheOut) fclose(s_cacheOut);
+     s_cacheOut = nullptr;
+     s_cacheState = -1;

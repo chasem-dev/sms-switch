@@ -1,0 +1,263 @@
+diff --git a/include/c11/threads.h b/include/c11/threads.h
+index b512521..87a9d41 100644
+--- a/include/c11/threads.h
++++ b/include/c11/threads.h
+@@ -46,6 +46,9 @@
+ #ifndef HAVE_TIMESPEC_GET
+ #include <sys/time.h>
+ 
++/* newlib declares timespec_get without implementing it: Mesa's own, under
++ * its own name (<threads.h> above has already brought in <time.h>). */
++#define timespec_get mesa_timespec_get
+ static inline int
+ timespec_get(struct timespec *ts, int base)
+ {
+diff --git a/meson.build b/meson.build
+index 0ed24fd..95dc494 100644
+--- a/meson.build
++++ b/meson.build
+@@ -833,7 +833,7 @@ endif
+ with_shader_cache = false
+ _shader_cache = get_option('shader-cache')
+ if _shader_cache != 'false'
+-  if ['windows','horizon'].contains(host_machine.system())
++  if ['windows'].contains(host_machine.system())
+     if _shader_cache == 'true'
+       error('Shader Cache does not currently work on Windows')
+     endif
+@@ -1325,7 +1325,9 @@ if host_machine.system() != 'horizon'
+     dep_expat = null_dep
+   endif
+ else
+-  dep_zlib = null_dep
++  # The shader cache compresses its entries with zlib (switch-zlib).
++  dep_zlib = dependency('zlib', version : '>= 1.2.3')
++  pre_args += '-DHAVE_ZLIB'
+   dep_zstd = null_dep
+   dep_thread = null_dep
+   dep_expat = null_dep
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index a92d621..7a260ce 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -31,7 +31,9 @@
+ #include <sys/file.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#ifndef __SWITCH__
+ #include <sys/mman.h>
++#endif
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <pwd.h>
+@@ -95,6 +97,9 @@ struct disk_cache {
+    /* A pointer to the mmapped index file within the cache directory. */
+    uint8_t *index_mmap;
+    size_t index_mmap_size;
++#ifdef __SWITCH__
++   int index_fd;
++#endif
+ 
+    /* Pointer to total size of all objects in cache (within index_mmap) */
+    uint64_t *size;
+@@ -113,6 +118,24 @@ struct disk_cache {
+    disk_cache_get_cb blob_get_cb;
+ };
+ 
++#ifdef __SWITCH__
++/* The index lives in memory on the Switch: write `len` changed bytes at
++ * `at` (within cache->index_mmap) back to the file. */
++static mtx_t index_write_lock = _MTX_INITIALIZER_NP;
++static void
++index_written(struct disk_cache *cache, const void *at, size_t len)
++{
++   const off_t off = (const uint8_t *) at - cache->index_mmap;
++   mtx_lock(&index_write_lock);
++   if (lseek(cache->index_fd, off, SEEK_SET) == off)
++      (void) !write(cache->index_fd, at, len);
++   mtx_unlock(&index_write_lock);
++}
++#define INDEX_WRITTEN(cache, at, len) index_written(cache, at, len)
++#else
++#define INDEX_WRITTEN(cache, at, len) ((void)0)
++#endif
++
+ struct disk_cache_put_job {
+    struct util_queue_fence fence;
+ 
+@@ -210,9 +233,11 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
+    uint8_t cache_version = CACHE_VERSION;
+    size_t cv_size = sizeof(cache_version);
+ 
++#ifndef __SWITCH__ /* no users on the Switch */
+    /* If running as a users other than the real user disable cache */
+    if (geteuid() != getuid())
+       return NULL;
++#endif
+ 
+    /* A ralloc context for transient data during this invocation. */
+    local = ralloc_context(NULL);
+@@ -259,6 +284,11 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
+       }
+    }
+ 
++#ifdef __SWITCH__
++   /* No users on the Switch: MESA_GLSL_CACHE_DIR or XDG_CACHE_HOME only. */
++   if (path == NULL)
++      goto path_fail;
++#else
+    if (path == NULL) {
+       char *buf;
+       size_t buf_size;
+@@ -293,6 +323,7 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
+       if (path == NULL)
+          goto path_fail;
+    }
++#endif
+ 
+    cache->path = ralloc_strdup(cache, path);
+    if (cache->path == NULL)
+@@ -331,10 +362,23 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
+     * guarantees of the cryptographic hash, a corrupt entry is
+     * unlikely to ever match a real cache key).
+     */
++#ifdef __SWITCH__
++   /* No file mappings on the Switch: the index is read into memory, and
++    * each change written back to the file (index_written). One process
++    * uses the cache, so nothing else changes the file meanwhile. */
++   cache->index_mmap = malloc(size);
++   if (cache->index_mmap == NULL)
++      goto path_fail;
++   if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, cache->index_mmap, size) != (ssize_t)size)
++      memset(cache->index_mmap, 0, size);
++   cache->index_fd = fd; /* kept open for index_written */
++   fd = -1;
++#else
+    cache->index_mmap = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, fd, 0);
+    if (cache->index_mmap == MAP_FAILED)
+       goto path_fail;
++#endif
+    cache->index_mmap_size = size;
+ 
+    cache->size = (uint64_t *) cache->index_mmap;
+@@ -448,7 +492,12 @@ disk_cache_destroy(struct disk_cache *cache)
+    if (cache && !cache->path_init_failed) {
+       util_queue_finish(&cache->cache_queue);
+       util_queue_destroy(&cache->cache_queue);
++#ifdef __SWITCH__
++      free(cache->index_mmap);
++      close(cache->index_fd);
++#else
+       munmap(cache->index_mmap, cache->index_mmap_size);
++#endif
+    }
+ 
+    ralloc_free(cache);
+@@ -531,7 +580,14 @@ choose_lru_file_matching(const char *dir_path,
+          break;
+ 
+       struct stat sb;
++#ifdef __SWITCH__
++      /* newlib has no dirfd/fstatat: the entry's path joined. */
++      char entry_path[1024];
++      snprintf(entry_path, sizeof(entry_path), "%s/%s", dir_path, entry->d_name);
++      if (stat(entry_path, &sb) == 0) {
++#else
+       if (fstatat(dirfd(dir), entry->d_name, &sb, 0) == 0) {
++#endif
+          if (!lru_atime || (sb.st_atime < lru_atime)) {
+             size_t len = strlen(entry->d_name);
+ 
+@@ -659,7 +715,7 @@ evict_lru_item(struct disk_cache *cache)
+    free(dir_path);
+ 
+    if (size) {
+-      p_atomic_add(cache->size, - (uint64_t)size);
++      p_atomic_add(cache->size, - (uint64_t)size); INDEX_WRITTEN(cache, cache->size, sizeof(uint64_t));
+       return;
+    }
+ 
+@@ -681,7 +737,7 @@ evict_lru_item(struct disk_cache *cache)
+    free(dir_path);
+ 
+    if (size)
+-      p_atomic_add(cache->size, - (uint64_t)size);
++      p_atomic_add(cache->size, - (uint64_t)size); INDEX_WRITTEN(cache, cache->size, sizeof(uint64_t));
+ }
+ 
+ void
+@@ -703,7 +759,7 @@ disk_cache_remove(struct disk_cache *cache, const cache_key key)
+    free(filename);
+ 
+    if (sb.st_blocks)
+-      p_atomic_add(cache->size, - (uint64_t)sb.st_blocks * 512);
++      p_atomic_add(cache->size, - (uint64_t)sb.st_blocks * 512); INDEX_WRITTEN(cache, cache->size, sizeof(uint64_t));
+ }
+ 
+ static ssize_t
+@@ -942,7 +998,9 @@ cache_put(void *job, int thread_index)
+     * open with the flock held. So just let that file be responsible
+     * for writing the file.
+     */
+-#ifdef HAVE_FLOCK
++#if defined(__SWITCH__)
++   err = 0; /* one process uses the cache */
++#elif defined(HAVE_FLOCK)
+    err = flock(fd, LOCK_EX | LOCK_NB);
+ #else
+    struct flock lock = {
+@@ -1049,7 +1107,7 @@ cache_put(void *job, int thread_index)
+       goto done;
+    }
+ 
+-   p_atomic_add(dc_job->cache->size, sb.st_blocks * 512);
++   p_atomic_add(dc_job->cache->size, sb.st_blocks * 512); INDEX_WRITTEN(dc_job->cache, dc_job->cache->size, sizeof(uint64_t));
+ 
+  done:
+    if (fd_final != -1)
+@@ -1291,6 +1349,7 @@ disk_cache_put_key(struct disk_cache *cache, const cache_key key)
+    entry = &cache->stored_keys[i * CACHE_KEY_SIZE];
+ 
+    memcpy(entry, key, CACHE_KEY_SIZE);
++   INDEX_WRITTEN(cache, entry, CACHE_KEY_SIZE);
+ }
+ 
+ /* This function lets us test whether a given key was previously
+diff --git a/src/util/disk_cache.h b/src/util/disk_cache.h
+index e5dca8e..b3b36cd 100644
+--- a/src/util/disk_cache.h
++++ b/src/util/disk_cache.h
+@@ -138,8 +138,18 @@ disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx)
+ static inline bool
+ disk_cache_get_function_identifier(void *ptr, struct mesa_sha1 *ctx)
+ {
++#ifdef __SWITCH__
++   /* No shared objects to time-stamp on the Switch: the cache's identity is
++    * this build's (MESA_SWITCH_CACHE_ID, from the build), so a rebuilt Mesa
++    * never reads another build's entries. */
++   static const char id[] = MESA_SWITCH_CACHE_ID;
++   (void) ptr;
++   _mesa_sha1_update(ctx, id, sizeof(id) - 1);
++   return true;
++#else
+    return false;
+ #endif
++#endif
+ }
+ 
+ /* Provide inlined stub functions if the shader cache is disabled. */
+diff --git a/src/util/u_thread.h b/src/util/u_thread.h
+index 1f2a104..eea09bd 100644
+--- a/src/util/u_thread.h
++++ b/src/util/u_thread.h
+@@ -64,7 +64,8 @@ static inline thrd_t u_thread_create(int (*routine)(void *), void *param)
+    int ret;
+    ret = thrd_create( &thread, routine, param );
+ #endif
+-   if (ret)
++   /* newlib's thrd_success is 4, not 0 */
++   if (ret != thrd_success)
+       return 0;
+ 
+    return thread;
