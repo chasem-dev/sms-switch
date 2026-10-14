@@ -107,6 +107,17 @@ The PC port's texture packs work here too (`sdmc:/switch/sms/mods/textures/`), b
 `tools/texpack/make-switch-pack.sh PACK_DIR OUT_DIR [MAX]` makes the Switch's copy: those cut to at most 2048 pixels (their own mip levels where they have them, else decoded, halved and encoded again with [bc7enc](https://github.com/richgel999/bc7enc_rdo)), everything else as it is. The UHD pack becomes 1.3 GiB in about 90 seconds.
 Copy OUT_DIR's contents to `sdmc:/switch/sms/mods/textures/`; `SMS_TEXTURE_PACKS=0` turns them off for a comparison, and at most 1 GiB is kept in memory (`SMS_TEXTURE_PACK_MB`).
 
+## Shader cache
+
+devkitPro's Mesa is built without its disk shader cache, so with it every area compiles its shaders again on each visit (2.7-4.4 s per load on a console).
+`tools/mesa/build-mesa.sh` builds the same Mesa with the cache on into `build/mesa/` (Docker, a few minutes), and `./build.sh` links it from then on (the CMake log says `Mesa with the shader cache (<id>)`).
+With it, compiled programs are kept in `sdmc:/switch/sms/cache/` and each stage's programs are made from there while it loads.
+
+`switch/shader-cache/gx-programs-64.bin` is a full cache: every program the game is known to draw with (made in Eden with `SMS_GX_SHADER_WARMUP_MS=1000000 SMS_GX_SHADER_WARM_DRAW=0`, plus those a console session added).
+Copy it to `sdmc:/switch/sms/cache/sms-port/` and even the first visit to an area loads from it.
+It only fits the Mesa build named in `switch/shader-cache/mesa-cache-id`; with any other the game notices and starts the cache over.
+Release builds use the installed Mesa for now, which has no program binaries, so they neither use nor need it.
+
 ## Quick test loop (nxlink)
 
 To try a build or an option without copying anything to the SD card:
