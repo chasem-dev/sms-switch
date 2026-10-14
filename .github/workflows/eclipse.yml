@@ -1,0 +1,60 @@
+name: Eclipse
+# Builds sms-eclipse.nro: the game with Super Mario Eclipse's code built in
+# (Eclipse, BetterSunshineEngine and BetterSunshineMoveset, GPL-3.0, fetched
+# at the revisions sms-port/cmake/eclipse.cmake pins and compiled with
+# clang), in the devkitPro image, and uploads it as the sms-eclipse artifact.
+# Build (build.yml) runs it beside sms.nro on every push and pull request and
+# releases the two together; it can also be run by hand.
+#
+# The NRO holds code only: no disc image (players make the GMSE04 image from
+# their own disc with the mod's patch), no art (libnx's icon) and no NSP
+# (installable titles need a console's keys; build them locally with
+# SMS_SWITCH_KEYS, see the README).
+on:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  eclipse:
+    runs-on: ubuntu-24.04
+    container: devkitpro/devkita64:latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install clang
+        run: |
+          set -euo pipefail
+          # Eclipse's sources are written for clang (llvm for the port's
+          # llvm-dwarfdump check of them), as in tools/docker/Dockerfile.
+          apt-get update
+          apt-get install -y --no-install-recommends clang-19 llvm-19
+          rm -rf /var/lib/apt/lists/*
+      - name: Build sms-eclipse.nro
+        run: |
+          set -euo pipefail
+          # The job runs as root in the container; the checkout belongs to the runner.
+          git config --global --add safe.directory '*'
+          # build.sh builds the plain tree first, then build/eclipse.
+          SMS_SWITCH_NATIVE=1 SMS_SWITCH_ECLIPSE=1 JOBS=$(nproc) ./build.sh -DSMS_SWITCH_ICON=default
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/eclipse/sms-eclipse.nro dist/
+          # Super Mario Eclipse's sources, at the revisions cmake/eclipse.cmake pins.
+          sed -n 's/^ *"\([a-z]*\)|\(https[^|]*\)|\([0-9a-f]\{7\}\)[0-9a-f]*".*/\1 \3 (\2)/p' \
+            sms-port/cmake/eclipse.cmake > dist/eclipse-versions.txt
+          [[ -s dist/eclipse-versions.txt ]]
+          ls -l dist
+          cat dist/eclipse-versions.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sms-eclipse
+          path: dist/
+          if-no-files-found: error
