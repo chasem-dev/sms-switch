@@ -277,10 +277,14 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// for 60 or 120 (the PC port's default is 60, twice the work per second).
 	if (!getenv("SMS_FRAME_RATE") && !settings_has(g_dir, "frame_rate"))
 		setenv("SMS_FRAME_RATE", "30", 1);
-	// The screen is 16:9: a wider view, with the HUD and menus kept 4:3 in
-	// the middle (widescreen = off in settings.txt for the original 4:3).
+	// The screen is 16:9: a wider view, with the menus kept 4:3 in the
+	// middle (widescreen = off in settings.txt for the original 4:3).
 	if (!getenv("SMS_WIDESCREEN") && !settings_has(g_dir, "widescreen"))
 		setenv("SMS_WIDESCREEN", "16:9", 1);
+	// The gameplay HUD at the screen's edges (counters left, water gauge
+	// right) rather than the 4:3 middle (widescreen_hud = centre for that).
+	if (!getenv("SMS_WIDESCREEN_HUD") && !settings_has(g_dir, "widescreen_hud"))
+		setenv("SMS_WIDESCREEN_HUD", "edges", 1);
 	// Mesa here advertises parallel shader compiles but compiles one at a
 	// time: the warm-up's parallel mode (batches of 32 extra programs per
 	// stage load) stalled a load for 6 s. Serial: a stage's own programs, and
