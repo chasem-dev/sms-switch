@@ -32,6 +32,9 @@
 #endif
 
 
+// The button prompt images (CMakeLists.txt: switch/prompts/switch.png).
+extern "C" const unsigned char sms_switch_prompts_png[];
+extern "C" const unsigned long sms_switch_prompts_png_size;
 extern "C" int __system_argc; // libnx's argv, before main
 extern "C" char** __system_argv;
 extern "C" void sms_switch_spread_main_thread(void); // performance.cpp
@@ -238,6 +241,20 @@ std::string find_standalone_disc_image(const std::string& dir)
 	return std::string();
 }
 
+// prompts/switch.png from the program's copy (CMakeLists.txt), if missing.
+void write_prompts(const std::string& dir)
+{
+	const std::string path = dir + "/switch.png";
+	struct stat st;
+	if (stat(path.c_str(), &st) == 0)
+		return;
+	mkdir(dir.c_str(), 0777);
+	if (FILE* f = fopen(path.c_str(), "wb")) {
+		fwrite(sms_switch_prompts_png, 1, sms_switch_prompts_png_size, f);
+		fclose(f);
+	}
+}
+
 void log_layout()
 {
 	const LowMemoryInfo* m = sms_switch_low_memory();
@@ -302,6 +319,17 @@ __attribute__((constructor(101))) static void switch_start(void)
 		const std::string key = std::string("camera_invert_") + char(axis[0] - 'A' + 'a');
 		if (!getenv(name.c_str()) && !settings_has(g_dir, key.c_str()))
 			setenv(name.c_str(), "1", 1);
+	}
+	// Button prompts as the Switch's buttons (button_prompts = gamecube in
+	// settings.txt for the game's own), from prompts/switch.png beside the NRO,
+	// written there from the program's copy when missing (replace it to
+	// change them).
+	if (!getenv("SMS_BUTTON_PROMPTS") && !settings_has(g_dir, "button_prompts"))
+		setenv("SMS_BUTTON_PROMPTS", "switch", 1);
+	if (!getenv("SMS_BUTTON_PROMPT_DIR") && !settings_has(g_dir, "button_prompt_dir")) {
+		const std::string dir = g_dir + "/prompts";
+		setenv("SMS_BUTTON_PROMPT_DIR", dir.c_str(), 1);
+		write_prompts(dir);
 	}
 	// Mesa here advertises parallel shader compiles but compiles one at a
 	// time: the warm-up's parallel mode (batches of 32 extra programs per

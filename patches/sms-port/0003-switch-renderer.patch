@@ -24,6 +24,9 @@ Renderer adjustments for the Switch's Mesa (nouveau) GL 4.3 stack (__SWITCH__).
   HOME menu leaves its open files at an older size (gx_shader.cpp)
 - SMS_TEXTURE_PACKS separated by ';' only: Switch paths begin with a device
   name and a colon (romfs:/textures) (gx_hires.cpp)
+- a "switch" button prompt style (SMS_BUTTON_PROMPTS=switch, and automatic
+  for Switch Pro Controllers and Joy-Cons), its images in
+  SMS_BUTTON_PROMPT_DIR/switch.png as for the other styles (gx_prompts.cpp)
 - both sticks pressed together (L3 + R3) toggle the debug overlay, as the
   backtick key does on a PC (gx_platform.cpp)
 
@@ -87,6 +90,61 @@ index f2c1fc4..f61038d 100644
          // F9 opens and closes the cheat menu and is kept from the pad layer
          if ((ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) && ev.key.keysym.scancode == SDL_SCANCODE_F9) {
              if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
+diff --git a/platform/gx/src/gx_prompts.cpp b/platform/gx/src/gx_prompts.cpp
+index bad7cf6..99fc510 100644
+--- a/platform/gx/src/gx_prompts.cpp
++++ b/platform/gx/src/gx_prompts.cpp
+@@ -38,8 +38,9 @@ extern "C" __attribute__((weak)) void* port_low_alloc(unsigned long size) { retu
+ 
+ namespace {
+ 
+-enum Style { S_GAMECUBE, S_XBOX, S_PLAYSTATION, S_STEAMDECK, S_KEYBOARD, S_COUNT };
+-const char* const kStyleNames[S_COUNT] = {"gamecube", "xbox", "playstation", "steamdeck", "keyboard"};
++// switch: a Nintendo Switch controller's buttons (the Switch build's default)
++enum Style { S_GAMECUBE, S_XBOX, S_PLAYSTATION, S_STEAMDECK, S_KEYBOARD, S_SWITCH, S_COUNT };
++const char* const kStyleNames[S_COUNT] = {"gamecube", "xbox", "playstation", "steamdeck", "keyboard", "switch"};
+ // The button glyphs, and the cells after them: SAVE_STATE's binding.
+ const int kCell = 64, kGlyphs = 8, kCells = 10;
+ 
+@@ -69,8 +70,8 @@ void init() {
+     for (int i = 0; i < S_COUNT; i++)
+         if (!strcmp(e, kStyleNames[i])) s_fixed = i;
+     if (const char* p = getenv("SMS_BUTTON_PROMPT_PAD"))
+-        for (int i = S_GAMECUBE; i <= S_STEAMDECK; i++)
+-            if (!strcmp(p, kStyleNames[i])) s_pad = i;
++        for (int i = S_GAMECUBE; i < S_COUNT; i++)
++            if (i != S_KEYBOARD && !strcmp(p, kStyleNames[i])) s_pad = i;
+     if (s_auto) gx::logmsg("button prompts: automatic, controllers as %s", s_pad < 0 ? "matched" : kStyleNames[s_pad]);
+     else gx::logmsg("button prompts: %s", kStyleNames[s_fixed]);
+ }
+@@ -183,9 +184,11 @@ extern "C" {
+ void GXPC_NoteInputDevice(int controller, int sdlType, const char* name) {
+     int style = S_KEYBOARD;
+     if (controller) {
+-        // SDL_GameControllerType: 3 PS3, 4 PS4, 7 PS5; the rest use Xbox prompts.
+-        // SDL 2 has no Steam Deck type, so the Deck's own controls go by name.
++        // SDL_GameControllerType: 3 PS3, 4 PS4, 7 PS5; 5 Switch Pro, 11-13
++        // Joy-Cons; the rest use Xbox prompts. SDL 2 has no Steam Deck type,
++        // so the Deck's own controls go by name.
+         if (sdlType == 3 || sdlType == 4 || sdlType == 7) style = S_PLAYSTATION;
++        else if (sdlType == 5 || (sdlType >= 11 && sdlType <= 13)) style = S_SWITCH;
+         else if (name && strstr(name, "Steam Deck")) style = S_STEAMDECK;
+         else style = S_XBOX;
+     }
+@@ -196,10 +199,11 @@ void GXPC_NoteInputDevice(int controller, int sdlType, const char* name) {
+ }
+ 
+ // The device in use for the save state hint (port_savestate.h): 0 keyboard,
+-// 1 Xbox, 2 PlayStation, 3 Steam Deck.
++// 1 Xbox (and Switch), 2 PlayStation, 3 Steam Deck.
+ int GXPC_InputStyle(void) {
+     switch (hintStyle()) {
+-    case S_XBOX: return 1;
++    case S_XBOX:
++    case S_SWITCH: return 1;
+     case S_PLAYSTATION: return 2;
+     case S_STEAMDECK: return 3;
+     default: return 0;
 diff --git a/platform/gx/src/gx_render.cpp b/platform/gx/src/gx_render.cpp
 index bd96a35..036d6fd 100644
 --- a/platform/gx/src/gx_render.cpp

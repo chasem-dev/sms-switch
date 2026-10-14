@@ -46,6 +46,18 @@ target_sources(sms PRIVATE
   ${SMS_SWITCH_DIR}/src/stack_switch.cpp
   ${SMS_SWITCH_DIR}/src/switch_main.cpp)
 target_include_directories(sms PRIVATE ${SMS_SWITCH_DIR}/src)
+# The Switch's button prompt images (switch/prompts/switch.png, drawn by
+# tools/make_prompts.py), built into the program: switch_main.cpp writes them
+# to prompts/ beside the NRO when that has none.
+set(_prompts_png ${SMS_SWITCH_DIR}/prompts/switch.png)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_prompts_png})
+file(READ ${_prompts_png} _png HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _png "${_png}")
+file(WRITE ${CMAKE_BINARY_DIR}/prompts_png.c.new
+  "const unsigned char sms_switch_prompts_png[] = {${_png}};\n"
+  "const unsigned long sms_switch_prompts_png_size = sizeof sms_switch_prompts_png;\n")
+configure_file(${CMAKE_BINARY_DIR}/prompts_png.c.new ${CMAKE_BINARY_DIR}/prompts_png.c COPYONLY)
+target_sources(sms PRIVATE ${CMAKE_BINARY_DIR}/prompts_png.c)
 set_source_files_properties(${SMS_SWITCH_DIR}/src/switch_main.cpp TARGET_DIRECTORY sms PROPERTIES COMPILE_DEFINITIONS
   "SMS_SWITCH_APP=\"${SMS_SWITCH_APP}\";SMS_SWITCH_TITLE=\"${SMS_SWITCH_TITLE}\"")
 # Every thread spread over cores 0-2 (switch/src/performance.cpp).
