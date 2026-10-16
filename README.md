@@ -126,6 +126,23 @@ Joy-Con and Pro Controllers work as the GameCube controller (the PC port's mappi
 
 `SMS_OVERLAY=1` in `env.txt` shows the overlay from the start.
 
+## Performance
+
+Gameplay runs at 30 fps unless `settings.txt` has `frame_rate = 60` (twice the work).
+Each frame is the game's own code, the GL driver's work for its draws (Mesa, on a thread of its own) and the GPU's; the console's A57 cores are slow enough that the first two decide the frame rate.
+What the Switch build does about it:
+
+- **The swap is queued, not waited for** (`SMS_GX_ASYNC_PRESENT`, `patches/sms-port/0007`): the game's thread queues the frame's present and swap for the GL thread and starts the next frame, so its game code runs while the GL thread and the GPU finish the last one.
+  The game's thread used to wait for the swap, so the game, the driver and the GPU took turns every frame.
+  `SMS_GX_ASYNC_PRESENT=0` in `env.txt` brings the wait back, to compare.
+- **Threads** (`switch/src/performance.cpp`): the game's thread starts on core 0, the GL thread on core 1 and the rest on core 2 or 0, each free to move to any of the three; the texture pack's background work runs below the game's priority, since Horizon does not share a core between threads of equal priority by time.
+  The CPU runs at 1785 MHz and the GPU at 460.8 MHz handheld, 768 MHz docked (`SMS_SWITCH_CLOCKS=0` for the console's default profile).
+- **Widescreen** draws are placed without scanning their vertices over and over (`patches/sms-port/0006`, from the Android build).
+
+To see where a frame's time goes, show the overlay (L3 + R3): `game`, `GX`, `present`, `swap` and `idle` are the game thread's milliseconds per frame, and `GL thread: busy` the GL thread's (`swapping` is the part of it in `SDL_GL_SwapWindow`, which waits for the display and the GPU).
+With the swap queued, `swap` on the game thread is its wait for the GL thread to finish the last frame: high there means the GL thread is the limit, high `game` that the game's own code is.
+`SMS_TIMING_LOG=1` in `env.txt` writes the same breakdown to `sms.log` every 2 seconds without the overlay, and `SMS_GX_STATS=120` adds draws, uploads and GL calls per frame.
+
 ## How it works
 
 The PC port is a native build of the decompilation: game code runs as AArch64 code, with the GameCube SDK replaced by host code (`sms-port/platform/`).

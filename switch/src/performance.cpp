@@ -7,9 +7,17 @@
 // mixer and the retrace timer as host threads, so all of them shared core 0
 // with the game, the GL thread only getting the core when the game waited.
 // threadCreate is wrapped (-Wl,--wrap=threadCreate, which also covers libnx's
-// own pthread_create and SDL): each new thread gets the next of cores 0-2 as
-// its ideal core, may run on any of them, and pthreads get the main thread's
-// priority.
+// own pthread_create and SDL): each new thread may run on any of cores 0-2,
+// and pthreads get the main thread's priority. The two threads that do most
+// of the work get a core each to start from: the main thread, which runs the
+// game, core 0, and the GL thread (the driver's work, sms_switch_gl_thread)
+// core 1; every other thread starts on core 2 or 0 in turn. Horizon does not
+// share a core between threads of the same priority by time: a thread keeps
+// it until it waits, and one that is woken there waits for it unless another
+// core is idle. So the texture pack's background work
+// (sms_switch_background_thread) runs below the game's priority, where the
+// game's threads take a core from it rather than wait for it.
+// SMS_SWITCH_SPREAD_THREADS=0 leaves all of this to libnx.
 //
 // Clocks. Homebrew runs at the console's default profile (CPU 1020 MHz, GPU
 // 307-384 MHz handheld, 768 MHz docked). The game's own CPU work is native
@@ -31,7 +39,20 @@ extern "C" Result __real_threadCreate(Thread* t, ThreadFunc entry, void* arg, vo
 namespace {
 constexpr u32 kAllCores = 0x7; // the cores applications may use
 constexpr int kMainPriority = 0x2C;
-std::atomic<int> g_next_core(1);
+constexpr int kBackgroundPriority = 0x2E;
+constexpr int kGlCore = 1;
+constexpr int kOtherCores[] = {2, 0}; // the cores other threads start on, in turn
+std::atomic<int> g_next_core(0);
+
+bool spread_threads()
+{
+	static int on = -1;
+	if (on < 0) {
+		const char* e = getenv("SMS_SWITCH_SPREAD_THREADS");
+		on = !(e && *e == '0');
+	}
+	return on != 0;
+}
 
 u32 env_mhz(const char* name, u32 fallback)
 {
@@ -44,17 +65,12 @@ u32 env_mhz(const char* name, u32 fallback)
 extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem, size_t stack_sz,
                                       int prio, int cpuid)
 {
-	static int on = -1;
-	if (on < 0) {
-		const char* e = getenv("SMS_SWITCH_SPREAD_THREADS");
-		on = !(e && *e == '0');
-	}
-	if (!on)
+	if (!spread_threads())
 		return __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
 	if (prio == 0x3B) // libnx's pthread_create
 		prio = kMainPriority;
 	const bool spread = cpuid == -2;
-	const int core = spread ? g_next_core.fetch_add(1) % 3 : cpuid;
+	const int core = spread ? kOtherCores[g_next_core.fetch_add(1) % 2] : cpuid;
 	Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, core);
 	if (R_SUCCEEDED(rc) && spread)
 		svcSetThreadCoreMask(t->handle, core, kAllCores);
@@ -64,6 +80,21 @@ extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, vo
 extern "C" void sms_switch_spread_main_thread(void)
 {
 	svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, kAllCores);
+}
+
+// The port's GL thread, as it starts (gx_glthread.cpp).
+extern "C" void sms_switch_gl_thread(void)
+{
+	if (spread_threads())
+		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kGlCore, kAllCores);
+}
+
+// A thread of work that may wait for idle time (gx_hires.cpp: the texture
+// pack's levels it makes itself).
+extern "C" void sms_switch_background_thread(void)
+{
+	if (spread_threads())
+		svcSetThreadPriority(CUR_THREAD_HANDLE, kBackgroundPriority);
 }
 
 // --- clocks -----------------------------------------------------------------
