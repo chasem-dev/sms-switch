@@ -1,0 +1,177 @@
+Place widescreen draws with fewer vertex scans (the Android branch's
+5bcba18, without its tests and notes).
+
+- a draw's screen extent walks each cached vertex run once, keeping the
+  last position matrix: it found every cached vertex by walking the runs
+  from the first, so a batch of n runs cost n^2/2 steps (a 512-run batch
+  231 us on a desktop, 3.6 us now); the bounds are bit-identical (the
+  branch's gx_extent_test, 1500 fixtures)
+- artwork outside the HUD, and a 3D HUD piece inside a pane, are placed
+  without scanning: the offset the scan led to is known beforehand
+- the threshold for a camera the game did not widen is worked out once,
+  with the widescreen setting
+
+diff --git a/platform/gx/src/gx_render.cpp b/platform/gx/src/gx_render.cpp
+index 2282374..ffffc96 100644
+--- a/platform/gx/src/gx_render.cpp
++++ b/platform/gx/src/gx_render.cpp
+@@ -5,6 +5,7 @@
+ #include "gl_funcs.h"
+ #include "gx_glcache.h"
+ #include "gx_glthread.h"
++#include "gx_screen_extent.h"
+ #include "gx_nis_coef.h"
+ #include "sms_gx/gx_pc.h"
+ 
+@@ -81,6 +82,7 @@ float efbScale() { return s_scale; }
+ // scaled by 1 / s_wide: its field of view widens, and what the game placed
+ // at x lands on x + s_ox, beside the centred HUD.
+ static float s_wide = 1.0f;
++static float s_wideCamAspect;
+ static int s_efbW = EFB_W, s_ox = 0;
+ struct XMap {
+     float a = 1, b = 0, clip = 1;
+@@ -1949,41 +1951,14 @@ static void pixMetricResume() {
+ // positions, position matrices and the projection and viewport.
+ static void screenExtent(float sx, float cx, float* outLo, float* outHi) {
+     const VtxFmtLayout& l = vtxFmtLayout(s_bfmt);
+-    float p0 = xff(XFR_PROJ), p1 = xff(XFR_PROJ + 1);
+-    bool ortho = g.xfReg[XFR_PROJ + 6] & 1;
+-    uint32_t defIdx = g.xfReg[XFR_MATIDX_A] & 63;
+-    float lo = 1e30f, hi = -1e30f;
+-    auto vertexAt = [](uint32_t v) -> const uint8_t* {  // the batch's v-th vertex: streamed ones, then arena runs
+-        if (v < s_bcount) return s_bdata.data + size_t(v) * s_bstride;
+-        v -= s_bcount;
+-        for (const BatchSeg& sg : s_segs) {
+-            if (!sg.arena) continue;
+-            if (v < sg.nverts) return sg.verts + size_t(v) * s_bstride;
+-            v -= sg.nverts;
+-        }
+-        return nullptr;
+-    };
+-    for (uint32_t v = 0; v < s_bcount + s_barenaVerts; v++) {
+-        const uint8_t* vx = vertexAt(v);
+-        float pos[3];
+-        memcpy(pos, vx, 12);
+-        uint32_t idx = (s_bfmt & VF_MTX) ? (vx[l.mtx] & 63) : defIdx;
+-        float m[12];
+-        memcpy(m, &g.xfMem[idx * 4], 48);
+-        float x = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3];
+-        float X;
+-        if (ortho) {
+-            X = cx + sx * (p0 * x + p1);
+-        } else {
+-            float z = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11];
+-            if (z > -1e-6f) continue;  // behind the eye
+-            X = cx + sx * (p0 * x + p1 * z) / -z;
+-        }
+-        lo = std::min(lo, X);
+-        hi = std::max(hi, X);
+-    }
+-    *outLo = lo;
+-    *outHi = hi;
++    ScreenExtent extent(sx, cx, xff(XFR_PROJ), xff(XFR_PROJ + 1), g.xfReg[XFR_PROJ + 6] & 1, g.xfMem);
++    const int matrixOffset = (s_bfmt & VF_MTX) ? int(l.mtx) : -1;
++    const uint32_t defIdx = g.xfReg[XFR_MATIDX_A] & 63;
++    extent.append(s_bdata.data, s_bcount, s_bstride, matrixOffset, defIdx);
++    for (const BatchSeg& sg : s_segs)
++        if (sg.arena) extent.append(sg.verts, sg.nverts, s_bstride, matrixOffset, defIdx);
++    *outLo = extent.lo;
++    *outHi = extent.hi;
+ }
+ 
+ // How the current batch's game coordinates map into the widened EFB.
+@@ -2006,6 +1981,10 @@ static XMap drawXMap() {
+     }
+     if ((g.xfReg[XFR_PROJ + 6] & 1) == 0) {  // perspective
+         if (s_hud) {  // a 3D part of the HUD (the water tank): moved like the rest
++            if (s_hudAnchor >= 0.0f) { // the enclosing pane already determines placement
++                m.b = centredOffset(s_hudAnchor);
++                return m;
++            }
+             float lo, hi;
+             screenExtent(sx, cx, &lo, &hi);
+             if (lo <= hi) m.b = centredOffset((lo + hi) / 2);
+@@ -2014,7 +1993,7 @@ static XMap drawXMap() {
+         m.a = s_wide;
+         float p00 = xff(XFR_PROJ), p11 = xff(XFR_PROJ + 2);
+         float aspect = p00 != 0.0f ? fabsf(p11 / p00) : 0.0f;
+-        if (aspect < kCamAspect * sqrtf(s_wide)) m.clip = 1.0f / s_wide;  // not widened by the game
++        if (aspect < s_wideCamAspect) m.clip = 1.0f / s_wide;  // not widened by the game
+         return m;
+     }
+     // 2D across the whole width: artwork (menus, the map, movies: colour
+@@ -2035,6 +2014,13 @@ static XMap drawXMap() {
+         int cw, ch;
+         if (ptr && tw >= 32 && th >= 32 && !efbCopyLookup(ptr, &cw, &ch)) artwork = true;
+     }
++    // Artwork is centred regardless of its bounds unless HUD edge placement
++    // needs its position. Avoid transforming every vertex to learn the same
++    // offset already known here (menus, text and ordinary centred HUD pieces).
++    if (artwork && !s_hud) {
++        m.b = float(s_ox);
++        return m;
++    }
+     float lo, hi;
+     screenExtent(sx, cx, &lo, &hi);
+     bool spans = lo <= 2.0f && hi >= float(EFB_W) - 2.0f;
+@@ -3019,6 +3005,7 @@ void GXPC_SetWide2D(int on) {
+ void GXPC_SetWidescreen(float widthOver43) {
+     if (s_ready) return;  // the EFB size is fixed once it exists
+     s_wide = widthOver43 > 1.0f ? widthOver43 : 1.0f;
++    s_wideCamAspect = kCamAspect * sqrtf(s_wide);
+ }
+ float GXPC_GetWidescreen(void) { return s_wide; }
+ 
+diff --git a/platform/gx/src/gx_screen_extent.h b/platform/gx/src/gx_screen_extent.h
+new file mode 100644
+index 0000000..84f5f35
+--- /dev/null
++++ b/platform/gx/src/gx_screen_extent.h
+@@ -0,0 +1,46 @@
++// CPU screen bounds used to place 2D/HUD draws in a widened framebuffer.
++#ifndef SMS_GX_SCREEN_EXTENT_H
++#define SMS_GX_SCREEN_EXTENT_H
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++namespace gx {
++struct ScreenExtent {
++    float lo = 1e30f, hi = -1e30f;
++    float sx, cx, p0, p1;
++    bool ortho;
++    const uint32_t* matrices;
++    uint32_t lastMatrix = ~0u;
++    float matrix[12];
++
++    ScreenExtent(float sx_, float cx_, float p0_, float p1_, bool ortho_, const uint32_t* matrices_)
++        : sx(sx_), cx(cx_), p0(p0_), p1(p1_), ortho(ortho_), matrices(matrices_) {}
++
++    // Each cached run is traversed once. Matrix state is immutable during
++    // the batch; reuse the last position matrix for consecutive vertices.
++    void append(const uint8_t* vertices, uint32_t count, size_t stride, int matrixOffset, uint32_t defaultMatrix) {
++        for (uint32_t v = 0; v < count; ++v, vertices += stride) {
++            float pos[3];
++            memcpy(pos, vertices, sizeof pos);
++            const uint32_t idx = matrixOffset >= 0 ? (vertices[matrixOffset] & 63) : defaultMatrix;
++            if (idx != lastMatrix) {
++                memcpy(matrix, matrices + idx * 4, sizeof matrix);
++                lastMatrix = idx;
++            }
++            const float x = matrix[0] * pos[0] + matrix[1] * pos[1] + matrix[2] * pos[2] + matrix[3];
++            float X;
++            if (ortho) X = cx + sx * (p0 * x + p1);
++            else {
++                const float z = matrix[8] * pos[0] + matrix[9] * pos[1] + matrix[10] * pos[2] + matrix[11];
++                if (z > -1e-6f) continue;
++                X = cx + sx * (p0 * x + p1 * z) / -z;
++            }
++            lo = std::min(lo, X);
++            hi = std::max(hi, X);
++        }
++    }
++};
++}
++#endif
