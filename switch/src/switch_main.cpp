@@ -306,10 +306,10 @@ __attribute__((constructor(101))) static void switch_start(void)
 
 	load_env_file(g_dir + "/env.txt");
 	take_env_arguments();
-	// Gameplay at the GameCube's 30 fps unless settings.txt or env.txt asks
-	// for 60 or 120 (the PC port's default is 60, twice the work per second).
+	// Gameplay at 60 fps unless settings.txt or env.txt asks for 30 (the
+	// GameCube's, half the work per second) or 120.
 	if (!getenv("SMS_FRAME_RATE") && !settings_has(g_dir, "frame_rate"))
-		setenv("SMS_FRAME_RATE", "30", 1);
+		setenv("SMS_FRAME_RATE", "60", 1);
 	// The screen is 16:9: a wider view, with the menus kept 4:3 in the
 	// middle (widescreen = off in settings.txt for the original 4:3).
 	if (!getenv("SMS_WIDESCREEN") && !settings_has(g_dir, "widescreen"))
