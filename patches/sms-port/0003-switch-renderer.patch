@@ -31,11 +31,11 @@ Renderer adjustments for the Switch's Mesa (nouveau) GL 4.3 stack (__SWITCH__).
   backtick key does on a PC (gx_platform.cpp)
 
 diff --git a/platform/gx/src/gx_hires.cpp b/platform/gx/src/gx_hires.cpp
-index bcd4174..2fe02b4 100644
+index d9f28b1..f3209d9 100644
 --- a/platform/gx/src/gx_hires.cpp
 +++ b/platform/gx/src/gx_hires.cpp
-@@ -184,7 +184,12 @@ static void scan() {
-     if (e && *e) {
+@@ -195,7 +195,12 @@ static void scan() {
+     } else if (e && *e) {
          std::string all = e, cur;
          for (char c : all + ";") {
 +#ifdef __SWITCH__
@@ -48,10 +48,10 @@ index bcd4174..2fe02b4 100644
                  cur.clear();
              } else {
 diff --git a/platform/gx/src/gx_platform.cpp b/platform/gx/src/gx_platform.cpp
-index f2c1fc4..f61038d 100644
+index ca73c1a..29c2777 100644
 --- a/platform/gx/src/gx_platform.cpp
 +++ b/platform/gx/src/gx_platform.cpp
-@@ -343,8 +343,16 @@ bool openWindow(float scale) {
+@@ -356,8 +356,16 @@ bool openWindow(float scale) {
          const long requested = strtol(e, nullptr, 10);
          if (requested > 0) windowScale = int(std::min(requested, 16L));
      }
@@ -68,7 +68,7 @@ index f2c1fc4..f61038d 100644
      s_window = SDL_CreateWindow("Super Mario Sunshine", layout.x, layout.y, layout.w, layout.h,
                                  SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
                                  SDL_WINDOW_HIDDEN);
-@@ -858,6 +866,21 @@ void sms_gx_pump_events(void) {
+@@ -871,6 +879,21 @@ void sms_gx_pump_events(void) {
              if (ev.type == SDL_KEYDOWN && !ev.key.repeat) GXPC_OverlayToggle();
              continue;
          }
@@ -146,10 +146,10 @@ index bad7cf6..99fc510 100644
      case S_STEAMDECK: return 3;
      default: return 0;
 diff --git a/platform/gx/src/gx_render.cpp b/platform/gx/src/gx_render.cpp
-index bd96a35..036d6fd 100644
+index ac2fce0..2282374 100644
 --- a/platform/gx/src/gx_render.cpp
 +++ b/platform/gx/src/gx_render.cpp
-@@ -506,6 +506,31 @@ void main() {
+@@ -507,6 +507,31 @@ void main() {
    o_color = vec4(float(byteAt(k)), float(byteAt(k + 1)), float(byteAt(k + 2)), float(byteAt(k + 3))) / 255.0;
  }
  )";
@@ -181,7 +181,7 @@ index bd96a35..036d6fd 100644
  static GLuint s_encProg, s_encFbo, s_encTex;
  static GLint s_encUSize, s_encULayout, s_encUBytes;
  static int s_encRows = 0;
-@@ -1181,7 +1206,11 @@ void rendererInit(float efbScale) {
+@@ -1182,7 +1207,11 @@ void rendererInit(float efbScale) {
      s_copyUMode = glGetUniformLocation(s_copyProg, "u_mode");
      s_copyURect = glGetUniformLocation(s_copyProg, "u_rect");
      s_copyUAlphaOne = glGetUniformLocation(s_copyProg, "u_alphaOne");
