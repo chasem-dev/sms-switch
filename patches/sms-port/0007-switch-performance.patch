@@ -1,0 +1,417 @@
+Present without waiting for the swap on the Switch, and say where the GL
+thread's time goes.
+
+- SMS_GX_ASYNC_PRESENT (on by default on the Switch, off elsewhere): the
+  game's thread draws the XFB, the overlay and the menus with its GL calls
+  queued, queues the swap for the GL thread and goes on to the next frame.
+  It waited for the swap before, so every frame the game's own work, the
+  driver's work on the GL thread and the GPU each waited for the others; now
+  the next frame's game work runs while the GL thread and the GPU finish the
+  last one. One frame is in flight: a present first waits for the last
+  frame's swap (counted as the swap's time, so GXPC_SkipNextPresent still
+  sees a slow present) (gx_platform.cpp)
+- the overlay panels' GL work (which reads and restores GL state) is queued
+  as one command for the GL thread, instead of a wait for it per state read
+  (gx_render.cpp drawOverlayPanel)
+- the GL thread's busy time and, with the swap queued, its time in
+  SDL_GL_SwapWindow: GXPCTimes glBusy and glSwap, a line in the overlay
+  (gx_glthread.cpp, gx_overlay.cpp)
+- SMS_TIMING_LOG=1 logs the overlay's frame breakdown every 2 s, overlay
+  shown or not, as the Android branch does
+- on the Switch the GL thread starts on a core of its own and the texture
+  pack's idle-priority work runs below the game's priority, through the
+  runtime's sms_switch_gl_thread and sms_switch_background_thread (weak:
+  gx_selftest.nro has neither)
+
+diff --git a/platform/gx/include/sms_gx/gx_pc.h b/platform/gx/include/sms_gx/gx_pc.h
+index a3981b7..795e4ce 100644
+--- a/platform/gx/include/sms_gx/gx_pc.h
++++ b/platform/gx/include/sms_gx/gx_pc.h
+@@ -205,9 +205,12 @@ double GXPC_GxSeconds(void);                   /* wall time spent inside sms_gx
+  * it on, as does SMS_GX_STATS). gpuWait is time blocked on the GPU (fences,
+  * reading back copies, peeks and pixel counts); present is drawing the XFB to
+  * the window, swap is SDL_GL_SwapWindow. idle is the time the game had no
+- * runnable thread (waiting for the next retrace), from GXPC_SetIdleClock. */
++ * runnable thread (waiting for the next retrace), from GXPC_SetIdleClock.
++ * glBusy is the GL thread's own time running the driver's work (0 without
++ * one), and glSwap the part of it in SDL_GL_SwapWindow when the swap is
++ * queued (SMS_GX_ASYNC_PRESENT). */
+ typedef struct GXPCTimes {
+-    double gx, vertices, draws, textures, copies, peeks, gpuWait, present, swap, idle;
++    double gx, vertices, draws, textures, copies, peeks, gpuWait, present, swap, idle, glBusy, glSwap;
+ } GXPCTimes;
+ void GXPC_GetTimes(GXPCTimes* out);
+ void GXPC_SetDetailedTimers(int on);
+diff --git a/platform/gx/src/gx_glthread.cpp b/platform/gx/src/gx_glthread.cpp
+index 393b8f9..4bd7618 100644
+--- a/platform/gx/src/gx_glthread.cpp
++++ b/platform/gx/src/gx_glthread.cpp
+@@ -12,6 +12,10 @@
+ #include <pthread.h>
+ #endif
+ 
++#ifdef __SWITCH__
++extern "C" __attribute__((weak)) void sms_switch_gl_thread(void);  // the Switch runtime (sms-switch)
++#endif
++
+ namespace gx {
+ namespace glt {
+ 
+@@ -75,6 +79,7 @@ void wakeMain() {
+ // main run loop: SDL makes the GL thread's swap call into the main thread
+ // (dispatch_sync) after the window changed size.
+ double s_waited = 0;  // seconds the game's threads waited for the GL thread
++std::atomic<double> s_busy{0};  // seconds the GL thread spent running commands
+ 
+ template <class C> void mainWait(const C& cond) {
+     if (cond()) return;
+@@ -102,6 +107,9 @@ template <class C> void mainWait(const C& cond) {
+ 
+ void threadMain(void (*bind)(void*), void* arg, std::atomic<int>* ready) {
+     t_onGl = true;
++#ifdef __SWITCH__
++    if (sms_switch_gl_thread) sms_switch_gl_thread();  // a core of its own
++#endif
+     bind(arg);
+     signalFlag(*ready);
+     uint64_t tail = s_tail.load();
+@@ -123,12 +131,14 @@ void threadMain(void (*bind)(void*), void* arg, std::atomic<int>* ready) {
+             }
+             continue;
+         }
++        const double t0 = monoSeconds();
+         while (tail != pub) {
+             Header* h = reinterpret_cast<Header*>(s_ring + tail % kRing);
+             if (h->fn) h->fn(reinterpret_cast<uint8_t*>(h) + 16);
+             tail += h->size;
+             s_tail.store(tail, std::memory_order_release);
+         }
++        s_busy.store(s_busy.load(std::memory_order_relaxed) + monoSeconds() - t0, std::memory_order_relaxed);
+         wakeMain();  // a producer may wait for space
+     }
+ }
+@@ -151,6 +161,7 @@ void stopAtExit() { stop(); }
+ 
+ bool active() { return s_running.load(std::memory_order_relaxed); }
+ double waitedSeconds() { return s_waited; }
++double busySeconds() { return s_busy.load(std::memory_order_relaxed); }
+ bool onGlThread() { return t_onGl || !s_running.load(std::memory_order_relaxed); }
+ 
+ void* reserve(Thunk fn, size_t bytes) {
+@@ -179,6 +190,10 @@ void publish() {
+     if (s_head - s_wokenAt >= kWakeBytes) wakeGl();
+ }
+ 
++void kick() {
++    if (s_running.load() && !t_onGl) wakeGl();
++}
++
+ void waitFlag(const std::atomic<int>& done) {
+     mainWait([&] { return done.load(std::memory_order_acquire) != 0; });
+ }
+diff --git a/platform/gx/src/gx_glthread.h b/platform/gx/src/gx_glthread.h
+index f14c136..2ab8514 100644
+--- a/platform/gx/src/gx_glthread.h
++++ b/platform/gx/src/gx_glthread.h
+@@ -23,6 +23,7 @@ namespace glt {
+ 
+ bool active();
+ double waitedSeconds();  // how long the game's threads have waited for the GL thread
++double busySeconds();    // how long the GL thread has spent running commands
+ // True on the GL thread, and on any thread while there is none: then GL may
+ // be called directly.
+ bool onGlThread();
+@@ -39,6 +40,7 @@ enum : size_t { kMaxInline = 4u << 20 };  // larger data is not copied: the call
+ // A command of `bytes` payload (16-byte aligned) that the GL thread passes to fn.
+ void* reserve(Thunk fn, size_t bytes);
+ void publish();
++void kick();  // wakes the GL thread for what is queued, without waiting for it
+ // Waits until `done` is set (by a command the GL thread runs).
+ void waitFlag(const std::atomic<int>& done);
+ void signalFlag(std::atomic<int>& done);
+diff --git a/platform/gx/src/gx_hires.cpp b/platform/gx/src/gx_hires.cpp
+index f3209d9..3758765 100644
+--- a/platform/gx/src/gx_hires.cpp
++++ b/platform/gx/src/gx_hires.cpp
+@@ -574,6 +574,9 @@ static int preloadMode() {
+ }
+ static bool preloading() { return preloadMode() != 0; }
+ 
++#ifdef __SWITCH__
++extern "C" __attribute__((weak)) void sms_switch_background_thread(void);  // the Switch runtime (sms-switch)
++#endif
+ // The levels a pack leaves out are made at the lowest priority, of processor
+ // and of disk (the completion worker and its helpers), so they wait for idle
+ // time instead of slowing the game's frames or its disc reads.
+@@ -586,6 +589,8 @@ static void idlePriority() {
+     sched_param p{};
+     pthread_setschedparam(pthread_self(), SCHED_IDLE, &p);
+     syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS: this thread */, 0, 3 << 13 /* IOPRIO_CLASS_IDLE */);
++#elif defined(__SWITCH__)
++    if (sms_switch_background_thread) sms_switch_background_thread();
+ #endif
+ }
+ 
+diff --git a/platform/gx/src/gx_internal.h b/platform/gx/src/gx_internal.h
+index f2df5c4..3cf66a2 100644
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -112,6 +112,7 @@ bool trustWriteStamps();
+ enum { kRecheckFrames = 8 };
+ extern uint32_t g_displayFrames;  // display copies so far
+ extern double g_presentWaited, g_presentDrain;  // gx_render.cpp, GXPC_GetTimes
++double glSwapSeconds();  // gx_platform.cpp: the GL thread's time in swaps (SMS_GX_ASYNC_PRESENT)
+ extern bool g_defaultArrayBE;
+ extern bool g_gxStats;  // SMS_GX_STATS: per-part timers run
+ extern uint32_t g_arrayGen;  // bumped by every write to g.arrayBase/Stride/BigEndian
+diff --git a/platform/gx/src/gx_overlay.cpp b/platform/gx/src/gx_overlay.cpp
+index d4cb8da..f9e20c7 100644
+--- a/platform/gx/src/gx_overlay.cpp
++++ b/platform/gx/src/gx_overlay.cpp
+@@ -18,6 +18,15 @@
+ 
+ namespace {
+ 
++// SMS_TIMING_LOG=1: the overlay's frame breakdown in the log every 2 s,
++// with or without the overlay shown.
++bool timingLogEnabled() {
++    static const bool on = [] {
++        const char* e = getenv("SMS_TIMING_LOG");
++        return e && *e && strcmp(e, "0") != 0;
++    }();
++    return on;
++}
+ bool s_visible = false;
+ bool s_panelDirty = true;
+ const int kSpeeds[] = {1, 2, 4, 10};
+@@ -33,7 +42,7 @@ struct FrameClock {
+     double start = 0, windowStart = 0, last = 0;
+     GXPCTimes atWindow = {};
+     int frames = 0, shownFrames = 0;
+-    double worst = 0;
++    double worst = 0, lastLog = 0;
+     // shown values, ms per frame
+     double fps = 0, shownFps = 0, avgMs = 0, maxMs = 0;
+     GXPCTimes per = {};
+@@ -67,12 +76,23 @@ struct FrameClock {
+             per.present = (now.present - atWindow.present) * k;
+             per.swap = (now.swap - atWindow.swap) * k;
+             per.idle = (now.idle - atWindow.idle) * k;
++            per.glBusy = (now.glBusy - atWindow.glBusy) * k;
++            per.glSwap = (now.glSwap - atWindow.glSwap) * k;
+             fps = frames / span;
+             shownFps = shownFrames / span;
+             avgMs = span * 1000.0 / frames;
+             maxMs = worst * 1000.0;
+             gameMs = avgMs - per.gx - per.present - per.swap - per.idle;
+             if (gameMs < 0) gameMs = 0;
++            if (timingLogEnabled() && t - lastLog >= 2.0) {
++                gx::logmsg("timing: game %.2f FPS, shown %.2f FPS, frame %.2f ms avg/%.2f ms worst; "
++                           "game %.2f, GX %.2f, present %.2f, swap %.2f, idle %.2f, explicit GPU waits %.2f ms/frame",
++                           fps, shownFps, avgMs, maxMs, gameMs, per.gx, per.present, per.swap, per.idle, per.gpuWait);
++                gx::logmsg("GX breakdown: vertices %.2f, draws %.2f, textures %.2f, copies %.2f, peeks %.2f ms/frame; "
++                           "GL thread busy %.2f (swapping %.2f) ms/frame",
++                           per.vertices, per.draws, per.textures, per.copies, per.peeks, per.glBusy, per.glSwap);
++                lastLog = t;
++            }
+             atWindow = now;
+             windowStart = t;
+             frames = 0;
+@@ -175,6 +195,7 @@ void GXPC_OverlayDraw(int winW, int winH) {
+                  "ms/frame: game %.1f  GX %.1f  present %.1f  swap %.1f  idle %.1f\n"
+                  "GX: vertices %.1f  batches %.1f  textures %.1f  copies %.1f  peeks %.1f\n"
+                  "    waiting for the GPU %.1f\n"
++                 "GL thread: busy %.1f  swapping %.1f\n"
+                  "draws %u   vertices %u   EFB copies %u\n"
+                  "texture uploads %u   shader compiles %u\n"
+                  "frames %u   up %d:%02d\n"
+@@ -193,7 +214,7 @@ void GXPC_OverlayDraw(int winW, int winH) {
+                  "Esc: quit",
+                  s_clock.fps, s_clock.shownFps, s_clock.avgMs, s_clock.maxMs, GXPC_GetSpeed(), s_clock.gameMs, s_clock.per.gx,
+                  s_clock.per.present, s_clock.per.swap, s_clock.per.idle, s_clock.per.vertices, s_clock.per.draws,
+-                 s_clock.per.textures, s_clock.per.copies, s_clock.per.peeks, s_clock.per.gpuWait, st.draws, st.vertices, st.efbCopies,
++                 s_clock.per.textures, s_clock.per.copies, s_clock.per.peeks, s_clock.per.gpuWait, s_clock.per.glBusy, s_clock.per.glSwap, st.draws, st.vertices, st.efbCopies,
+                  st.textureUploads, st.shaderCompiles, s_clock.total, int(up) / 60, int(up) % 60, winW, winH,
+                  s_renderer.c_str());
+ 
+diff --git a/platform/gx/src/gx_platform.cpp b/platform/gx/src/gx_platform.cpp
+index 29c2777..04ccedd 100644
+--- a/platform/gx/src/gx_platform.cpp
++++ b/platform/gx/src/gx_platform.cpp
+@@ -16,6 +16,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
++#include <atomic>
+ #include <vector>
+ #if !defined(_WIN32) && !defined(__APPLE__)
+ #include <sys/stat.h>
+@@ -65,6 +66,28 @@ double s_presentCost = 0;
+ const double kSkipPresentCost = 0.002;
+ double s_lastPresent = 0;  // the last display copy's present, 0 when skipped
+ int s_vsync = 0;
++// SMS_GX_ASYNC_PRESENT (on by default on the Switch): the game's thread queues
++// the frame's present and swap for the GL thread and goes on to the next
++// frame, so the next frame's game work runs while the GL thread and the GPU
++// finish this one. Without it the game's thread waits for the swap, and the
++// game, the driver's work and the GPU each wait for the others every frame.
++// One frame is in flight: a present first waits for the last one's swap.
++std::atomic<int> s_swapDone{1};
++std::atomic<double> s_glSwapSeconds{0};  // the GL thread's time in SDL_GL_SwapWindow
++
++bool asyncPresent() {
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("SMS_GX_ASYNC_PRESENT");
++#ifdef __SWITCH__
++        on = !(e && e[0] == '0');
++#else
++        on = e && *e && e[0] != '0';
++#endif
++        if (on) gx::logmsg("presenting without waiting for the swap (SMS_GX_ASYNC_PRESENT)");
++    }
++    return on && glt::active();
++}
+ uint32_t s_frame = 0;
+ 
+ #ifdef SMS_GX_HAVE_SDL2
+@@ -634,6 +657,8 @@ void onDisplayCopy(const void* xfb) {
+ }  // namespace
+ 
+ namespace gx {
++double glSwapSeconds() { return s_glSwapSeconds.load(std::memory_order_relaxed); }
++
+ // GXPC_Shutdown: the GL thread ends and the context is current on the
+ // calling thread again, so the caller may destroy it.
+ void releaseGlThread() {
+@@ -766,6 +791,41 @@ void GXPC_Present(const void* xfb) {
+         SDL_GL_GetDrawableSize(s_window, &w, &h);
+         double t0 = 0, t1 = 0, tSwapped = 0;
+         const bool hdr = hdrActive();
++        if (!hdr && asyncPresent()) {
++            // on this thread, its GL calls queued (gx_glthread.h); the waits
++            // here (for the last frame's swap, and any GL call with a result)
++            // count as the swap's, not GX's
++            t0 = nowSeconds();
++            const double waited0 = glt::waitedSeconds();
++            glt::waitFlag(s_swapDone);
++            const double tReady = nowSeconds();
++            GXPC_PresentXFB(xfb, w, h);
++            GXPC_OverlayDraw(w, h);
++            cheatMenuRender(w, h);
++            warpMenuRender(w, h);
++            savestateOverlayRender(w, h);
++            captureWindow(s_frame, w, h);
++            s_swapDone.store(0, std::memory_order_relaxed);
++            glt::post([] {
++                const double a = nowSeconds();
++                SDL_GL_SwapWindow(s_window);
++                s_glSwapSeconds.store(s_glSwapSeconds.load(std::memory_order_relaxed) + nowSeconds() - a,
++                                      std::memory_order_relaxed);
++                glt::signalFlag(s_swapDone);
++            });
++            glt::kick();  // the GL thread may sleep until more is queued
++            t1 = nowSeconds();
++            g_presentWaited += glt::waitedSeconds() - waited0;
++            waitSimulatedRefresh();
++            const double t2 = nowSeconds();
++            g_presentSeconds += t1 - tReady;
++            g_swapSeconds += (tReady - t0) + (t2 - t1);
++            s_lastPresent = t2 - t0;
++            s_presentCost += (s_lastPresent - s_presentCost) * 0.1;
++            GXPC_EndPresent();
++            sms_gx_pump_events();
++            return;
++        }
+         // on the GL thread, after what the frame queued before (the frame's
+         // own work, which is not timed as presenting); this thread waits for
+         // the swap, as it did when it made it
+diff --git a/platform/gx/src/gx_render.cpp b/platform/gx/src/gx_render.cpp
+index ffffc96..fa4ceac 100644
+--- a/platform/gx/src/gx_render.cpp
++++ b/platform/gx/src/gx_render.cpp
+@@ -48,7 +48,8 @@ static double nowSeconds() { return monoSeconds(); }
+ // measured; the others cost a clock read per texture bind and per primitive.
+ static bool statsEnv() {
+     const char* e = getenv("SMS_GX_STATS");
+-    return (e && atoi(e) > 0) || getenv("SMS_GX_HITCH_MS");
++    const char* timing = getenv("SMS_TIMING_LOG");  // the overlay's breakdown in the log
++    return (e && atoi(e) > 0) || getenv("SMS_GX_HITCH_MS") || (timing && *timing && strcmp(timing, "0") != 0);
+ }
+ bool g_gxStats = statsEnv();
+ struct GxTimer {
+@@ -128,6 +129,7 @@ static GLint s_copyUMode, s_copyURect, s_copyUAlphaOne;
+ static GLuint s_tmpFbo;
+ static GLuint s_overlayTex[OVERLAY_SLOTS];
+ static int s_overlayW[OVERLAY_SLOTS], s_overlayH[OVERLAY_SLOTS];
++static int s_panelW[OVERLAY_SLOTS], s_panelH[OVERLAY_SLOTS];  // the same, as the game's thread knows them
+ static GLuint s_overlayProg;
+ static GLint s_overlayRect, s_overlayWindow;
+ static GXPCStats s_lastFrameStats;
+@@ -2684,10 +2686,12 @@ void GXPC_Shutdown(void) {
+     if (!s_ready) return;
+     textureShutdown();
+     shaderShutdown();
++    glt::finish();  // the overlay panels' queued draws use s_overlay*
+     for (int i = 0; i < OVERLAY_SLOTS; i++) {
+         if (s_overlayTex[i]) glDeleteTextures(1, &s_overlayTex[i]);
+         s_overlayTex[i] = 0;
+         s_overlayW[i] = s_overlayH[i] = 0;
++        s_panelW[i] = s_panelH[i] = 0;
+     }
+     if (s_overlayProg) glDeleteProgram(s_overlayProg);
+     s_overlayProg = 0;
+@@ -3029,6 +3033,8 @@ void GXPC_GetTimes(GXPCTimes* out) {
+     out->present = g_presentSeconds;
+     out->swap = g_swapSeconds;
+     out->idle = s_idleClock ? s_idleClock() : 0;
++    out->glBusy = glt::busySeconds();
++    out->glSwap = glSwapSeconds();
+ }
+ 
+ void GXPC_SetDetailedTimers(int on) { g_gxStats = on || statsEnv(); }
+@@ -3071,11 +3077,12 @@ void gx::captureWindow(uint32_t frame, int w, int h) {
+     }
+ }
+ 
+-void gx::drawOverlayPanel(OverlaySlot slot, const uint8_t* rgba, int w, int h, int x, int y, int scale, int winW, int winH) {
+-    if (!s_ready || w <= 0 || h <= 0) return;
+-    if (!rgba && (!s_overlayTex[slot] || w != s_overlayW[slot] || h != s_overlayH[slot])) return;
+-    flushBatch();
+-    glcInvalidate();
++// The panel's GL work, on the GL thread (drawOverlayPanel): it reads the GL
++// state it changes and puts it back, which on the game's thread would wait
++// for everything queued before it, and with SMS_GX_ASYNC_PRESENT for the last
++// frame's swap. Only it touches s_overlay*.
++static void drawOverlayPanelGl(OverlaySlot slot, const uint8_t* rgba, int w, int h, int x, int y, int scale, int winW,
++                               int winH) {
+     // glBlitFramebuffer ignores alpha, so draw the panel with source-alpha blending.
+     if (!s_overlayProg) {
+         static const char* vs = R"(#version 330 core
+@@ -3187,6 +3194,26 @@ void main() { o_color = texture(u_color, v_uv); }
+     if (clip1) glEnable(GL_CLIP_DISTANCE1);
+ }
+ 
++void gx::drawOverlayPanel(OverlaySlot slot, const uint8_t* rgba, int w, int h, int x, int y, int scale, int winW, int winH) {
++    if (!s_ready || w <= 0 || h <= 0) return;
++    if (!rgba && (w != s_panelW[slot] || h != s_panelH[slot])) return;
++    if (rgba) {
++        s_panelW[slot] = w;
++        s_panelH[slot] = h;
++    }
++    flushBatch();
++    glcInvalidate();
++    struct Panel {
++        OverlaySlot slot;
++        int w, h, x, y, scale, winW, winH;
++        bool upload;
++    };
++    const Panel p = {slot, w, h, x, y, scale, winW, winH, rgba != nullptr};
++    glt::postData(rgba, rgba ? size_t(w) * size_t(h) * 4 : 0, [p](const uint8_t* px) {
++        drawOverlayPanelGl(p.slot, p.upload ? px : nullptr, p.w, p.h, p.x, p.y, p.scale, p.winW, p.winH);
++    });
++}
++
+ extern "C" {
+ 
+ void GXPC_GetStats(GXPCStats* out) {

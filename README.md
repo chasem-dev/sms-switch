@@ -80,7 +80,7 @@ Everything else lives in the same folder:
 | `cache/` | the shader cache |
 | `sms.log` | the log of the last run (or the nxlink console, when started with `nxlink -s`) |
 
-The game fills the screen (720p handheld, 1080p docked) in 16:9 widescreen at 30 fps, with the gameplay HUD at the screen's edges and the camera stick inverted on both axes; `settings.txt` changes any of that (`widescreen = off` for the original 4:3, `widescreen_hud = centre`, `frame_rate = 60`, `camera_invert_x = 0`, `camera_invert_y = 0`).
+The game fills the screen (720p handheld, 1080p docked) in 16:9 widescreen at 60 fps, with the gameplay HUD at the screen's edges and the camera stick inverted on both axes; `settings.txt` changes any of that (`widescreen = off` for the original 4:3, `widescreen_hud = centre`, `frame_rate = 30`, `camera_invert_x = 0`, `camera_invert_y = 0`).
 Button prompts in the game's text show the Switch's buttons (`button_prompts = gamecube` for the game's own); the images are `prompts/switch.png` beside the NRO, written there on the first start, and can be replaced (eight 64x64 icons in a row: A B X Y Z L R C-stick, here A B X Y R ZL ZR and the right stick; `tools/make_prompts.py` draws the default).
 A B X Y are the Switch buttons labelled so, as the prompts show them (devkitPro's SDL had mapped them by position, putting the GameCube's A on the Switch's B); `SDL_GAMECONTROLLERCONFIG` in `env.txt` replaces that mapping, and `bindings.txt` rebinds buttons as on the PC.
 Leaving through HOME ends the game as closing any game does; it does not return to the homebrew menu.
@@ -125,6 +125,23 @@ Joy-Con and Pro Controllers work as the GameCube controller (the PC port's mappi
 | **−** with the overlay shown | the warp menu (stages and episodes) |
 
 `SMS_OVERLAY=1` in `env.txt` shows the overlay from the start.
+
+## Performance
+
+Gameplay runs at 60 fps (`frame_rate = 30` in `settings.txt` for the GameCube's rate, half the work).
+Each frame is the game's own code, the GL driver's work for its draws (Mesa, on a thread of its own) and the GPU's; the console's A57 cores are slow enough that the first two decide the frame rate.
+What the Switch build does about it:
+
+- **The swap is queued, not waited for** (`SMS_GX_ASYNC_PRESENT`, `patches/sms-port/0007`): the game's thread queues the frame's present and swap for the GL thread and starts the next frame, so its game code runs while the GL thread and the GPU finish the last one.
+  The game's thread used to wait for the swap, so the game, the driver and the GPU took turns every frame.
+  `SMS_GX_ASYNC_PRESENT=0` in `env.txt` brings the wait back, to compare.
+- **Threads** (`switch/src/performance.cpp`): the game's thread starts on core 0, the GL thread on core 1 and the rest on core 2 or 0, each free to move to any of the three; the texture pack's background work runs below the game's priority, since Horizon does not share a core between threads of equal priority by time.
+  The CPU runs at 1785 MHz and the GPU at 460.8 MHz handheld, 768 MHz docked (`SMS_SWITCH_CLOCKS=0` for the console's default profile).
+- **Widescreen** draws are placed without scanning their vertices over and over (`patches/sms-port/0006`, from the Android build).
+
+To see where a frame's time goes, show the overlay (L3 + R3): `game`, `GX`, `present`, `swap` and `idle` are the game thread's milliseconds per frame, and `GL thread: busy` the GL thread's (`swapping` is the part of it in `SDL_GL_SwapWindow`, which waits for the display and the GPU).
+With the swap queued, `swap` on the game thread is its wait for the GL thread to finish the last frame: high there means the GL thread is the limit, high `game` that the game's own code is.
+`SMS_TIMING_LOG=1` in `env.txt` writes the same breakdown to `sms.log` every 2 seconds without the overlay, and `SMS_GX_STATS=120` adds draws, uploads and GL calls per frame.
 
 ## How it works
 

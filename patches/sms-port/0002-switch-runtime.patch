@@ -132,7 +132,7 @@ index b3a27d9..0ccaf85 100644
  	localtime_r(&now, &lt);
  	s64 local = (s64)now + lt.tm_gmtoff - 946684800LL;
 diff --git a/platform/os/os_thread.cpp b/platform/os/os_thread.cpp
-index 193c3a7..460bfc4 100644
+index 61b058a..720a4c1 100644
 --- a/platform/os/os_thread.cpp
 +++ b/platform/os/os_thread.cpp
 @@ -184,7 +184,7 @@ LowStack* low_stack()
@@ -171,8 +171,8 @@ index 193c3a7..460bfc4 100644
  		port_win64_thread_exit();
  #else
  		pthread_exit(NULL);
-@@ -309,7 +309,7 @@ void switch_to(OSThread* self, OSThread* next, bool exiting)
- 		// has since been recreated and scheduled (it then has a new Host).
+@@ -312,7 +312,7 @@ void switch_to(OSThread* self, OSThread* next, bool exiting)
+ 	for (;;) {
  		if (hs->cancelled && (g_cur != self || host_of(self) != hs)) {
  			pthread_mutex_unlock(&g_cpu);
 -#ifdef _WIN64
@@ -181,7 +181,7 @@ index 193c3a7..460bfc4 100644
  #else
  			pthread_exit(NULL);
 diff --git a/platform/port_runtime.cpp b/platform/port_runtime.cpp
-index cecfc98..58a96d3 100644
+index 6120c63..5e1a684 100644
 --- a/platform/port_runtime.cpp
 +++ b/platform/port_runtime.cpp
 @@ -134,7 +134,9 @@ extern "C" void port_stub_report(void)
@@ -233,7 +233,7 @@ index cecfc98..58a96d3 100644
  
  #ifndef _WIN32
  // mmap exactly at `want` without replacing an existing mapping. Linux has
-@@ -514,6 +520,20 @@ static void map_mem1()
+@@ -546,6 +552,20 @@ static void map_mem1()
  			VirtualFree(p, 0, MEM_RELEASE);
  		exit(1);
  	}
