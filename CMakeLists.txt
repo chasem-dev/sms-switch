@@ -92,6 +92,37 @@ else()
 endif()
 target_link_libraries(sms PRIVATE ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouveau z)
 
+# dkgl (switch/src/dkgl): the renderer's GL calls on deko3d, with
+# SMS_SWITCH_RENDERER=deko3d. It compiles shaders with uam built as a library
+# (tools/uam/build-uam.sh, into build/uam/); without it, only Mesa's GL.
+set(SMS_SWITCH_UAM_DIR "${CMAKE_BINARY_DIR}/uam" CACHE PATH "libuam built by tools/uam/build-uam.sh")
+if(EXISTS "${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
+  add_library(dkgl STATIC
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_api.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_device.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_draw.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_glsl.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_program.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_sdl.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_texture.cpp)
+  # (SDL itself is linked by the program)
+  target_include_directories(dkgl PRIVATE ${SMS_SWITCH_UAM_DIR}/include ${DEVKITPRO}/portlibs/switch/include/SDL2)
+  target_compile_features(dkgl PRIVATE cxx_std_17)
+  target_link_libraries(dkgl PUBLIC ${SMS_SWITCH_UAM_DIR}/lib/libuam.a deko3d)
+  # SDL's GL calls go to dkgl when it is chosen (dkgl_sdl.cpp)
+  set(SMS_SWITCH_DKGL_WRAPS
+    -Wl,--wrap=SDL_GL_CreateContext -Wl,--wrap=SDL_GL_MakeCurrent -Wl,--wrap=SDL_GL_SwapWindow
+    -Wl,--wrap=SDL_GL_SetSwapInterval -Wl,--wrap=SDL_GL_GetSwapInterval -Wl,--wrap=SDL_GL_DeleteContext
+    -Wl,--wrap=SDL_GL_GetProcAddress -Wl,--wrap=SDL_GL_GetDrawableSize -Wl,--wrap=SDL_EGL_CreateSurface
+    -Wl,--wrap=SDL_EGL_DestroySurface -Wl,--wrap=nwindowSetDimensions)
+  target_link_libraries(sms PRIVATE dkgl)
+  target_link_options(sms PRIVATE ${SMS_SWITCH_DKGL_WRAPS})
+  target_compile_definitions(sms PRIVATE SMS_SWITCH_DKGL=1)
+  message(STATUS "sms-switch: the deko3d renderer (dkgl) with ${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
+else()
+  message(STATUS "sms-switch: no libuam (tools/uam/build-uam.sh): Mesa's GL only")
+endif()
+
 # The icon (homebrew menu, HOME menu): SMS_SWITCH_ICON=
 #   steamgriddb (default)  the box art from SteamGridDB, fetched at build time,
 #                          else the disc's memory-card Mario (with a disc);
@@ -210,5 +241,11 @@ if(SMS_SWITCH_GX_SELFTEST)
     ${_gx}/src ${SMS_SWITCH_DIR}/src)
   target_compile_features(gx_selftest PRIVATE cxx_std_17)
   target_link_libraries(gx_selftest PRIVATE sms_gx ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouveau z)
+  if(TARGET dkgl)
+    # SMS_SWITCH_RENDERER=deko3d runs the self-test on dkgl
+    target_link_libraries(gx_selftest PRIVATE dkgl)
+    target_link_options(gx_selftest PRIVATE ${SMS_SWITCH_DKGL_WRAPS})
+    target_compile_definitions(gx_selftest PRIVATE SMS_SWITCH_DKGL=1)
+  endif()
   nx_create_nro(gx_selftest OUTPUT ${CMAKE_BINARY_DIR}/gx_selftest.nro NOICON NONACP)
 endif()

@@ -21,6 +21,9 @@
 #include <unistd.h>
 #include <string>
 #include "low_memory.h"
+#ifdef SMS_SWITCH_DKGL
+#include "dkgl/dkgl.h"
+#endif
 
 // The program's name and title (CMakeLists.txt): sms and Super Mario Sunshine,
 // or sms-eclipse and Super Mario Eclipse.
@@ -372,6 +375,10 @@ __attribute__((constructor(101))) static void switch_start(void)
 	setenv("SMS_FULLSCREEN", "1", 0);
 	setenv("XDG_DATA_HOME", (g_dir + "/save").c_str(), 0);
 	setenv("XDG_CACHE_HOME", (g_dir + "/cache").c_str(), 0);
+#ifdef SMS_SWITCH_DKGL
+	// the deko3d renderer's compiled programs (SMS_SWITCH_RENDERER=deko3d)
+	dkgl::setShaderCache((g_dir + "/cache/dkgl").c_str(), nullptr);
+#endif
 	if (!getenv("SMS_DISC_IMAGE") && !getenv("SMS_DISC_ROOT")) {
 		// sms-standalone.nro carries the image in its RomFS; else the SD card.
 		std::string disc = find_bundled_disc_image();

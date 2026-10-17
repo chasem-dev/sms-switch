@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#ifdef SMS_SWITCH_DKGL
+#include "dkgl/dkgl.h"
+#endif
 
 extern int gx_selftest_main(int argc, char** argv);
 
@@ -14,6 +17,12 @@ int main(int, char**)
 	dup2(fileno(stdout), fileno(stderr));
 	setvbuf(stdout, NULL, _IONBF, 0);
 	setvbuf(stderr, NULL, _IONBF, 0);
+#ifdef SMS_SWITCH_DKGL
+	// on the deko3d renderer, unless gx_selftest.gl is beside it (Mesa's GL)
+	if (access("gx_selftest.gl", F_OK) != 0) setenv("SMS_SWITCH_RENDERER", "deko3d", 0);
+	dkgl::setShaderCache("gx_selftest-dkgl", nullptr);
+	printf("gx_selftest: renderer %s\n", getenv("SMS_SWITCH_RENDERER") ? getenv("SMS_SWITCH_RENDERER") : "gl");
+#endif
 	char* args[] = {(char*)"gx_selftest", (char*)"--window", (char*)"gx_selftest.ppm", NULL};
 	const int rc = gx_selftest_main(3, args);
 	printf("gx_selftest: exit %d\n", rc);
