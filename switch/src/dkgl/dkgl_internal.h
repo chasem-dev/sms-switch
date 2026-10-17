@@ -19,6 +19,22 @@ namespace dkgl {
 
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// What the GL thread is waiting for (a string literal, or null when it is
+// not waiting), and its draws and swaps so far: a watchdog thread logs a wait
+// of over 3 seconds, and whether the GL thread still draws (startWatchdog).
+struct Activity {
+    const char* volatile waiting = nullptr;
+    volatile uint64_t since = 0;  // system tick the wait began
+    volatile uint32_t draws = 0, swaps = 0;
+};
+extern Activity g_activity;
+struct Waiting {
+    const char* prev;
+    explicit Waiting(const char* what);
+    ~Waiting();
+};
+void startWatchdog();
+
 // --- memory ----------------------------------------------------------------
 // A piece of one of the heaps' memory blocks.
 struct Alloc {

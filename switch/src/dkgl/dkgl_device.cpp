@@ -22,7 +22,48 @@ void logf(const char* fmt, ...) {
     svcOutputDebugString(buf, size_t(n < 0 ? 0 : n < int(sizeof buf) ? n : int(sizeof buf) - 1));
 }
 
+Activity g_activity;
+
+Waiting::Waiting(const char* what) : prev(g_activity.waiting) {
+    g_activity.since = armGetSystemTick();
+    g_activity.waiting = what;
+}
+Waiting::~Waiting() {
+    g_activity.since = armGetSystemTick();
+    g_activity.waiting = prev;
+}
+
 namespace {
+Thread s_watchdog;
+
+void watchdog(void*) {
+    const char* told = nullptr;
+    uint64_t toldSince = 0;
+    uint32_t draws = g_activity.draws, swaps = g_activity.swaps, still = 0;
+    for (;;) {
+        svcSleepThread(1000000000ll);
+        const char* what = g_activity.waiting;
+        const uint64_t since = g_activity.since;
+        if (what && (what != told || since != toldSince) &&
+            armTicksToNs(armGetSystemTick() - since) > 3000000000ull) {
+            logf("the GL thread has been %s for 3 s (draws %u, swaps %u; GPU submissions %llu, finished %llu)", what,
+                 g_activity.draws, g_activity.swaps, (unsigned long long)g_dev.serial - 1,
+                 (unsigned long long)g_dev.completed);
+            told = what;
+            toldSince = since;
+        }
+        // drawing on without swapping (or not drawing at all) for 5 s
+        if (g_activity.swaps != swaps) {
+            swaps = g_activity.swaps;
+            draws = g_activity.draws;
+            still = 0;
+        } else if (++still == 5) {
+            logf("no swap for 5 s: %u draws since the last one (%s)", g_activity.draws - draws,
+                 what ? what : "the GL thread is not waiting for the GPU");
+        }
+    }
+}
+
 uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 
 void debugCallback(void*, const char* context, DkResult result, const char* message) {
@@ -164,11 +205,20 @@ void poll() {
 // Waits for a fence, saying so in the log when the GPU takes over 2 seconds
 // (a GPU hang otherwise leaves nothing there).
 void waitFence(DkFence* f, uint64_t serial) {
+    Waiting w("waiting for the GPU");
     if (dkFenceWait(f, 2000000000ll) != DkResult_Timeout) return;
     logf("the GPU has not finished submission %llu after 2 s (%llu submitted, %llu finished)",
          (unsigned long long)serial, (unsigned long long)g_dev.serial - 1, (unsigned long long)g_dev.completed);
     dkFenceWait(f, -1);
     logf("submission %llu finished", (unsigned long long)serial);
+}
+
+void startWatchdog() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    if (R_SUCCEEDED(threadCreate(&s_watchdog, watchdog, nullptr, nullptr, 0x4000, 0x20, 2)))
+        threadStart(&s_watchdog);
 }
 
 void submit(bool wait) {

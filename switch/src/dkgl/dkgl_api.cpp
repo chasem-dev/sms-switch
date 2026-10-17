@@ -1011,6 +1011,7 @@ bool init(int width, int height) {
     dkCmdBufBindMultisampleState(g_dev.cmd, &ms);
     dkSwapchainSetSwapInterval(g_dev.swapchain, uint32_t(s_swapInterval));
     s_ready = true;
+    startWatchdog();
     return true;
 }
 
@@ -1034,14 +1035,22 @@ void swap() {
     if (!s_ready) return;
     // (the compositor shows the image flipped: its row 0, GL's y = 0, at the bottom)
     barrierBeforeTransfer();
-    const int slot = dkQueueAcquireImage(g_dev.queue, g_dev.swapchain);
+    int slot;
+    {
+        Waiting w("acquiring a swapchain image");
+        slot = dkQueueAcquireImage(g_dev.queue, g_dev.swapchain);
+    }
     DkImageView sv = viewOf(&g.backbuffer, 0);
     DkImageView dv;
     dkImageViewDefaults(&dv, &g_dev.swapImages[slot]);
     DkImageRect r = {0, 0, 0, uint32_t(g_dev.width), uint32_t(g_dev.height), 1};
     dkCmdBufCopyImage(g_dev.cmd, &sv, &r, &dv, &r, 0);
     submit();
-    dkQueuePresentImage(g_dev.queue, g_dev.swapchain, slot);
+    {
+        Waiting w("presenting");
+        dkQueuePresentImage(g_dev.queue, g_dev.swapchain, slot);
+    }
+    g_activity.swaps = g_activity.swaps + 1;
     g.transferred = true;
     s_drawsSinceSubmit = 0;
 }

@@ -230,6 +230,7 @@ static void validateFixed() {
 }
 
 bool validateDraw() {
+    g_activity.draws = g_activity.draws + 1;
     Program* p = g.programs.get(g.program);
     if (!p || !p->linked) return false;
     if (!validateTargets()) return false;
