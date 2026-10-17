@@ -5,3 +5,4 @@ build/
 .eclipse
 .bundled-eclipse-disc
 .eclipse-icon
+/logs/
