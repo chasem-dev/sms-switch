@@ -189,6 +189,14 @@ To try a build or an option without copying anything to the SD card:
 
 `NAME=value` arguments act as `env.txt` lines; a plain `sms.nro` there takes its disc from `sms-standalone.nro` beside it.
 
+With [sys-botbase](https://github.com/olliz0r/sys-botbase) on the console (it presses buttons and takes screenshots over Wi-Fi), `tools/switch-dev.py` needs no hands at all: it closes what runs, opens the network loader from the HOME menu's selected game, sends the NRO and any `--file`s to go beside it, and keeps the log in `logs/switch/`:
+
+```sh
+tools/switch-dev.py run build/sms.nro --path sms/sms-dkgl.nro --file build/dkgl-programs.pack \
+    --secs 90 --shots 15 SMS_SWITCH_RENDERER=deko3d
+tools/switch-dev.py shot now.jpg
+```
+
 ## Testing without a console
 
 `tools/emu/` runs `sms.nro` in [Eden](https://eden-emu.dev) (a yuzu-derived emulator), which loads NROs without keys or firmware:

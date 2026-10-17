@@ -1,0 +1,201 @@
+diff --git a/meson.build b/meson.build
+index 1486cbc..53f5151 100644
+--- a/meson.build
++++ b/meson.build
+@@ -78,9 +78,21 @@ uam_incs = []
+ subdir('source')
+ subdir('mesa-imported')
+ 
+-uam = executable(
+-	'uam',
+-	uam_files,
+-	include_directories: uam_incs,
+-	install: true,
+-)
++if get_option('library')
++	# libuam.a: the compiler without its command line, for programs that
++	# compile shaders while they run (uam_api.h)
++	libuam = static_library(
++		'uam',
++		uam_files + files('source/uam_api.cpp'),
++		include_directories: uam_incs,
++		install: true,
++	)
++	install_headers('source/uam_api.h')
++else
++	uam = executable(
++		'uam',
++		uam_files + uam_main,
++		include_directories: uam_incs,
++		install: true,
++	)
++endif
+diff --git a/meson_options.txt b/meson_options.txt
+new file mode 100644
+index 0000000..75fe9cb
+--- /dev/null
++++ b/meson_options.txt
+@@ -0,0 +1 @@
++option('library', type: 'boolean', value: false, description: 'Build libuam.a instead of the uam program')
+diff --git a/source/compiler_iface.cpp b/source/compiler_iface.cpp
+index 7ce5809..73ce4f6 100644
+--- a/source/compiler_iface.cpp
++++ b/source/compiler_iface.cpp
+@@ -281,12 +281,15 @@ DekoCompiler::DekoCompiler(pipeline_stage stage, int optLevel) :
+ 	glsl_frontend_init();
+ }
+ 
++bool g_uamKeepFrontend = false;
++
+ DekoCompiler::~DekoCompiler()
+ {
+ 	if (m_glsl)
+ 		glsl_program_free(m_glsl);
+ 
+-	glsl_frontend_exit();
++	if (!g_uamKeepFrontend)
++		glsl_frontend_exit();
+ }
+ 
+ bool DekoCompiler::CompileGlsl(const char* glsl)
+@@ -622,7 +625,31 @@ void DekoCompiler::GenerateHeaders()
+ 	}
+ }
+ 
++void DekoCompiler::GetDksh(void** data, size_t* size)
++{
++	char* buf = NULL;
++	size_t len = 0;
++	FILE* f = open_memstream(&buf, &len);
++	if (f)
++	{
++		WriteDksh(f);
++		fclose(f);
++	}
++	*data = buf;
++	*size = buf ? len : 0;
++}
++
+ void DekoCompiler::OutputDksh(const char* dkshFile)
++{
++	FILE* f = fopen(dkshFile, "wb");
++	if (f)
++	{
++		WriteDksh(f);
++		fclose(f);
++	}
++}
++
++void DekoCompiler::WriteDksh(FILE* f)
+ {
+ 	DkshHeader hdr = {};
+ 	hdr.magic        = DKSH_MAGIC;
+@@ -632,8 +659,6 @@ void DekoCompiler::OutputDksh(const char* dkshFile)
+ 	hdr.programs_off = sizeof(DkshHeader);
+ 	hdr.num_programs = 1;
+ 
+-	FILE* f = fopen(dkshFile, "wb");
+-	if (f)
+ 	{
+ 		fwrite(&hdr, 1, sizeof(hdr), f);
+ 		fwrite(&m_dkph, 1, sizeof(m_dkph), f);
+@@ -654,8 +679,6 @@ void DekoCompiler::OutputDksh(const char* dkshFile)
+ 			fwrite(m_data, 1, m_dataSize, f);
+ 			FileAlign256(f);
+ 		}
+-
+-		fclose(f);
+ 	}
+ }
+ 
+diff --git a/source/compiler_iface.h b/source/compiler_iface.h
+index 63e1042..d66b94f 100644
+--- a/source/compiler_iface.h
++++ b/source/compiler_iface.h
+@@ -3,6 +3,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <stddef.h>
+ 
+ #include "tgsi/tgsi_text.h"
+ #include "tgsi/tgsi_dump.h"
+@@ -32,6 +33,7 @@ class DekoCompiler
+ 
+ 	void RetrieveAndPadCode();
+ 	void GenerateHeaders();
++	void WriteDksh(FILE* f);
+ 
+ public:
+ 	DekoCompiler(pipeline_stage stage, int optLevel = 3);
+@@ -39,6 +41,8 @@ public:
+ 
+ 	bool CompileGlsl(const char* glsl);
+ 	void OutputDksh(const char* dkshFile);
++	// The DKSH file OutputDksh writes, in memory.
++	void GetDksh(void** data, size_t* size);
+ 	void OutputRawCode(const char* rawFile);
+ 	void OutputTgsi(const char* tgsiFile);
+ };
+diff --git a/source/meson.build b/source/meson.build
+index ea60677..87d7729 100644
+--- a/source/meson.build
++++ b/source/meson.build
+@@ -2,7 +2,8 @@
+ uam_files += files(
+ 	'compiler_iface.cpp',
+ 	'glsl_frontend.cpp',
+-	'main.cpp',
+ 	'mini-os.c',
+ 	'tgsi_support.cpp',
+ )
++
++uam_main = files('main.cpp')
+diff --git a/source/uam_api.cpp b/source/uam_api.cpp
+new file mode 100644
+index 0000000..713de40
+--- /dev/null
++++ b/source/uam_api.cpp
+@@ -0,0 +1,18 @@
++#include "uam_api.h"
++#include "compiler_iface.h"
++
++extern bool g_uamKeepFrontend; // compiler_iface.cpp
++
++int uam_compile_dksh(const char* glsl, enum uam_stage stage, void** dksh, size_t* size)
++{
++	// The front end's types and built-in functions are made once and kept:
++	// making them again for every shader costs more than most compiles.
++	g_uamKeepFrontend = true;
++	*dksh = NULL;
++	*size = 0;
++	DekoCompiler compiler{(pipeline_stage)stage};
++	if (!compiler.CompileGlsl(glsl))
++		return 0;
++	compiler.GetDksh(dksh, size);
++	return *dksh != NULL;
++}
+diff --git a/source/uam_api.h b/source/uam_api.h
+new file mode 100644
+index 0000000..4affd35
+--- /dev/null
++++ b/source/uam_api.h
+@@ -0,0 +1,18 @@
++// libuam's C interface: GLSL in, a DKSH shader module in memory out.
++#pragma once
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum uam_stage { UAM_STAGE_VERTEX = 0, UAM_STAGE_GEOMETRY = 3, UAM_STAGE_FRAGMENT = 4, UAM_STAGE_COMPUTE = 5 };
++
++// Compiles one stage's GLSL. On success *dksh is the module (free() it) and
++// the result is 1; on failure 0, with the compiler's messages on stderr.
++// Not thread-safe: one compile at a time.
++int uam_compile_dksh(const char* glsl, enum uam_stage stage, void** dksh, size_t* size);
++
++#ifdef __cplusplus
++}
++#endif

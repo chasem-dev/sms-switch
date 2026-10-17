@@ -8,6 +8,7 @@
 //   settings.txt, bindings.txt
 //   save/    memory card files      cache/   shader cache
 //   sms.log  the port's log (stderr), unless started with nxlink
+//   (tools/switch-dev.py run --file sends other files here as it starts)
 #include <switch.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -17,10 +18,14 @@
 #include <string.h>
 #include <strings.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string>
 #include "low_memory.h"
+#ifdef SMS_SWITCH_DKGL
+#include "dkgl/dkgl.h"
+#endif
 
 // The program's name and title (CMakeLists.txt): sms and Super Mario Sunshine,
 // or sms-eclipse and Super Mario Eclipse.
@@ -188,11 +193,89 @@ bool settings_has(const std::string& dir, const char* name)
 	return found;
 }
 
+// SMS_DEV_FETCH=<port> (tools/switch-dev.py run --file): before anything reads
+// them, the files the PC offers on that port of the nxlink host are written
+// beside the NRO. The stream is "SMSF", then per file a u16 name length, the
+// name (a path under this folder), a u64 size and the bytes; a zero length
+// ends it. Both ends are little-endian.
+namespace {
+bool recv_all(int s, void* buf, size_t size)
+{
+	for (char* p = (char*)buf; size;) {
+		const ssize_t n = recv(s, p, size, 0);
+		if (n <= 0)
+			return false;
+		p += n;
+		size -= (size_t)n;
+	}
+	return true;
+}
+
+void fetch_dev_files(const std::string& dir)
+{
+	int port = 0;
+	for (int i = 1; __system_argv && i < __system_argc; i++)
+		if (!strncmp(__system_argv[i], "SMS_DEV_FETCH=", 14))
+			port = atoi(__system_argv[i] + 14);
+	if (!port || __nxlink_host.s_addr == 0)
+		return;
+	const int s = socket(AF_INET, SOCK_STREAM, 0);
+	sockaddr_in addr = {};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons((uint16_t)port);
+	addr.sin_addr = __nxlink_host;
+	char magic[4];
+	if (s < 0 || connect(s, (sockaddr*)&addr, sizeof addr) != 0 || !recv_all(s, magic, 4) ||
+	    memcmp(magic, "SMSF", 4) != 0) {
+		fprintf(stderr, "[switch] dev fetch: no files from port %d (%s)\n", port, strerror(errno));
+		if (s >= 0)
+			close(s);
+		return;
+	}
+	static char chunk[1 << 16];
+	for (;;) {
+		uint16_t len = 0;
+		char name[256];
+		uint64_t size = 0;
+		if (!recv_all(s, &len, 2) || len == 0 || len >= sizeof name || !recv_all(s, name, len))
+			break;
+		name[len] = 0;
+		if (!recv_all(s, &size, 8))
+			break;
+		const std::string path = dir + "/" + name;
+		for (size_t slash = path.find('/', dir.size() + 1); slash != std::string::npos;
+		     slash = path.find('/', slash + 1))
+			mkdir(path.substr(0, slash).c_str(), 0777);
+		const bool safe = name[0] != '/' && !strstr(name, "..");
+		FILE* f = safe ? fopen((path + ".part").c_str(), "wb") : NULL;
+		bool ok = true;
+		for (uint64_t left = size; left && ok;) {
+			const size_t n = left < sizeof chunk ? (size_t)left : sizeof chunk;
+			ok = recv_all(s, chunk, n) && (!f || fwrite(chunk, 1, n, f) == n);
+			left -= n;
+		}
+		if (f) {
+			ok = fclose(f) == 0 && ok;
+			remove(path.c_str());
+			ok = ok && rename((path + ".part").c_str(), path.c_str()) == 0;
+		}
+		fprintf(stderr, "[switch] dev fetch: %s, %llu bytes%s\n", name, (unsigned long long)size,
+		        ok && safe ? "" : " (not written)");
+		if (!ok)
+			break;
+	}
+	send(s, "OK\n", 3, 0);
+	close(s);
+}
+} // namespace
+
 // NAME=value launch arguments (nxlink --args, tools/nxlink.sh) act as env.txt
 // lines, and are taken out of argv: the port reads its other arguments as a
 // disc path.
 void take_env_arguments()
 {
+	if (!__system_argv)
+		return;  // no arguments at all (see __wrap_main)
 	int out = 1;
 	for (int i = 1; i < __system_argc; i++) {
 		char* a = __system_argv[i];
@@ -304,6 +387,8 @@ __attribute__((constructor(101))) static void switch_start(void)
 	setvbuf(stderr, NULL, _IONBF, 0);
 	log_layout();
 
+	if (g_nxlink_socket >= 0)
+		fetch_dev_files(g_dir);
 	load_env_file(g_dir + "/env.txt");
 	take_env_arguments();
 	// Gameplay at 60 fps unless settings.txt or env.txt asks for 30 (the
@@ -372,6 +457,11 @@ __attribute__((constructor(101))) static void switch_start(void)
 	setenv("SMS_FULLSCREEN", "1", 0);
 	setenv("XDG_DATA_HOME", (g_dir + "/save").c_str(), 0);
 	setenv("XDG_CACHE_HOME", (g_dir + "/cache").c_str(), 0);
+#ifdef SMS_SWITCH_DKGL
+	// the deko3d renderer's compiled programs (SMS_SWITCH_RENDERER=deko3d):
+	// the pack of the known ones (tools/dkgl/make-pack), then those made here
+	dkgl::setShaderCache((g_dir + "/cache/dkgl").c_str(), (g_dir + "/dkgl-programs.pack").c_str());
+#endif
 	if (!getenv("SMS_DISC_IMAGE") && !getenv("SMS_DISC_ROOT")) {
 		// sms-standalone.nro carries the image in its RomFS; else the SD card.
 		std::string disc = find_bundled_disc_image();
@@ -428,4 +518,18 @@ extern "C" void NX_NORETURN __libnx_exit(int rc)
 		close(g_nxlink_socket);
 	__appExit();
 	svcExitProcess();
+}
+
+// main, with an argument list even from a loader that passes none (Ryubing
+// starts an NRO with argv NULL): just the program's name, as the port
+// expects (-Wl,--wrap=main).
+extern "C" int __real_main(int argc, char** argv);
+extern "C" int __wrap_main(int argc, char** argv)
+{
+	if (!argv) {
+		static char name[] = SMS_SWITCH_APP ".nro";
+		static char* args[2] = {name, NULL};
+		return __real_main(1, args);
+	}
+	return __real_main(argc, argv);
 }

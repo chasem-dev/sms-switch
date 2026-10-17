@@ -1,0 +1,69 @@
+The GX self-test on the Switch: its textured quad's texture in emulated main
+memory, and the overlay counts read after the GL thread has run.
+
+- the 8x8 texture was a static std::vector: on the Switch the heap may be
+  above 4 GiB, past a 32-bit texture address (the game's own textures are in
+  main memory)
+- with SMS_GX_ASYNC_PRESENT the overlay's GL work is queued for the GL
+  thread, so each count of texture allocations and uploads waits for it
+  (glFinish) first
+
+diff --git a/platform/gx/tests/gx_selftest.cpp b/platform/gx/tests/gx_selftest.cpp
+index 50f1e42..96c8873 100644
+--- a/platform/gx/tests/gx_selftest.cpp
++++ b/platform/gx/tests/gx_selftest.cpp
+@@ -200,10 +200,13 @@ int main(int argc, char** argv) {
+                 const u8 cols[4][3] = {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 255}};
+                 p[0] = cols[q][0]; p[1] = cols[q][1]; p[2] = cols[q][2]; p[3] = 255;
+             }
+-        static std::vector<u8> tex;
+-        tex = encodeRGBA8(img, 8, 8);
++        // in emulated main memory, as the game's textures are (a texture
++        // address must fit 32 bits: the heap may be above 4 GiB)
++        const std::vector<u8> encoded = encodeRGBA8(img, 8, 8);
++        u8* tex = arena + 0x300000;
++        memcpy(tex, encoded.data(), encoded.size());
+         GXTexObj to;
+-        GXInitTexObj(&to, tex.data(), 8, 8, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
++        GXInitTexObj(&to, tex, 8, 8, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+         GXInitTexObjLOD(&to, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
+         GXLoadTexObj(&to, GX_TEXMAP0);
+         texSetup();
+@@ -631,28 +634,37 @@ int main(int argc, char** argv) {
+         while (glGetError() != GL_NO_ERROR) {}  // isolate overlay errors
+         const u8 panel[16] = {255, 255, 255, 255};
+         GXPC_DrawOverlay(panel, 2, 2, 0, 0, 1, 640, 480);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("overlay allocates initial texture", allocations == 1 && uploads == 0);
+         for (int i = 0; i < 10; i++) GXPC_DrawOverlay(nullptr, 2, 2, 0, 0, 1, 640, 480);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("cached overlay draws without uploads", allocations == 1 && uploads == 0);
+         GXPC_DrawOverlay(panel, 2, 2, 0, 0, 1, 640, 480);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("overlay refresh reuses texture storage", allocations == 1 && uploads == 1);
+         GXPC_DrawOverlay(panel, 1, 2, 0, 0, 1, 640, 480);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("overlay resize reallocates storage", allocations == 2 && uploads == 1);
+         if (!GXPC_OverlayVisible()) GXPC_OverlayToggle();
+         GXPC_OverlayDraw(640, 480);
+         int refreshed = allocations + uploads;
+         GXPC_OverlayDraw(640, 480);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("performance panel caches its bitmap", allocations + uploads == refreshed);
+         GXPC_CycleSpeed();
+         GXPC_OverlayDraw(640, 480);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("speed change refreshes overlay immediately", allocations + uploads == ++refreshed);
+         GXPC_OverlayDraw(800, 600);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("window resize refreshes overlay immediately", allocations + uploads == ++refreshed);
+         GXPC_OverlayToggle();
+         GXPC_OverlayDraw(800, 600);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("hidden overlay does not upload", allocations + uploads == refreshed);
+         GXPC_OverlayToggle();
+         GXPC_OverlayDraw(800, 600);
++        glFinish();  // the overlay's GL work is queued for the GL thread
+         expect("reopening overlay refreshes immediately", allocations + uploads == ++refreshed);
+         GXPC_OverlayToggle();
+         for (int i = 0; i < 3; i++) GXPC_CycleSpeed();  // restore x1

@@ -4,16 +4,36 @@
 // final frame in gx_selftest.ppm.
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <netinet/in.h>
+#include <switch.h>
+#ifdef SMS_SWITCH_DKGL
+#include "dkgl/dkgl.h"
+#endif
 
 extern int gx_selftest_main(int argc, char** argv);
 
 int main(int, char**)
 {
-	freopen("gx_selftest.log", "w", stdout);
-	dup2(fileno(stdout), fileno(stderr));
+	// sent with nxlink -s: the report goes back over the network, as it runs
+	if (__nxlink_host.s_addr && R_SUCCEEDED(socketInitializeDefault()) && nxlinkStdio() >= 0) {
+	} else {
+		freopen("gx_selftest.log", "w", stdout);
+		dup2(fileno(stdout), fileno(stderr));
+	}
 	setvbuf(stdout, NULL, _IONBF, 0);
 	setvbuf(stderr, NULL, _IONBF, 0);
+#ifdef SMS_SWITCH_DKGL
+	// on the deko3d renderer, unless gx_selftest.gl is beside it (Mesa's GL)
+	if (access("gx_selftest.gl", F_OK) != 0) setenv("SMS_SWITCH_RENDERER", "deko3d", 0);
+	setenv("SMS_DKGL_TRACE", "400", 0);  // the first draws' state in the log
+	dkgl::setShaderCache("gx_selftest-dkgl", nullptr);
+	printf("gx_selftest: renderer %s\n", getenv("SMS_SWITCH_RENDERER") ? getenv("SMS_SWITCH_RENDERER") : "gl");
+	// dkgl's own checks first: the GL paths sms_gx's draws take, one at a time
+	if (getenv("SMS_SWITCH_RENDERER") && !strcmp(getenv("SMS_SWITCH_RENDERER"), "deko3d") && dkgl::init(1920, 1080))
+		dkgl::runChecks();
+#endif
 	char* args[] = {(char*)"gx_selftest", (char*)"--window", (char*)"gx_selftest.ppm", NULL};
 	const int rc = gx_selftest_main(3, args);
 	printf("gx_selftest: exit %d\n", rc);
