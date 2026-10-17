@@ -241,6 +241,7 @@ void uploadLevel(Texture* t, int level, int x, int y, uint32_t w, uint32_t h, co
 }
 
 DkResHandle textureHandle(Texture* t, const SamplerParams& s) {
+    if (t->handleValid && t->realized && !t->descDirty && !memcmp(&s, &t->handleParams, sizeof s)) return t->handle;
     if (!realize(t)) return 0;
     if (t->descDirty || t->desc == ~0u) {
         retireImageDescriptor(t->desc);
@@ -277,7 +278,10 @@ DkResHandle textureHandle(Texture* t, const SamplerParams& s) {
     ds.lodClampMax = std::min(s.maxLod, 15.0f);
     ds.lodBias = s.lodBias;
     ds.maxAnisotropy = std::max(1.0f, std::min(s.maxAniso, 16.0f));
-    return dkMakeTextureHandle(t->desc, samplerDescriptor(ds));
+    t->handle = dkMakeTextureHandle(t->desc, samplerDescriptor(ds));
+    t->handleParams = s;
+    t->handleValid = true;
+    return t->handle;
 }
 
 Texture* attachmentTexture(const Attachment& a) {

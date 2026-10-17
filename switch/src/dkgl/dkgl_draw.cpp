@@ -2,6 +2,7 @@
 // changed since the last draw.
 #include "dkgl_state.h"
 
+#include <stdlib.h>
 #include <algorithm>
 
 namespace dkgl {
@@ -96,11 +97,14 @@ bool attribFormat(const VertexAttrib& a, DkVtxAttribSize* size, DkVtxAttribType*
 }
 
 uint64_t s_vertexSerial = 0;    // the serial the bound constant attributes were written in
+uint32_t s_constMask = 0;       // the bound layout's constant attributes
+State::CurrentAttrib s_constValue[16];  // and their values as bound
 uint64_t s_uniformSerial = 0;   // likewise the bound default block
 DkResHandle s_dummyHandle = 0;  // a 1x1 texture for units with none
 Texture* s_dummy = nullptr;
 
 DkResHandle dummyTexture() {
+    if (s_dummy && s_dummy->handleValid) return s_dummy->handle;
     if (!s_dummy) {
         s_dummy = new Texture();
         defineLevel(s_dummy, 0, GL_RGBA8, 1, 1);
@@ -312,14 +316,18 @@ bool validateDraw() {
     }
     g.dirty &= ~D_UNIFORMS;
 
-    // vertex inputs
+    // vertex inputs: the layout when the vertex array, the program's inputs
+    // or the serial changed; else only the constants whose values changed
+    // (GX sets the matrix indices as one for each batch)
     const VertexArray* va = currentVao();
-    if (va != g.boundVao || va->version != g.boundVaoVersion || g.currentVersion != g.boundCurrentVersion ||
-        p->attribMask != g.boundAttribMask || s_vertexSerial != g_dev.serial) {
+    const bool layout = va != g.boundVao || va->version != g.boundVaoVersion || p->attribMask != g.boundAttribMask ||
+                        s_vertexSerial != g_dev.serial;
+    if (layout) {
         DkVtxAttribState attribs[16];
         DkVtxBufferState bufStates[16];
         DkBufExtents bufs[16];
         uint32_t n = 0;
+        s_constMask = 0;
         for (int loc = 0; loc < 16; loc++)
             if (p->attribMask & (1u << loc)) n = uint32_t(loc + 1);
         for (uint32_t loc = 0; loc < n; loc++) {
@@ -344,15 +352,19 @@ bool validateDraw() {
                 bufStates[loc].stride = a.stride ? uint32_t(a.stride) : bytes;
                 bufs[loc] = {b->mem.gpu + a.offset, uint32_t(b->size > a.offset ? b->size - a.offset : 0)};
             } else {
-                // GL's current value for the attribute: one vertex, read by every vertex
+                // GL's current value for the attribute: one element, read per
+                // instance (the draws have one), so by every vertex
                 const State::CurrentAttrib& cur = g.current[loc];
                 Alloc m = transient(16, 16);
                 memcpy(m.cpu, cur.v, 16);
                 attribs[loc].bufferId = loc;
                 attribs[loc].size = DkVtxAttribSize_4x32;
                 attribs[loc].type = cur.integer ? DkVtxAttribType_Uint : DkVtxAttribType_Float;
-                bufStates[loc].stride = 0;
+                bufStates[loc].stride = 16;
+                bufStates[loc].divisor = 1;
                 bufs[loc] = {m.gpu, 16};
+                s_constMask |= 1u << loc;
+                s_constValue[loc] = cur;
             }
         }
         dkCmdBufBindVtxAttribState(c, attribs, n);
@@ -363,8 +375,80 @@ bool validateDraw() {
         g.boundCurrentVersion = g.currentVersion;
         g.boundAttribMask = p->attribMask;
         s_vertexSerial = g_dev.serial;
+    } else if (g.currentVersion != g.boundCurrentVersion) {
+        for (int loc = 0; loc < 16; loc++) {
+            if (!(s_constMask & (1u << loc))) continue;
+            const State::CurrentAttrib& cur = g.current[loc];
+            State::CurrentAttrib& was = s_constValue[loc];
+            if (cur.integer != was.integer) {
+                // another type: the layout again, at the next draw
+                g.boundVao = nullptr;
+                return validateDraw();
+            }
+            if (!memcmp(cur.v, was.v, 16)) continue;
+            Alloc m = transient(16, 16);
+            memcpy(m.cpu, cur.v, 16);
+            dkCmdBufBindVtxBuffer(c, uint32_t(loc), m.gpu, 16);
+            was = cur;
+        }
+        g.boundCurrentVersion = g.currentVersion;
     }
     return true;
+}
+
+// SMS_DKGL_TRACE=n: the first n draws' state in the log.
+void traceDraw(const char* what, GLenum mode, int count, uint32_t first, int base, DkGpuAddr indices) {
+    static int left = -1;
+    if (left < 0) {
+        const char* e = getenv("SMS_DKGL_TRACE");
+        left = e ? atoi(e) : 0;
+    }
+    if (left <= 0) return;
+    left--;
+    const Program* p = g.programs.get(g.program);
+    logf("draw %s: mode 0x%x count %d first %u base %d indices 0x%llx; fbo %u (%dx%d) viewport %d %d %d %d "
+         "scissor %s %d %d %d %d; depth %d func 0x%x mask %d; cull %d 0x%x front 0x%x; blend %d; colormask %d%d%d%d",
+         what, mode, count, first, base, (unsigned long long)indices, g.drawFbo, g.targetW, g.targetH,
+         g.viewport[0], g.viewport[1], g.viewport[2], g.viewport[3], g.scissorTest ? "on" : "off", g.scissor[0],
+         g.scissor[1], g.scissor[2], g.scissor[3], g.depthTest, g.depthFunc, g.depthMask, g.cullFace, g.cullMode,
+         g.frontFace, g.blend, g.colorMask[0], g.colorMask[1], g.colorMask[2], g.colorMask[3]);
+    if (!p) return;
+    logf("  program %u: attribs 0x%x, %d samplers, %zu blocks, default block %u bytes, gs %d", g.program,
+         p->attribMask, p->samplerCount, p->glsl.blocks.size(), p->glsl.defaultBlockSize, p->hasGs);
+    const VertexArray* va = currentVao();
+    for (int loc = 0; loc < 16; loc++) {
+        if (!(p->attribMask & (1u << loc))) continue;
+        const VertexAttrib& a = va->attribs[loc];
+        const Buffer* b = g.buffers.get(a.buffer);
+        if (a.enabled && b && b->mem) {
+            float f[3] = {0, 0, 0};
+            const uint32_t at = uint32_t(a.offset) + uint32_t(std::max(base, 0)) * uint32_t(a.stride);
+            if (a.type == GL_FLOAT && at + 12 <= b->size) memcpy(f, b->mem.cpu + at, 12);
+            logf("  attrib %d: buffer %u at 0x%llx + %llu stride %d size %d type 0x%x%s%s; vertex %d: %g %g %g", loc,
+                 a.buffer, (unsigned long long)b->mem.gpu, (unsigned long long)a.offset, a.stride, a.size, a.type,
+                 a.normalized ? " norm" : "", a.integer ? " int" : "", base, f[0], f[1], f[2]);
+        } else {
+            const State::CurrentAttrib& c = g.current[loc];
+            logf("  attrib %d: constant %s %08x %08x %08x %08x", loc, c.integer ? "uint" : "float", c.v[0], c.v[1],
+                 c.v[2], c.v[3]);
+        }
+    }
+    for (size_t i = 0; i < p->glsl.blocks.size(); i++) {
+        const UboBinding& ub = g.ubo[p->blockBindings[i] & 15];
+        const Buffer* b = g.buffers.get(ub.buffer);
+        logf("  block %zu %s: binding %d buffer %u offset %lld size %lld (gpu 0x%llx)", i, p->glsl.blocks[i].c_str(),
+             p->blockBindings[i], ub.buffer, (long long)ub.offset, (long long)ub.size,
+             (unsigned long long)(b && b->mem ? b->mem.gpu : 0));
+    }
+    for (const GlslUniform& u : p->glsl.uniforms) {
+        if (u.binding >= 0) {
+            logf("  sampler %s: binding %d unit %d", u.name.c_str(), u.binding, p->samplerUnits[size_t(u.binding)]);
+            continue;
+        }
+        uint32_t w[4] = {0, 0, 0, 0};
+        if (u.offset + 16 <= p->defaultBlock.size()) memcpy(w, &p->defaultBlock[u.offset], 16);
+        logf("  uniform %s @%u: %08x %08x %08x %08x", u.name.c_str(), u.offset, w[0], w[1], w[2], w[3]);
+    }
 }
 
 }  // namespace dkgl

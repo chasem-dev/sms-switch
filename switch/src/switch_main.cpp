@@ -196,6 +196,8 @@ bool settings_has(const std::string& dir, const char* name)
 // disc path.
 void take_env_arguments()
 {
+	if (!__system_argv)
+		return;  // no arguments at all (see __wrap_main)
 	int out = 1;
 	for (int i = 1; i < __system_argc; i++) {
 		char* a = __system_argv[i];
@@ -435,4 +437,18 @@ extern "C" void NX_NORETURN __libnx_exit(int rc)
 		close(g_nxlink_socket);
 	__appExit();
 	svcExitProcess();
+}
+
+// main, with an argument list even from a loader that passes none (Ryubing
+// starts an NRO with argv NULL): just the program's name, as the port
+// expects (-Wl,--wrap=main).
+extern "C" int __real_main(int argc, char** argv);
+extern "C" int __wrap_main(int argc, char** argv)
+{
+	if (!argv) {
+		static char name[] = SMS_SWITCH_APP ".nro";
+		static char* args[2] = {name, NULL};
+		return __real_main(1, args);
+	}
+	return __real_main(argc, argv);
 }

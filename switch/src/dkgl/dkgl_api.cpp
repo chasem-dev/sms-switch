@@ -120,6 +120,7 @@ void drawElements(GLenum mode, GLsizei count, GLenum type, const void* indices, 
     const uintptr_t off = reinterpret_cast<uintptr_t>(indices);
     dkCmdBufBindIdxBuffer(g_dev.cmd, fmt, ib->mem.gpu);
     dkCmdBufDrawIndexed(g_dev.cmd, primitiveOf(mode), uint32_t(count), 1, uint32_t(off / size), baseVertex, 0);
+    traceDraw("indexed", mode, count, uint32_t(off / size), baseVertex, ib->mem.gpu + off);
     drawn();
 }
 
@@ -507,6 +508,7 @@ void APIENTRY glMultiDrawElementsBaseVertex_(GLenum mode, const GLsizei* count, 
 void APIENTRY glDrawArrays_(GLenum mode, GLint first, GLsizei count) {
     if (count <= 0 || !validateDraw()) return;
     dkCmdBufDraw(g_dev.cmd, primitiveOf(mode), uint32_t(count), 1, uint32_t(first), 0);
+    traceDraw("arrays", mode, count, uint32_t(first), 0, 0);
     drawn();
 }
 
@@ -997,7 +999,7 @@ bool init(int width, int height) {
         logf("deko3d could not start");
         return false;
     }
-    // the default framebuffer, shown flipped at the swap (see swap)
+    // the default framebuffer, copied to the swapchain at each swap
     defineLevel(&g.backbuffer, 0, GL_RGBA8, uint32_t(width), uint32_t(height));
     realize(&g.backbuffer);
     g.viewport[2] = width;
@@ -1011,6 +1013,8 @@ bool init(int width, int height) {
     s_ready = true;
     return true;
 }
+
+bool ready() { return s_ready; }
 
 void shutdown() {
     if (!s_ready) return;
@@ -1028,14 +1032,14 @@ void* getProc(const char* name) {
 
 void swap() {
     if (!s_ready) return;
-    // GL's default framebuffer has its row 0 at the bottom of the screen
+    // (the compositor shows the image flipped: its row 0, GL's y = 0, at the bottom)
     barrierBeforeTransfer();
     const int slot = dkQueueAcquireImage(g_dev.queue, g_dev.swapchain);
     DkImageView sv = viewOf(&g.backbuffer, 0);
     DkImageView dv;
     dkImageViewDefaults(&dv, &g_dev.swapImages[slot]);
     DkImageRect r = {0, 0, 0, uint32_t(g_dev.width), uint32_t(g_dev.height), 1};
-    dkCmdBufBlitImage(g_dev.cmd, &sv, &r, &dv, &r, DkBlitFlag_FlipY, 0);
+    dkCmdBufCopyImage(g_dev.cmd, &sv, &r, &dv, &r, 0);
     submit();
     dkQueuePresentImage(g_dev.queue, g_dev.swapchain, slot);
     g.transferred = true;

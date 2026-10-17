@@ -285,10 +285,12 @@ bool initDevice(int width, int height) {
     DkDeviceMaker dm;
     dkDeviceMakerDefaults(&dm);
     dm.cbDebug = debugCallback;
-    // GL's clip-space depth; the origin is GL's too as dkgl uses it: a
-    // framebuffer's row 0 is GL's y = 0 (the default framebuffer is flipped
-    // when shown, see swap)
-    dm.flags = DkDeviceFlags_DepthMinusOneToOne | DkDeviceFlags_OriginUpperLeft;
+    // GL's conventions: clip-space depth from -1, and the lower-left origin,
+    // where clip-space y points up and an image's row 0 is GL's y = 0 (in
+    // upper-left mode deko3d flips y as Direct3D does, which turned every
+    // draw upside down against the copies and reads); the compositor is told
+    // to show the swapchain's images flipped
+    dm.flags = DkDeviceFlags_DepthMinusOneToOne | DkDeviceFlags_OriginLowerLeft;
     logf("starting: device");
     g_dev.dev = dkDeviceCreate(&dm);
     if (!g_dev.dev) return false;
@@ -302,7 +304,7 @@ bool initDevice(int width, int height) {
 
     DkQueueMaker qm;
     dkQueueMakerDefaults(&qm, g_dev.dev);
-    qm.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute | DkQueueFlags_MediumPrio;
+    qm.flags = DkQueueFlags_Graphics | DkQueueFlags_MediumPrio;
     logf("starting: queue");
     g_dev.queue = dkQueueCreate(&qm);
     if (!g_dev.queue) return false;

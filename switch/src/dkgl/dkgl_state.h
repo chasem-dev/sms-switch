@@ -136,6 +136,7 @@ void destroyProgram(Program* p);
 // dkgl_draw.cpp
 bool validateDraw();
 bool validateTargets();
+void traceDraw(const char* what, GLenum mode, int count, uint32_t first, int base, DkGpuAddr indices);
 
 }  // namespace dkgl
 

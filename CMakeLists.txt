@@ -62,6 +62,8 @@ set_source_files_properties(${SMS_SWITCH_DIR}/src/switch_main.cpp TARGET_DIRECTO
   "SMS_SWITCH_APP=\"${SMS_SWITCH_APP}\";SMS_SWITCH_TITLE=\"${SMS_SWITCH_TITLE}\"")
 # Every thread spread over cores 0-2 (switch/src/performance.cpp).
 target_link_options(sms PRIVATE -Wl,--wrap=threadCreate)
+# main with an argument list even when the loader gives none (switch_main.cpp)
+target_link_options(sms PRIVATE -Wl,--wrap=main)
 
 # Mesa (OpenGL over nouveau). Its pkg-config files carry an unexpanded
 # $(DEVKITPRO), so the libraries are named directly; order matters.
@@ -104,18 +106,20 @@ if(EXISTS "${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
     ${SMS_SWITCH_DIR}/src/dkgl/dkgl_glsl.cpp
     ${SMS_SWITCH_DIR}/src/dkgl/dkgl_program.cpp
     ${SMS_SWITCH_DIR}/src/dkgl/dkgl_sdl.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_test.cpp
     ${SMS_SWITCH_DIR}/src/dkgl/dkgl_texture.cpp)
   # (SDL itself is linked by the program)
   target_include_directories(dkgl PRIVATE ${SMS_SWITCH_UAM_DIR}/include ${DEVKITPRO}/portlibs/switch/include/SDL2)
   target_compile_features(dkgl PRIVATE cxx_std_17)
-  target_link_libraries(dkgl PUBLIC ${SMS_SWITCH_UAM_DIR}/lib/libuam.a deko3d)
+  # (deko3d itself: the program's choice, deko3dd being its checked build)
+  target_link_libraries(dkgl PUBLIC ${SMS_SWITCH_UAM_DIR}/lib/libuam.a)
   # SDL's GL calls go to dkgl when it is chosen (dkgl_sdl.cpp)
   set(SMS_SWITCH_DKGL_WRAPS
     -Wl,--wrap=SDL_GL_CreateContext -Wl,--wrap=SDL_GL_MakeCurrent -Wl,--wrap=SDL_GL_SwapWindow
     -Wl,--wrap=SDL_GL_SetSwapInterval -Wl,--wrap=SDL_GL_GetSwapInterval -Wl,--wrap=SDL_GL_DeleteContext
     -Wl,--wrap=SDL_GL_GetProcAddress -Wl,--wrap=SDL_GL_GetDrawableSize -Wl,--wrap=SDL_EGL_CreateSurface
     -Wl,--wrap=SDL_EGL_DestroySurface -Wl,--wrap=nwindowSetDimensions)
-  target_link_libraries(sms PRIVATE dkgl)
+  target_link_libraries(sms PRIVATE dkgl deko3d)
   target_link_options(sms PRIVATE ${SMS_SWITCH_DKGL_WRAPS})
   target_compile_definitions(sms PRIVATE SMS_SWITCH_DKGL=1)
   message(STATUS "sms-switch: the deko3d renderer (dkgl) with ${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
@@ -243,9 +247,12 @@ if(SMS_SWITCH_GX_SELFTEST)
   target_link_libraries(gx_selftest PRIVATE sms_gx ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouveau z)
   if(TARGET dkgl)
     # SMS_SWITCH_RENDERER=deko3d runs the self-test on dkgl
-    target_link_libraries(gx_selftest PRIVATE dkgl)
+    # deko3d's checked build: it reports misuse in the log (dkgl's debug callback)
+    target_link_libraries(gx_selftest PRIVATE dkgl deko3dd)
     target_link_options(gx_selftest PRIVATE ${SMS_SWITCH_DKGL_WRAPS})
     target_compile_definitions(gx_selftest PRIVATE SMS_SWITCH_DKGL=1)
   endif()
-  nx_create_nro(gx_selftest OUTPUT ${CMAKE_BINARY_DIR}/gx_selftest.nro NOICON NONACP)
+  # (with a NACP: emulators such as Ryubing load no NRO without one)
+  nx_generate_nacp(gx_selftest.nacp NAME "gx_selftest" AUTHOR "sms-switch" VERSION "${PROJECT_VERSION}")
+  nx_create_nro(gx_selftest OUTPUT ${CMAKE_BINARY_DIR}/gx_selftest.nro NACP gx_selftest.nacp)
 endif()

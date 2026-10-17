@@ -177,6 +177,11 @@ struct Texture {
     uint32_t desc = ~0u;       // image descriptor slot
     bool descDirty = true;     // swizzle or levels changed
     bool isRenderbuffer = false;
+    // the handle last made, and the sampler settings it was made with: most
+    // draws sample a texture as the draw before did
+    SamplerParams handleParams;
+    DkResHandle handle = 0;
+    bool handleValid = false;
 };
 
 struct Renderbuffer;  // a Texture with isRenderbuffer

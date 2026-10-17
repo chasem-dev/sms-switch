@@ -28,7 +28,6 @@ Result __real_nwindowSetDimensions(NWindow* nw, u32 width, u32 height);
 }
 
 namespace {
-bool s_swapchainMade = false;
 int s_context;  // what SDL_GL_CreateContext returns: only compared, never used
 
 // Read each time: libnx sizes the default window before main, before
@@ -49,7 +48,6 @@ extern "C" SDL_GLContext __wrap_SDL_GL_CreateContext(SDL_Window* window) {
         SDL_SetError("deko3d could not start");
         return nullptr;
     }
-    s_swapchainMade = true;
     return &s_context;
 }
 
@@ -96,6 +94,6 @@ extern "C" void __wrap_SDL_EGL_DestroySurface(void* video, void* surface) {
 }
 
 extern "C" Result __wrap_nwindowSetDimensions(NWindow* nw, u32 width, u32 height) {
-    if (deko3d() && s_swapchainMade) return 0;  // the swapchain's images set them
+    if (deko3d() && dkgl::ready()) return 0;  // the swapchain's images set them
     return __real_nwindowSetDimensions(nw, width, height);
 }

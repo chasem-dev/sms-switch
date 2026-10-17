@@ -19,6 +19,7 @@ namespace dkgl {
 
 // Starts the device and a swapchain on the default window, w x h.
 bool init(int width, int height);
+bool ready();  // init has made the device and swapchain
 void shutdown();
 // A GL entry point by name (for SDL_GL_GetProcAddress), or null.
 void* getProc(const char* name);
@@ -28,6 +29,8 @@ void setSwapInterval(int interval);
 // Where compiled programs are cached (a directory), and a prebuilt pack of
 // them to read first (a file, or null).
 void setShaderCache(const char* dir, const char* pack);
+// dkgl's own pixel checks (gx_selftest.nro), after init: the number failed.
+int runChecks();
 
 }  // namespace dkgl
 
