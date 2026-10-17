@@ -10,6 +10,8 @@
 #include <algorithm>
 
 namespace dkgl {
+extern bool g_tracing;  // dkgl_draw.cpp
+#define TRACE_CALL(...) do { if (g_tracing) logf(__VA_ARGS__); } while (0)
 
 State g;
 void setShaderCacheImpl(const char* dir, const char* pack);  // dkgl_program.cpp
@@ -107,7 +109,10 @@ DkPrimitive primitiveOf(GLenum mode) {
 uint32_t s_drawsSinceSubmit = 0;
 void drawn() {
     g.rendered = true;
-    if (++s_drawsSinceSubmit >= 256) {
+    g.unfinished = true;
+    // (SMS_DKGL_SUBMIT_EVERY=n: a submission every n draws, a test)
+    static const uint32_t every = getenv("SMS_DKGL_SUBMIT_EVERY") ? uint32_t(atoi(getenv("SMS_DKGL_SUBMIT_EVERY"))) : 256;
+    if (++s_drawsSinceSubmit >= every) {
         s_drawsSinceSubmit = 0;
         submit();
     }
@@ -299,6 +304,7 @@ void APIENTRY glLineWidth_(GLfloat w) { g.lineWidth = w; g.dirty |= D_LINE; }
 void APIENTRY glPointSize_(GLfloat s) { g.pointSize = s; g.dirty |= D_POINT; }
 
 void APIENTRY glClear_(GLbitfield mask) {
+    TRACE_CALL("  call glClear fbo %u mask 0x%x scissor %d %d,%d %dx%d", g.drawFbo, mask, g.scissorTest, g.scissor[0], g.scissor[1], g.scissor[2], g.scissor[3]);
     if (!validateTargets()) return;
     barrierBeforeDraw();
     if (g.dirty & D_SCISSOR) {
@@ -322,6 +328,7 @@ void APIENTRY glClear_(GLbitfield mask) {
     if ((mask & GL_DEPTH_BUFFER_BIT) && g.targetDepth && g.depthMask)
         dkCmdBufClearDepthStencil(g_dev.cmd, true, float(g.clearDepth), 0, 0);
     g.rendered = true;
+    g.unfinished = true;
 }
 
 void APIENTRY glFinish_(void) { submit(true); }
@@ -369,9 +376,12 @@ void APIENTRY glBufferStorage_(GLenum target, GLsizeiptr size, const void* data,
     }
 }
 void APIENTRY glBufferSubData_(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
+    TRACE_CALL("  call glBufferSubData off %lld size %lld", (long long)offset, (long long)size);
     Buffer* b = boundBuffer(target);
     if (!b || !b->mem || !data || offset + size > GLintptr(b->size)) return;
-    // in the command stream, after the draws already recorded (GL's order)
+    // in the command stream, after the draws already recorded (GL's order),
+    // once they are done reading it
+    barrierBeforeTransfer();
     const uint8_t* src = static_cast<const uint8_t*>(data);
     for (GLsizeiptr done = 0; done < size;) {
         const uint32_t n = uint32_t(std::min<GLsizeiptr>(size - done, 0x8000));
@@ -395,6 +405,7 @@ void APIENTRY glBindBufferRange_(GLenum target, GLuint index, GLuint buffer, GLi
     }
 }
 void* APIENTRY glMapBufferRange_(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+    TRACE_CALL("  call glMapBufferRange target 0x%x off %lld len %lld access 0x%x", target, (long long)offset, (long long)length, access);
     Buffer* b = boundBuffer(target);
     if (!b || !b->mem) return nullptr;
     if (access & GL_MAP_READ_BIT) {
@@ -423,6 +434,7 @@ GLboolean APIENTRY glUnmapBuffer_(GLenum target) {
         GLuint saved = 0;
         (void)saved;
         const uint8_t* src = b->mapShadow.data();
+        barrierBeforeTransfer();  // the draws recorded before the map are done with it
         for (uint32_t done = 0; done < b->mapLength;) {
             const uint32_t n = std::min<uint32_t>(b->mapLength - done, 0x8000);
             Alloc staging = transient(n, 4);
@@ -685,6 +697,7 @@ uint32_t unpackRow(GLsizei w) { return g.unpackRowLength ? uint32_t(g.unpackRowL
 
 void APIENTRY glTexImage2D_(GLenum, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint, GLenum format, GLenum type,
                             const void* pixels) {
+    TRACE_CALL("  call glTexImage2D tex %u level %d %dx%d fmt 0x%x data %d", g.tex2D[g.activeUnit], level, w, h, ifmt, pixels != nullptr);
     Texture* t = boundTexture2D();
     if (!t) return;
     GLenum internal = GLenum(ifmt);
@@ -695,6 +708,7 @@ void APIENTRY glTexImage2D_(GLenum, GLint level, GLint ifmt, GLsizei w, GLsizei 
 }
 void APIENTRY glTexSubImage2D_(GLenum, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum, GLenum,
                                const void* pixels) {
+    TRACE_CALL("  call glTexSubImage2D tex %u level %d at %d,%d %dx%d", g.tex2D[g.activeUnit], level, x, y, w, h);
     if (Texture* t = boundTexture2D()) uploadLevel(t, level, x, y, uint32_t(w), uint32_t(h), pixels, 0, unpackRow(w), false);
 }
 void APIENTRY glCompressedTexImage2D_(GLenum, GLint level, GLenum ifmt, GLsizei w, GLsizei h, GLint, GLsizei bytes,
@@ -738,6 +752,7 @@ void APIENTRY glTexParameterf_(GLenum, GLenum pname, GLfloat v) {
     if (t) texParam(t, &t->sampler, pname, v, GLint(v));
 }
 void APIENTRY glGenerateMipmap_(GLenum) {
+    TRACE_CALL("  call glGenerateMipmap tex %u", g.tex2D[g.activeUnit]);
     Texture* t = boundTexture2D();
     if (!t || t->levels.empty() || !t->levels[0].defined || t->compressed) return;
     // define the whole chain, then make each level from the one above with the 2D engine
@@ -793,6 +808,7 @@ void APIENTRY glDeleteFramebuffers_(GLsizei n, const GLuint* names) {
     g.dirty |= D_TARGETS;
 }
 void APIENTRY glBindFramebuffer_(GLenum target, GLuint f) {
+    TRACE_CALL("  call glBindFramebuffer 0x%x %u", target, f);
     if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
         if (g.drawFbo != f) g.dirty |= D_TARGETS;
         g.drawFbo = f;
@@ -811,6 +827,7 @@ void attach(GLenum target, GLenum attachment, GLuint name, bool renderbuffer, in
     g.dirty |= D_TARGETS;
 }
 void APIENTRY glFramebufferTexture2D_(GLenum target, GLenum attachment, GLenum, GLuint tex, GLint level) {
+    TRACE_CALL("  call glFramebufferTexture2D att 0x%x tex %u level %d", attachment, tex, level);
     attach(target, attachment, tex, false, level);
 }
 void APIENTRY glFramebufferRenderbuffer_(GLenum target, GLenum attachment, GLenum, GLuint rb) {
@@ -846,6 +863,7 @@ void APIENTRY glRenderbufferStorage_(GLenum target, GLenum ifmt, GLsizei w, GLsi
 
 void APIENTRY glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1,
                                  GLbitfield mask, GLenum filter) {
+    TRACE_CALL("  call glBlitFramebuffer read %u draw %u src %d,%d-%d,%d dst %d,%d-%d,%d mask 0x%x", g.readFbo, g.drawFbo, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask);
     const Framebuffer* rf = g.framebuffers.get(g.readFbo);
     const Framebuffer* df = g.framebuffers.get(g.drawFbo);
     for (int pass = 0; pass < 2; pass++) {
@@ -878,6 +896,7 @@ void APIENTRY glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLi
 }
 
 void APIENTRY glReadPixels_(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void* pixels) {
+    TRACE_CALL("  call glReadPixels fbo %u %d,%d %dx%d fmt 0x%x pack %u", g.readFbo, x, y, w, h, format, g.packBuffer);
     readPixels(x, y, w, h, format, type, pixels);
 }
 void APIENTRY glPixelStorei_(GLenum pname, GLint v) {
@@ -941,10 +960,12 @@ struct SyncObj {
     uint64_t serial;
 };
 GLsync APIENTRY glFenceSync_(GLenum, GLbitfield) {
+    TRACE_CALL("  call glFenceSync at serial %llu", (unsigned long long)g_dev.serial);
     SyncObj* s = new SyncObj{g_dev.serial};
     return reinterpret_cast<GLsync>(s);
 }
 GLenum APIENTRY glClientWaitSync_(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+    TRACE_CALL("  call glClientWaitSync");
     SyncObj* s = reinterpret_cast<SyncObj*>(sync);
     if (!s) return GL_WAIT_FAILED;
     poll();
@@ -1101,7 +1122,14 @@ void tracePixels() {
     static const bool dump = getenv("SMS_DKGL_TRACE_DUMP") && atoi(getenv("SMS_DKGL_TRACE_DUMP"));
     static uint32_t dumped = 0, traced = 0;
     static const int every = getenv("SMS_DKGL_TRACE_DUMP_EVERY") ? std::max(1, atoi(getenv("SMS_DKGL_TRACE_DUMP_EVERY"))) : 1;
-    if (dump && traced++ % uint32_t(every) == 0) {
+    // SMS_DKGL_TRACE_DUMP_AT=n: dump before the n-th traced draw only; with
+    // SMS_DKGL_TRACE_WAIT=1 the GPU is waited for before each other traced draw
+    // (which waits make a race go away)
+    static const int dumpAt = getenv("SMS_DKGL_TRACE_DUMP_AT") ? atoi(getenv("SMS_DKGL_TRACE_DUMP_AT")) : -1;
+    static const bool waitEach = getenv("SMS_DKGL_TRACE_WAIT") && atoi(getenv("SMS_DKGL_TRACE_WAIT"));
+    const uint32_t index = traced;
+    if (waitEach && int(index) != dumpAt) submit(true);
+    if (dump && (dumpAt >= 0 ? int(index) == dumpAt : index % uint32_t(every) == 0) && (traced++, true)) {
         const Framebuffer* f = g.framebuffers.get(g.drawFbo);
         const int w = g.targetW, h = g.targetH;
         if (f && w > 0 && h > 0) {
@@ -1125,9 +1153,11 @@ void tracePixels() {
             GXPC_WindowShotSink(100001 + dumped * 3, a.data(), w, h);
             GXPC_WindowShotSink(100002 + dumped * 3, reinterpret_cast<const uint8_t*>(z.data()), w, h);
             logf("  dumped the target as captures %u-%u (before traced draw %u)", 100000 + dumped * 3,
-                 100002 + dumped * 3, traced - 1);
+                 100002 + dumped * 3, index);
             dumped++;
         }
+    } else {
+        traced++;
     }
     if (pts.empty()) return;
     const GLuint read = g.readFbo;

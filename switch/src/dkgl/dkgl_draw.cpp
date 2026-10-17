@@ -279,6 +279,28 @@ bool validateDraw() {
         if (si != 1 && g.boundTexCount[slot] == p->samplerCount &&
             !memcmp(g.boundTex[slot], handles, sizeof(DkResHandle) * size_t(p->samplerCount)))
             continue;
+        // (SMS_DKGL_SAMPLER_EVERY=1: the sampler set bound again with every
+        // texture binding, a test)
+        static const int samplerMode = getenv("SMS_DKGL_SAMPLER_EVERY") ? atoi(getenv("SMS_DKGL_SAMPLER_EVERY")) : 2;
+        if (samplerMode == 1) dkCmdBufBindSamplerDescriptorSet(c, g_dev.samplerDescs.gpu, 2048);
+        if (samplerMode == 2) {
+            // a sampler descriptor not read since the set was bound: bound
+            // again first (test: on the console a sampler first read later
+            // came out stale, the plaza's ground in solid colour)
+            bool fresh = false;
+            for (int k = 0; k < p->samplerCount; k++) {
+                const uint32_t id = handles[k] >> 20;
+                if (id < g_dev.samplerUsed.size() && !g_dev.samplerUsed[id]) fresh = true;
+            }
+            if (fresh) {
+                dkCmdBufBindSamplerDescriptorSet(c, g_dev.samplerDescs.gpu, 2048);
+                std::fill(g_dev.samplerUsed.begin(), g_dev.samplerUsed.end(), false);
+            }
+            for (int k = 0; k < p->samplerCount; k++) {
+                const uint32_t id = handles[k] >> 20;
+                if (id < g_dev.samplerUsed.size()) g_dev.samplerUsed[id] = true;
+            }
+        }
         dkCmdBufBindTextures(c, kStages[si], 0, handles, uint32_t(p->samplerCount));
         if (si != 1) {
             memcpy(g.boundTex[slot], handles, sizeof(DkResHandle) * size_t(p->samplerCount));
@@ -398,6 +420,7 @@ bool validateDraw() {
 }
 
 extern uint64_t g_swapCount;  // dkgl_api.cpp
+bool g_tracing = false;       // within SMS_DKGL_TRACE's window: traceCall logs
 void tracePixels();            // dkgl_api.cpp
 
 // SMS_DKGL_TRACE=n: the first n draws' state in the log; with
@@ -413,12 +436,56 @@ void traceDraw(const char* what, GLenum mode, int count, uint32_t first, int bas
         const char* k = getenv("SMS_DKGL_TRACE_SKIP");  // draws passed over first
         skip = k ? atoi(k) : 0;
     }
+    // SMS_DKGL_WAIT_AT=n[,n...]: the GPU waited for before those draws of
+    // the frame SMS_DKGL_TRACE_FROM (counted from its first), whatever is traced
+    {
+        static std::vector<int> waitAt;
+        static bool parsed = false;
+        static uint64_t frame = ~0ull;
+        static int index = 0;
+        if (!parsed) {
+            parsed = true;
+            if (const char* w = getenv("SMS_DKGL_WAIT_AT"))
+                for (const char* q = w; *q;) {
+                    char* end;
+                    waitAt.push_back(int(strtol(q, &end, 10)));
+                    q = *end ? end + 1 : end;
+                }
+        }
+        if (!waitAt.empty() && g_swapCount == from) {
+            if (frame != g_swapCount) frame = g_swapCount, index = 0;
+            static const bool noWait = getenv("SMS_DKGL_WAIT_NOWAIT") && atoi(getenv("SMS_DKGL_WAIT_NOWAIT"));
+            // SMS_DKGL_WAIT_ACTION: instead of a submission, only part of
+            // what one does (uniforms: bound again; descsets; l2; full: a full
+            // barrier)
+            static const char* action = getenv("SMS_DKGL_WAIT_ACTION");
+            if (std::find(waitAt.begin(), waitAt.end(), index) != waitAt.end()) {
+                if (!action) submit(!noWait);
+                else if (!strcmp(action, "uniforms")) s_uniformSerial = ~0ull;
+                else if (!strcmp(action, "descsets")) {
+                    dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, 8192);
+                    dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, 2048);
+                } else if (!strcmp(action, "l2")) dkCmdBufBarrier(g_dev.cmd, DkBarrier_None, DkInvalidateFlags_L2Cache);
+                else if (!strcmp(action, "full"))
+                    dkCmdBufBarrier(g_dev.cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache | DkInvalidateFlags_Image |
+                                                                  DkInvalidateFlags_Shader | DkInvalidateFlags_Descriptors);
+                else if (!strcmp(action, "textures")) memset(g.boundTex, 0, sizeof g.boundTex), g.boundTexCount[0] = g.boundTexCount[1] = 0;
+                else if (!strcmp(action, "imageset")) dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, 8192);
+                else if (!strcmp(action, "samplerset")) dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, 2048);
+                else if (!strcmp(action, "descinval")) dkCmdBufBarrier(g_dev.cmd, DkBarrier_None, DkInvalidateFlags_Descriptors);
+                else if (!strcmp(action, "descwfi")) dkCmdBufBarrier(g_dev.cmd, DkBarrier_Primitives, DkInvalidateFlags_Descriptors);
+            }
+            index++;
+        }
+    }
+    g_tracing = left > 0 && g_swapCount >= from;
     if (left <= 0 || g_swapCount < from) return;
     if (skip > 0) {
         skip--;
         return;
     }
     left--;
+    g_tracing = left > 0;
     tracePixels();
     const Program* p = g.programs.get(g.program);
     logf("draw %s: mode 0x%x count %d first %u base %d indices 0x%llx; fbo %u (%dx%d) viewport %d %d %d %d "
@@ -468,7 +535,14 @@ void traceDraw(const char* what, GLenum mode, int count, uint32_t first, int bas
     }
     for (const GlslUniform& u : p->glsl.uniforms) {
         if (u.binding >= 0) {
-            logf("  sampler %s: binding %d unit %d", u.name.c_str(), u.binding, p->samplerUnits[size_t(u.binding)]);
+            for (int e = 0; e < std::max(u.arraySize, 1) && size_t(u.binding + e) < p->samplerUnits.size(); e++) {
+                const int unit = p->samplerUnits[size_t(u.binding + e)];
+                const GLuint name = unit >= 0 && unit < 32 ? g.tex2D[unit] : 0;
+                const Texture* t = g.textures.get(name);
+                logf("  sampler %s[%d]: unit %d texture %u %ux%u format 0x%x levels %u", u.name.c_str(), e, unit, name,
+                     t && !t->levels.empty() ? t->levels[0].w : 0, t && !t->levels.empty() ? t->levels[0].h : 0,
+                     t ? t->internalFormat : 0, t ? t->imageLevels : 0);
+            }
             continue;
         }
         // each element of an array (up to 4), at its std140 stride

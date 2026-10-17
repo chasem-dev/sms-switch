@@ -239,7 +239,8 @@ def cmd_run(a):
     log = a.log or os.path.join(HERE, "logs", "switch", time.strftime("%Y%m%d-%H%M%S") + ".log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
     shots = None
-    args = list(a.args) + [f"SMS_DEV_LISTEN={LINK_PORT}"]
+    # Auto-Sleep off (switch_main.cpp): asleep, the console is off Wi-Fi
+    args = list(a.args) + [f"SMS_DEV_LISTEN={LINK_PORT}", "SMS_SWITCH_NO_AUTOSLEEP=1"]
     if a.shots:
         shots = os.path.splitext(log)[0] + "-shots"
         os.makedirs(shots, exist_ok=True)

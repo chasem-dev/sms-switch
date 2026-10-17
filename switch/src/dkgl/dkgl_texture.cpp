@@ -81,9 +81,15 @@ void copyIn(Texture* t, int level, int x, int y, uint32_t w, uint32_t h, const v
 
 }  // namespace
 
+// A copy (the copy engine) reads what draws wrote only once they are complete:
+// the Fragments barrier a change of render targets makes only orders the 3D
+// pipeline's own work, so it does not count (an EFB copy after the targets
+// changed read half-drawn pixels: the plaza's ground came out in solid
+// shadow colour on the console).
 void barrierBeforeTransfer() {
-    if (g.rendered) {
+    if (g.unfinished) {
         dkCmdBufBarrier(g_dev.cmd, DkBarrier_Primitives, 0);
+        g.unfinished = false;
         g.rendered = false;
     }
 }
@@ -92,13 +98,33 @@ void barrierBeforeDraw() {
     uint32_t inval = 0;
     DkBarrier mode = DkBarrier_None;
     if (g.transferred) {
+        // copies wrote images and buffers: the texture cache and the
+        // shaders' data (uniform) cache may hold what was there before
         mode = DkBarrier_Full;
-        inval |= DkInvalidateFlags_Image;
+        g.unfinished = false;  // a full barrier completes the draws too
+        inval |= DkInvalidateFlags_Image | DkInvalidateFlags_Shader;
         g.transferred = false;
     }
     if (g_dev.descriptorsDirty) {
-        inval |= DkInvalidateFlags_Descriptors;
+        // (SMS_DKGL_DESC_L2=1: and the GPU's L2, a test)
+        static const bool l2 = getenv("SMS_DKGL_DESC_L2") && atoi(getenv("SMS_DKGL_DESC_L2"));
+        inval |= DkInvalidateFlags_Descriptors | (l2 ? DkInvalidateFlags_L2Cache : 0);
         g_dev.descriptorsDirty = false;
+        // (SMS_DKGL_DESC_REBIND=1: the descriptor sets bound again; =2 with a
+        // wait for idle first; tests)
+        static const int rebind = getenv("SMS_DKGL_DESC_REBIND") ? atoi(getenv("SMS_DKGL_DESC_REBIND")) : 0;
+        if (rebind == 2 && mode == DkBarrier_None) mode = DkBarrier_Primitives;
+        if (rebind == 1) {
+            dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, 8192);
+            dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, 2048);
+        }
+    }
+    // (SMS_DKGL_SAMPLER_REBIND=1: the sampler set bound again after a new
+    // sampler descriptor, a test)
+    static const bool samplerRebind = getenv("SMS_DKGL_SAMPLER_REBIND") && atoi(getenv("SMS_DKGL_SAMPLER_REBIND"));
+    if (g_dev.samplersAdded) {
+        g_dev.samplersAdded = false;
+        if (samplerRebind) dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, 2048);
     }
     if (mode != DkBarrier_None || inval) dkCmdBufBarrier(g_dev.cmd, mode, inval);
 }

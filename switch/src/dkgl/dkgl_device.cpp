@@ -8,6 +8,7 @@
 #include <switch.h>
 
 namespace dkgl {
+extern bool g_tracing;  // dkgl_draw.cpp
 
 Device g_dev;
 
@@ -182,7 +183,10 @@ void poll() {
         g_dev.inFlight.pop_front();
     }
     const uint64_t done = g_dev.completed;
-    while (!g_dev.retired.empty() && g_dev.retired.front().serial <= done) {
+    // SMS_DKGL_NO_FREE=1: retired memory is never reused (a test for memory
+    // freed while still in use; it runs out in time)
+    static const bool keep = getenv("SMS_DKGL_NO_FREE") && atoi(getenv("SMS_DKGL_NO_FREE"));
+    while (!keep && !g_dev.retired.empty() && g_dev.retired.front().serial <= done) {
         const Alloc& a = g_dev.retired.front().alloc;
         g_dev.heaps[a.heap].free(a);
         g_dev.retired.pop_front();
@@ -230,9 +234,15 @@ void startWatchdog() {
 // Everything the list reads is written before it is submitted, so dropping
 // the L2's lines once at its start is enough.
 void startList() {
-    dkCmdBufBarrier(g_dev.cmd, DkBarrier_None, DkInvalidateFlags_L2Cache);
+    // (SMS_DKGL_LIST_INVALIDATE=all: every cache, a test)
+    static const bool all = getenv("SMS_DKGL_LIST_INVALIDATE") && !strcmp(getenv("SMS_DKGL_LIST_INVALIDATE"), "all");
+    dkCmdBufBarrier(g_dev.cmd, DkBarrier_None,
+                    all ? DkInvalidateFlags_L2Cache | DkInvalidateFlags_Image | DkInvalidateFlags_Shader |
+                              DkInvalidateFlags_Descriptors | DkInvalidateFlags_Zcull
+                        : DkInvalidateFlags_L2Cache);
     dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, kImageDescriptors);
     dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, kSamplerDescriptors);
+    g_dev.samplerUsed.assign(kSamplerDescriptors, false);
 }
 
 void submit(bool wait) {
@@ -349,6 +359,8 @@ uint32_t samplerDescriptor(const DkSampler& s) {
     // a slot never used before: written directly
     memcpy(g_dev.samplerDescs.cpu + id * sizeof(DkSamplerDescriptor), &d, sizeof d);
     g_dev.descriptorsDirty = true;
+    g_dev.samplersAdded = true;
+    if (g_tracing) logf("  new sampler descriptor %u", id);
     g_dev.samplerIds[key] = id;
     return id;
 }

@@ -316,6 +316,22 @@ __attribute__((constructor(101))) static void switch_start(void)
 
 	load_env_file(g_dir + "/env.txt");
 	take_env_arguments();
+	// SMS_SWITCH_NO_AUTOSLEEP=1 (tools/switch-dev.py's runs): the console's
+	// Auto-Sleep off, handheld and TV, as System Settings > Sleep Mode sets it
+	// (and sets it back): asleep, the console turns Wi-Fi off and the PC
+	// cannot reach it
+	if (const char* e = getenv("SMS_SWITCH_NO_AUTOSLEEP"); e && atoi(e) && R_SUCCEEDED(setsysInitialize())) {
+		SetSysSleepSettings sleep;
+		if (R_SUCCEEDED(setsysGetSleepSettings(&sleep)) &&
+		    (sleep.handheld_sleep_plan != SetSysHandheldSleepPlan_Never ||
+		     sleep.console_sleep_plan != SetSysConsoleSleepPlan_Never)) {
+			sleep.handheld_sleep_plan = SetSysHandheldSleepPlan_Never;
+			sleep.console_sleep_plan = SetSysConsoleSleepPlan_Never;
+			const Result r = setsysSetSleepSettings(&sleep);
+			fprintf(stderr, "[switch] auto-sleep set to never: 0x%x\n", (unsigned)r);
+		}
+		setsysExit();
+	}
 	// Gameplay at 60 fps unless settings.txt or env.txt asks for 30 (the
 	// GameCube's, half the work per second) or 120.
 	if (!getenv("SMS_FRAME_RATE") && !settings_has(g_dir, "frame_rate"))

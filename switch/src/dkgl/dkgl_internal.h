@@ -127,6 +127,8 @@ struct Device {
     std::deque<std::pair<uint64_t, uint32_t>> retiredImageDescs;
     std::unordered_map<std::string, uint32_t> samplerIds;  // DkSampler bytes -> slot
     bool descriptorsDirty = false;  // written since the last invalidate
+    bool samplersAdded = false;  // a sampler descriptor written since the last draw
+    std::vector<bool> samplerUsed;  // sampler descriptors read since the sampler set was bound
 
     // The swapchain: the default framebuffer is drawn straight into its images.
     DkSwapchain swapchain = nullptr;

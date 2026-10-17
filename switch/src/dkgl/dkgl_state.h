@@ -99,6 +99,7 @@ struct State {
 
     // what the command buffer has bound
     bool rendered = false;      // drawn since the last barrier (an RT may be sampled next)
+    bool unfinished = false;    // drawn since the last barrier that completes draws (a copy may read them)
     bool transferred = false;   // a copy wrote since the last barrier
     const Program* boundProgram = nullptr;
     uint32_t boundProgramVersion = 0;
