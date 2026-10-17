@@ -7,3 +7,4 @@ build/
 .eclipse-icon
 /logs/
 /tools/botstart/botstart.nro
+__pycache__/
