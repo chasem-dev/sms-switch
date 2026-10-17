@@ -74,6 +74,20 @@ extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, vo
 	Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, core);
 	if (R_SUCCEEDED(rc) && spread)
 		svcSetThreadCoreMask(t->handle, core, kAllCores);
+	static int trace = -1;
+	if (trace < 0) {
+		const char* e = getenv("SMS_SWITCH_TRACE_THREADS");
+		trace = e && *e == '1';
+	}
+	if (trace && R_SUCCEEDED(rc)) {
+		// where each thread's stack is: an emulator's bad address in the
+		// stack region names its thread
+		char line[128];
+		const int n = snprintf(line, sizeof line, "[switch] thread %p: stack %p-%p (mirror of %p), entry %p",
+		                       (void*)t, t->stack_mirror, (char*)t->stack_mirror + t->stack_sz, t->stack_mem,
+		                       (void*)entry);
+		svcOutputDebugString(line, size_t(n));
+	}
 	return rc;
 }
 

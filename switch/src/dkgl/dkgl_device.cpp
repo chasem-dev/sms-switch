@@ -161,6 +161,16 @@ void poll() {
     }
 }
 
+// Waits for a fence, saying so in the log when the GPU takes over 2 seconds
+// (a GPU hang otherwise leaves nothing there).
+void waitFence(DkFence* f, uint64_t serial) {
+    if (dkFenceWait(f, 2000000000ll) != DkResult_Timeout) return;
+    logf("the GPU has not finished submission %llu after 2 s (%llu submitted, %llu finished)",
+         (unsigned long long)serial, (unsigned long long)g_dev.serial - 1, (unsigned long long)g_dev.completed);
+    dkFenceWait(f, -1);
+    logf("submission %llu finished", (unsigned long long)serial);
+}
+
 void submit(bool wait) {
     // the chunk the command buffer is writing into stays with this serial
     if (!g_dev.cmdChunks.empty()) g_dev.cmdChunks.back().serial = g_dev.serial;
@@ -178,7 +188,7 @@ void submit(bool wait) {
     dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, kImageDescriptors);
     dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, kSamplerDescriptors);
     if (wait) {
-        dkFenceWait(&g_dev.inFlight.back().fence, -1);
+        waitFence(&g_dev.inFlight.back().fence, g_dev.inFlight.back().serial);
     }
     poll();
 }
@@ -186,7 +196,7 @@ void submit(bool wait) {
 void waitSerial(uint64_t serial) {
     if (serial >= g_dev.serial) submit();
     while (g_dev.completed < serial && !g_dev.inFlight.empty()) {
-        dkFenceWait(&g_dev.inFlight.front().fence, -1);
+        waitFence(&g_dev.inFlight.front().fence, g_dev.inFlight.front().serial);
         poll();
     }
 }

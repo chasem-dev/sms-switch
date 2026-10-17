@@ -2,7 +2,10 @@
 // of compiled programs.
 #include "dkgl_state.h"
 
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <uam_api.h>
@@ -30,7 +33,7 @@ uint64_t fnv(const std::string& s, uint64_t h = 1469598103934665603ull) {
 }
 
 uint64_t keyOf(const GlslProgram& p) {
-    return fnv(p.fs, fnv(p.gs + '\x02', fnv("uam 1.1.0 dkgl 1\n" + p.vs + '\x01')));
+    return fnv(p.fs, fnv(p.gs + '\x02', fnv("uam 1.1.0 dkgl 2\n" + p.vs + '\x01')));
 }
 
 uint64_t recordSize(const std::string& rec) {
@@ -100,11 +103,37 @@ void cacheStore(uint64_t key, const std::string& rec) {
     if (s_cacheDir.empty()) return;
     const std::string path = cachePath(key), part = path + ".part";
     FILE* f = fopen(part.c_str(), "wb");
-    if (!f) return;
-    const bool ok = fwrite(rec.data(), rec.size(), 1, f) == 1;
-    fclose(f);
-    if (ok) rename(part.c_str(), path.c_str());
-    else remove(part.c_str());
+    bool ok = f && fwrite(rec.data(), rec.size(), 1, f) == 1;
+    if (f && fclose(f) != 0) ok = false;
+    if (ok && rename(part.c_str(), path.c_str()) != 0) ok = false;
+    if (!ok) {
+        static bool told = false;
+        if (!told) logf("the program cache cannot be written (%s: %s)", path.c_str(), strerror(errno));
+        told = true;
+        remove(part.c_str());
+    }
+}
+
+// SMS_DKGL_DUMP=dir writes each program's adapted GLSL there (<key>.vs, .gs,
+// .fs), for tools/dkgl/make-pack to compile ahead of time; with
+// SMS_DKGL_DUMP_ONLY=1 programs are only written, not compiled (they then
+// fail to link), so the shader warm-up writes all the known ones quickly.
+void dumpProgram(uint64_t key, const GlslProgram& p) {
+    static const char* dir = getenv("SMS_DKGL_DUMP");
+    if (!dir || !*dir) return;
+    static bool made = (mkdir(dir, 0777), true);
+    (void)made;
+    const std::string* src[3] = {&p.vs, &p.gs, &p.fs};
+    const char* ext[3] = {"vs", "gs", "fs"};
+    for (int i = 0; i < 3; i++) {
+        if (src[i]->empty()) continue;
+        char name[64];
+        snprintf(name, sizeof name, "/%016llx.%s", (unsigned long long)key, ext[i]);
+        if (FILE* f = fopen((std::string(dir) + name).c_str(), "wb")) {
+            fwrite(src[i]->data(), src[i]->size(), 1, f);
+            fclose(f);
+        }
+    }
 }
 
 // Makes the DkShader for one DKSH module in code memory.
@@ -126,13 +155,27 @@ bool loadShader(const uint8_t* dksh, uint32_t size, DkShader* out, Alloc* code, 
     return dkShaderIsValid(out);
 }
 
+// switch_main.cpp names the cache from a constructor that runs before this
+// file's (s_cacheDir, s_cached), so the names are kept in plain arrays until
+// the first program is linked.
+char s_cacheDirName[512], s_packName[512];
+bool s_cacheReady = false;
+
+void setUpCache() {
+    if (s_cacheReady) return;
+    s_cacheReady = true;
+    s_cacheDir = s_cacheDirName;
+    for (size_t at = 1; at <= s_cacheDir.size(); at++)  // with its parents
+        if (at == s_cacheDir.size() || s_cacheDir[at] == '/') mkdir(s_cacheDir.substr(0, at).c_str(), 0777);
+    if (s_packName[0]) loadPack(s_packName);
+}
+
 }  // namespace
 
 void setShaderCacheImpl(const char* dir, const char* pack) {
-    s_cacheDir = dir ? dir : "";
-    for (size_t at = 1; at <= s_cacheDir.size(); at++)  // with its parents
-        if (at == s_cacheDir.size() || s_cacheDir[at] == '/') mkdir(s_cacheDir.substr(0, at).c_str(), 0777);
-    if (pack) loadPack(pack);
+    snprintf(s_cacheDirName, sizeof s_cacheDirName, "%s", dir ? dir : "");
+    snprintf(s_packName, sizeof s_packName, "%s", pack ? pack : "");
+    s_cacheReady = false;
 }
 
 bool linkProgram(Program* p) {
@@ -145,6 +188,7 @@ bool linkProgram(Program* p) {
         if (!sh) continue;
         (sh->type == GL_VERTEX_SHADER ? vs : sh->type == GL_GEOMETRY_SHADER ? gs : fs) = sh->source;
     }
+    setUpCache();
     if (vs.empty() || fs.empty()) {
         p->infoLog = "dkgl: a program needs a vertex and a fragment shader";
         return false;
@@ -156,8 +200,13 @@ bool linkProgram(Program* p) {
     }
     p->hasGs = !p->glsl.gs.empty();
     const uint64_t key = keyOf(p->glsl);
+    dumpProgram(key, p->glsl);
+    static const bool dumpOnly = getenv("SMS_DKGL_DUMP_ONLY") && atoi(getenv("SMS_DKGL_DUMP_ONLY"));
     std::string rec;
-    if (cacheLookup(key, &rec)) {
+    if (dumpOnly) {
+        p->infoLog = "dkgl: SMS_DKGL_DUMP_ONLY";
+        return false;
+    } else if (cacheLookup(key, &rec)) {
         s_fromCache++;
     } else {
         const double t0 = now();

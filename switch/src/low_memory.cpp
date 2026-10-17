@@ -388,7 +388,11 @@ void __libnx_initheap(void)
 			trace_hex("[switch] stack region ", region, region_size);
 			const u64 lo = region > w.lo ? region : w.lo;
 			const u64 hi = region + region_size < w.hi ? region + region_size : w.hi;
-			at = w.at >= lo && w.at + w.size <= hi && range_unmapped(w.at, w.size) ? w.at
+			// MEM1 on an address aligned to 1 GiB, as its own 0x80000000 is:
+			// code that turns a MEM1 pointer into an offset by masking it (as
+			// the GameCube's addresses allow) then still gets the offset
+			const u64 want = w.mem1 ? 0x40000000 : 0x20000000;
+			at = want >= lo && want + w.size <= hi && range_unmapped(want, w.size) ? want
 			     : hi > lo + w.size                                                  ? find_free(lo, hi, w.size, 0x200000)
 			                                                                         : 0;
 			mapped = at && R_SUCCEEDED(svcMapMemory((void*)at, (void*)heap, w.size));

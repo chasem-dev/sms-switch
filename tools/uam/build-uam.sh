@@ -7,7 +7,8 @@
 # The game makes its GX shaders while it runs, and deko3d takes only compiled
 # GPU code, so the compiler runs in the game: uam-library.patch builds uam
 # without its command line and adds uam_api.h (GLSL in, a DKSH module in
-# memory out).
+# memory out). uam-scheduling.patch fixes the Maxwell scheduler's stalls at
+# the ends of blocks (code that read registers too early on the console).
 #
 #   tools/uam/build-uam.sh        (Docker; about 2 minutes)
 set -euo pipefail
@@ -26,6 +27,7 @@ git -C src fetch -q origin "$uam_commit" 2>/dev/null || true
 git -C src checkout -q -f "$uam_commit"
 git -C src clean -qfdx
 git -C src apply "$here/tools/uam/uam-library.patch"
+git -C src apply "$here/tools/uam/uam-scheduling.patch"
 
 docker image inspect "$image" >/dev/null 2>&1 || docker build -q -t "$image" "$here/tools/mesa" >/dev/null
 rm -rf "$work/switch" "$work/host"

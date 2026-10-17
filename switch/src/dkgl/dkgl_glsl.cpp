@@ -65,6 +65,25 @@ struct Segment {
 
 bool isIdent(char c) { return isalnum(uint8_t(c)) || c == '_'; }
 
+bool hasWord(const std::string& s, const char* word) {
+    const size_t n = strlen(word);
+    for (size_t at = s.find(word); at != std::string::npos; at = s.find(word, at + 1))
+        if ((at == 0 || !isIdent(s[at - 1])) && (at + n == s.size() || !isIdent(s[at + n]))) return true;
+    return false;
+}
+
+// main() with a return in it, as a function main() calls: the compiler then
+// makes its returns branches (inlined), not the Maxwell return instruction
+// (PRET/RET) a return from main's middle is, which Ryujinx-based emulators
+// cannot run (the EFB copy's shader returns early).
+std::string withoutMainReturn(const std::string& fn) {
+    size_t at = fn.find("main");
+    if (fn.compare(0, 4, "void") != 0 || at == std::string::npos || !hasWord(fn.substr(0, at + 4), "main") ||
+        !hasWord(fn, "return"))
+        return fn;
+    return fn.substr(0, at) + "_dkgl_main" + fn.substr(at + 4) + "\nvoid main() { _dkgl_main(); }";
+}
+
 // Splits a shader into whitespace and comments (K_TEXT), preprocessor lines,
 // and top-level statements: declarations (up to their ';'), interface blocks
 // and structs (up to the ';' after their '}'), and functions (up to their
@@ -537,7 +556,7 @@ bool adaptProgram(const std::string& vsIn, const std::string& gsIn, const std::s
                 s += block;
                 placed = true;
             }
-            s += seg.text;
+            s += seg.kind == K_FUNCTION ? withoutMainReturn(seg.text) : seg.text;
         }
         if (!placed) s += block;
         (st == 0 ? out->vs : st == 1 ? out->gs : out->fs) = s;

@@ -378,8 +378,9 @@ __attribute__((constructor(101))) static void switch_start(void)
 	setenv("XDG_DATA_HOME", (g_dir + "/save").c_str(), 0);
 	setenv("XDG_CACHE_HOME", (g_dir + "/cache").c_str(), 0);
 #ifdef SMS_SWITCH_DKGL
-	// the deko3d renderer's compiled programs (SMS_SWITCH_RENDERER=deko3d)
-	dkgl::setShaderCache((g_dir + "/cache/dkgl").c_str(), nullptr);
+	// the deko3d renderer's compiled programs (SMS_SWITCH_RENDERER=deko3d):
+	// the pack of the known ones (tools/dkgl/make-pack), then those made here
+	dkgl::setShaderCache((g_dir + "/cache/dkgl").c_str(), (g_dir + "/dkgl-programs.pack").c_str());
 #endif
 	if (!getenv("SMS_DISC_IMAGE") && !getenv("SMS_DISC_ROOT")) {
 		// sms-standalone.nro carries the image in its RomFS; else the SD card.
