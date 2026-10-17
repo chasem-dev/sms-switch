@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <switch.h>
+#include "dev_link.h"
 #ifdef SMS_SWITCH_DKGL
 #include "dkgl/dkgl.h"
 #endif
@@ -16,8 +17,10 @@ extern int gx_selftest_main(int argc, char** argv);
 
 int main(int, char**)
 {
-	// sent with nxlink -s: the report goes back over the network, as it runs
-	if (__nxlink_host.s_addr && R_SUCCEEDED(socketInitializeDefault()) && nxlinkStdio() >= 0) {
+	// sent with tools/switch-dev.py or nxlink -s: the report goes back over
+	// the network, as it runs
+	if (sms_dev_link_start(".") >= 0) {
+	} else if (__nxlink_host.s_addr && R_SUCCEEDED(socketInitializeDefault()) && nxlinkStdio() >= 0) {
 	} else {
 		freopen("gx_selftest.log", "w", stdout);
 		dup2(fileno(stdout), fileno(stderr));

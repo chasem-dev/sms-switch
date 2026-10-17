@@ -189,13 +189,15 @@ To try a build or an option without copying anything to the SD card:
 
 `NAME=value` arguments act as `env.txt` lines; a plain `sms.nro` there takes its disc from `sms-standalone.nro` beside it.
 
-With [sys-botbase](https://github.com/olliz0r/sys-botbase) on the console (it presses buttons and takes screenshots over Wi-Fi), `tools/switch-dev.py` needs no hands at all: it closes what runs, opens the network loader from the HOME menu's selected game, sends the NRO and any `--file`s to go beside it, and keeps the log in `logs/switch/`:
+With [sys-botbase](https://github.com/olliz0r/sys-botbase) on the console (it presses buttons and takes screenshots over Wi-Fi), `tools/switch-dev.py` needs no hands at all: it closes what runs, opens the network loader from the HOME menu's selected game (holding R through the user picker), sends the NRO, then connects to the program itself (`switch/src/dev_link.cpp`, port 28773) for the `--file`s to go beside it, its log in `logs/switch/` and `--shots` window captures as PNGs, so nothing on the PC has to accept a connection:
 
 ```sh
 tools/switch-dev.py run build/sms.nro --path sms/sms-dkgl.nro --file build/dkgl-programs.pack \
     --secs 90 --shots 15 SMS_SWITCH_RENDERER=deko3d
 tools/switch-dev.py shot now.jpg
 ```
+
+Use the sys-botbase release of the console's firmware era: builds from v2.4 on carry a debug-flags capability that firmware before 19.0.0 refuses (`0xFC01`), so for 16.x that is v2.31. `tools/botstart/` checks whether it runs, and with `NSP=` installs another build, from the homebrew menu's network loader.
 
 ## Testing without a console
 

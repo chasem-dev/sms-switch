@@ -6,3 +6,4 @@ build/
 .bundled-eclipse-disc
 .eclipse-icon
 /logs/
+/tools/botstart/botstart.nro

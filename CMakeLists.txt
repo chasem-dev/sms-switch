@@ -40,6 +40,7 @@ set(SMS_GX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(sms-port ${CMAKE_BINARY_DIR}/port)
 
 target_sources(sms PRIVATE
+  ${SMS_SWITCH_DIR}/src/dev_link.cpp
   ${SMS_SWITCH_DIR}/src/low_memory.cpp
   ${SMS_SWITCH_DIR}/src/performance.cpp
   ${SMS_SWITCH_DIR}/src/posix_shims.cpp
@@ -232,6 +233,7 @@ if(SMS_SWITCH_GX_SELFTEST)
     ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/msl_math.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/port_cheats.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/port_warp.cpp
+    ${SMS_SWITCH_DIR}/src/dev_link.cpp
     ${SMS_SWITCH_DIR}/src/gx_selftest_main.cpp
     ${SMS_SWITCH_DIR}/src/low_memory.cpp
     ${SMS_SWITCH_DIR}/src/posix_shims.cpp)
