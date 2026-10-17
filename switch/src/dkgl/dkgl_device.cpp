@@ -221,6 +221,20 @@ void startWatchdog() {
         threadStart(&s_watchdog);
 }
 
+// The start of each command list. The CPU writes what the list's commands
+// read (vertices, indices, uniform blocks, descriptors) in CPU-uncached
+// memory that the GPU caches in its L2, which does not see those writes: the
+// GPU could read a ring slot's or transient chunk's last contents from an
+// earlier list instead (stale lights, uniforms and vertices: the self-test's
+// lighting, the menus' streaks on the console; emulators have no such cache).
+// Everything the list reads is written before it is submitted, so dropping
+// the L2's lines once at its start is enough.
+void startList() {
+    dkCmdBufBarrier(g_dev.cmd, DkBarrier_None, DkInvalidateFlags_L2Cache);
+    dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, kImageDescriptors);
+    dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, kSamplerDescriptors);
+}
+
 void submit(bool wait) {
     // the chunk the command buffer is writing into stays with this serial
     if (!g_dev.cmdChunks.empty()) g_dev.cmdChunks.back().serial = g_dev.serial;
@@ -235,8 +249,7 @@ void submit(bool wait) {
     g_dev.commandsSinceSubmit = 0;
     // descriptor sets and everything else bound stay bound in the queue;
     // the command buffer's next list starts in its remaining memory
-    dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, kImageDescriptors);
-    dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, kSamplerDescriptors);
+    startList();
     if (wait) {
         waitFence(&g_dev.inFlight.back().fence, g_dev.inFlight.back().serial);
     }
@@ -378,8 +391,7 @@ bool initDevice(int width, int height) {
     g_dev.samplerDescs = g_dev.heaps[HEAP_DATA].alloc(kSamplerDescriptors * sizeof(DkSamplerDescriptor), 0x100);
     memset(g_dev.imageDescs.cpu, 0, g_dev.imageDescs.size);
     memset(g_dev.samplerDescs.cpu, 0, g_dev.samplerDescs.size);
-    dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, kImageDescriptors);
-    dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, kSamplerDescriptors);
+    startList();
 
     logf("starting: swapchain images, %dx%d", width, height);
     // the swapchain's images

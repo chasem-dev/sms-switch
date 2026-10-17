@@ -8,12 +8,16 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <switch.h>
+#include <string>
 #include "dev_link.h"
 #ifdef SMS_SWITCH_DKGL
 #include "dkgl/dkgl.h"
 #endif
 
 extern int gx_selftest_main(int argc, char** argv);
+
+extern "C" int __system_argc;
+extern "C" char** __system_argv;
 
 static int g_link = -1;  // stdout and stderr's socket, if they go to the PC
 
@@ -42,6 +46,14 @@ int main(int, char**)
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);
 	setvbuf(stderr, NULL, _IONBF, 0);
+	// NAME=value launch arguments, as the game takes them (SMS_SWITCH_RENDERER=gl
+	// instead of gx_selftest.gl, SMS_DKGL_DUMP=- ...)
+	for (int i = 1; __system_argv && i < __system_argc; i++)
+		if (const char* eq = strchr(__system_argv[i], '='))
+			if (eq != __system_argv[i] && strncmp(__system_argv[i], "SMS_DEV_", 8) != 0) {
+				setenv(std::string(__system_argv[i], size_t(eq - __system_argv[i])).c_str(), eq + 1, 1);
+				printf("gx_selftest: %s\n", __system_argv[i]);
+			}
 #ifdef SMS_SWITCH_DKGL
 	// on the deko3d renderer, unless gx_selftest.gl is beside it (Mesa's GL)
 	if (access("gx_selftest.gl", F_OK) != 0) setenv("SMS_SWITCH_RENDERER", "deko3d", 0);

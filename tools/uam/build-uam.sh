@@ -28,6 +28,7 @@ git -C src checkout -q -f "$uam_commit"
 git -C src clean -qfdx
 git -C src apply "$here/tools/uam/uam-library.patch"
 git -C src apply "$here/tools/uam/uam-scheduling.patch"
+git -C src apply "$here/tools/uam/uam-no-dual-issue.patch"
 
 docker image inspect "$image" >/dev/null 2>&1 || docker build -q -t "$image" "$here/tools/mesa" >/dev/null
 rm -rf "$work/switch" "$work/host"

@@ -33,7 +33,7 @@ uint64_t fnv(const std::string& s, uint64_t h = 1469598103934665603ull) {
 }
 
 uint64_t keyOf(const GlslProgram& p) {
-    return fnv(p.fs, fnv(p.gs + '\x02', fnv("uam 1.1.0 dkgl 2\n" + p.vs + '\x01')));
+    return fnv(p.fs, fnv(p.gs + '\x02', fnv("uam 1.1.0 dkgl 3\n" + p.vs + '\x01')));
 }
 
 uint64_t recordSize(const std::string& rec) {
@@ -118,15 +118,24 @@ void cacheStore(uint64_t key, const std::string& rec) {
 // .fs), for tools/dkgl/make-pack to compile ahead of time; with
 // SMS_DKGL_DUMP_ONLY=1 programs are only written, not compiled (they then
 // fail to link), so the shader warm-up writes all the known ones quickly.
+// SMS_DKGL_DUMP=- puts them in the log instead, between "[dkgl] dump
+// <key>.<stage>" and "[dkgl] dump end" lines (a run on the console, read back
+// by tools/switch-dev.py).
 void dumpProgram(uint64_t key, const GlslProgram& p) {
     static const char* dir = getenv("SMS_DKGL_DUMP");
     if (!dir || !*dir) return;
-    static bool made = (mkdir(dir, 0777), true);
+    const bool toLog = !strcmp(dir, "-");
+    static bool made = toLog || (mkdir(dir, 0777), true);
     (void)made;
     const std::string* src[3] = {&p.vs, &p.gs, &p.fs};
     const char* ext[3] = {"vs", "gs", "fs"};
     for (int i = 0; i < 3; i++) {
         if (src[i]->empty()) continue;
+        if (toLog) {
+            fprintf(stderr, "[dkgl] dump %016llx.%s\n%s\n[dkgl] dump end\n", (unsigned long long)key, ext[i],
+                    src[i]->c_str());
+            continue;
+        }
         char name[64];
         snprintf(name, sizeof name, "/%016llx.%s", (unsigned long long)key, ext[i]);
         if (FILE* f = fopen((std::string(dir) + name).c_str(), "wb")) {

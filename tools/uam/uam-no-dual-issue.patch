@@ -1,0 +1,27 @@
+uam's Maxwell target (TargetGM107::canDualIssue): no dual issue.
+
+uam pairs an ALU instruction with a following load or SFU instruction
+(delay 0); on the console that left later instructions reading registers
+their producers had not written yet (the GX lighting's light term read as
+zero, a colour channel black), while emulators, which ignore the
+scheduling words, drew it right. Mesa's own GM107 target never dual-issues
+(canDualIssue returns false), and its code runs right on the console.
+
+diff --git a/mesa-imported/codegen/nv50_ir_target_gm107.cpp b/mesa-imported/codegen/nv50_ir_target_gm107.cpp
+index 50d0e80..ad1206c 100644
+--- a/mesa-imported/codegen/nv50_ir_target_gm107.cpp
++++ b/mesa-imported/codegen/nv50_ir_target_gm107.cpp
+@@ -291,6 +291,13 @@ getDualIssueClass(const Instruction *insn)
+ bool
+ TargetGM107::canDualIssue(const Instruction *a, const Instruction *b) const
+ {
++   // Never: on the console, pairs this allowed (an ALU instruction with the
++   // load or SFU instruction after it) left later instructions reading
++   // registers that had not been written (the GX lighting's light term came
++   // out zero, and a channel black); Mesa's own GM107 scheduler never
++   // dual-issues either. Emulators ignore the scheduling words.
++   return false;
++
+    if (!a->canCommuteDefDef(b) || !a->canCommuteDefSrc(b))
+       return false;
+ 

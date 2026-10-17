@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
     for (const std::string& name : keys) {
         const std::string base = dir + "/" + name;
         const std::string vs = slurp(base + ".vs"), gs = slurp(base + ".gs"), fs = slurp(base + ".fs");
-        const uint64_t key = fnv(fs, fnv(gs + '\x02', fnv("uam 1.1.0 dkgl 2\n" + vs + '\x01')));
+        const uint64_t key = fnv(fs, fnv(gs + '\x02', fnv("uam 1.1.0 dkgl 3\n" + vs + '\x01')));
         if (key != strtoull(name.c_str(), nullptr, 16)) {
             fprintf(stderr, "%s: the sources do not give its key (another dkgl version?)\n", name.c_str());
             failed++;
