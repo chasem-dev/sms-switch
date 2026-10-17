@@ -127,7 +127,7 @@ bool validateTargets() {
     Texture* depth = nullptr;
     int colorLevel = 0, depthLevel = 0;
     if (g.drawFbo == 0) {
-        color = &g.backbuffer;
+        color = defaultFramebuffer();
     } else if (const Framebuffer* f = g.framebuffers.get(g.drawFbo)) {
         color = attachmentTexture(f->color);
         depth = attachmentTexture(f->depth);

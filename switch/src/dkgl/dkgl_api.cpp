@@ -1,5 +1,7 @@
 // dkgl's GL entry points (the ones in sms_gx's gl_funcs.h), dkgl::getProc,
 // and presenting.
+#include <stdlib.h>
+#include <switch.h>
 #include "dkgl_state.h"
 #include "dkgl.h"
 
@@ -130,7 +132,7 @@ void readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum ty
     Texture* t = nullptr;
     int level = 0;
     if (g.readFbo == 0) {
-        t = &g.backbuffer;
+        t = defaultFramebuffer();
     } else if (const Framebuffer* f = g.framebuffers.get(g.readFbo)) {
         const Attachment& a = format == GL_DEPTH_COMPONENT ? f->depth : f->color;
         t = attachmentTexture(a);
@@ -849,8 +851,8 @@ void APIENTRY glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLi
     for (int pass = 0; pass < 2; pass++) {
         const bool depth = pass == 1;
         if (!(mask & (depth ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT))) continue;
-        Texture* src = g.readFbo ? (rf ? attachmentTexture(depth ? rf->depth : rf->color) : nullptr) : &g.backbuffer;
-        Texture* dst = g.drawFbo ? (df ? attachmentTexture(depth ? df->depth : df->color) : nullptr) : &g.backbuffer;
+        Texture* src = g.readFbo ? (rf ? attachmentTexture(depth ? rf->depth : rf->color) : nullptr) : defaultFramebuffer();
+        Texture* dst = g.drawFbo ? (df ? attachmentTexture(depth ? df->depth : df->color) : nullptr) : defaultFramebuffer();
         if (!src || !dst || !realize(src) || !realize(dst)) continue;
         const int sl = g.readFbo && rf ? (depth ? rf->depth.level : rf->color.level) : 0;
         const int dl = g.drawFbo && df ? (depth ? df->depth.level : df->color.level) : 0;
@@ -999,9 +1001,20 @@ bool init(int width, int height) {
         logf("deko3d could not start");
         return false;
     }
-    // the default framebuffer, copied to the swapchain at each swap
-    defineLevel(&g.backbuffer, 0, GL_RGBA8, uint32_t(width), uint32_t(height));
-    realize(&g.backbuffer);
+    // the default framebuffer: the swapchain's images, as textures
+    for (int i = 0; i < 3; i++) {
+        Texture& t = g.swapTex[i];
+        t.internalFormat = GL_RGBA8;
+        t.format = DkImageFormat_RGBA8_Unorm;
+        t.levels.resize(1);
+        t.levels[0].w = uint32_t(width);
+        t.levels[0].h = uint32_t(height);
+        t.levels[0].defined = true;
+        t.layout = g_dev.swapLayout;
+        t.image = g_dev.swapImages[i];
+        t.imageLevels = 1;
+        t.realized = true;
+    }
     g.viewport[2] = width;
     g.viewport[3] = height;
     g.scissor[2] = width;
@@ -1031,28 +1044,72 @@ void* getProc(const char* name) {
     return nullptr;
 }
 
+namespace {
+uint64_t s_acquireTicks = 0;
+// each image's acquire fence: the command buffer keeps a pointer to it until
+// the commands are submitted (at the swap at the latest)
+DkFence s_acquireFence[3];
+}
+
+Texture* defaultFramebuffer() {
+    if (g.frontSlot < 0) {
+        // the GPU waits (in the command stream, where the frame first uses
+        // it) until the compositor has let go of the image
+        const uint64_t t0 = armGetSystemTick();
+        int slot = 0;
+        DkFence ready;
+        {
+            Waiting w("acquiring a swapchain image");
+            dkSwapchainAcquireImage(g_dev.swapchain, &slot, &ready);
+        }
+        s_acquireFence[slot] = ready;
+        dkCmdBufWaitFence(g_dev.cmd, &s_acquireFence[slot]);
+        s_acquireTicks += armGetSystemTick() - t0;
+        g.frontSlot = slot;
+    }
+    return &g.swapTex[g.frontSlot];
+}
+
 void swap() {
     if (!s_ready) return;
+    static uint64_t presentTicks = 0, swapTicks = 0, lastSwap = 0;
+    static uint32_t swaps = 0;
     // (the compositor shows the image flipped: its row 0, GL's y = 0, at the bottom)
-    barrierBeforeTransfer();
-    int slot;
-    {
-        Waiting w("acquiring a swapchain image");
-        slot = dkQueueAcquireImage(g_dev.queue, g_dev.swapchain);
+    defaultFramebuffer();  // a frame that never drew into it still shows one
+    const int slot = g.frontSlot;
+    if (g.rendered) {
+        dkCmdBufBarrier(g_dev.cmd, DkBarrier_Fragments, 0);
+        g.rendered = false;
     }
-    DkImageView sv = viewOf(&g.backbuffer, 0);
-    DkImageView dv;
-    dkImageViewDefaults(&dv, &g_dev.swapImages[slot]);
-    DkImageRect r = {0, 0, 0, uint32_t(g_dev.width), uint32_t(g_dev.height), 1};
-    dkCmdBufCopyImage(g_dev.cmd, &sv, &r, &dv, &r, 0);
     submit();
+    const uint64_t t2 = armGetSystemTick();
     {
         Waiting w("presenting");
         dkQueuePresentImage(g_dev.queue, g_dev.swapchain, slot);
     }
+    const uint64_t t3 = armGetSystemTick();
+    g.frontSlot = -1;
+    if (g.targetColor == &g.swapTex[slot]) {
+        g.targetColor = nullptr;
+        g.dirty |= D_TARGETS;
+    }
     g_activity.swaps = g_activity.swaps + 1;
-    g.transferred = true;
     s_drawsSinceSubmit = 0;
+    // every 300 frames: where a swap's time goes (SMS_TIMING_LOG)
+    presentTicks += t3 - t2;
+    if (lastSwap) swapTicks += t3 - lastSwap;
+    lastSwap = t3;
+    if (++swaps == 300) {
+        static const bool timing = getenv("SMS_TIMING_LOG") && atoi(getenv("SMS_TIMING_LOG"));
+        if (timing)
+            logf("swaps: acquiring %.2f ms, presenting %.2f ms, %.2f ms apart (avg); GPU memory %.1f MiB",
+                 armTicksToNs(s_acquireTicks) / 300e6, armTicksToNs(presentTicks) / 300e6,
+                 armTicksToNs(swapTicks) / 299e6,
+                 double(g_dev.heaps[HEAP_DATA].used() + g_dev.heaps[HEAP_IMAGE].used()) / 1048576.0);
+        s_acquireTicks = presentTicks = swapTicks = 0;
+        swaps = 0;
+        lastSwap = 0;
+    }
 }
 
 void setSwapInterval(int interval) {

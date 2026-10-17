@@ -128,10 +128,11 @@ struct Device {
     std::unordered_map<std::string, uint32_t> samplerIds;  // DkSampler bytes -> slot
     bool descriptorsDirty = false;  // written since the last invalidate
 
-    // The swapchain and the default framebuffer drawn into before it.
+    // The swapchain: the default framebuffer is drawn straight into its images.
     DkSwapchain swapchain = nullptr;
     Alloc swapMem[3];
     DkImage swapImages[3];
+    DkImageLayout swapLayout;
     int width = 0, height = 0;
 };
 extern Device g_dev;

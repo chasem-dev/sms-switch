@@ -391,7 +391,7 @@ bool initDevice(int width, int height) {
     lm.format = DkImageFormat_RGBA8_Unorm;
     lm.dimensions[0] = uint32_t(width);
     lm.dimensions[1] = uint32_t(height);
-    DkImageLayout layout;
+    DkImageLayout& layout = g_dev.swapLayout;
     dkImageLayoutInitialize(&layout, &lm);
     const DkImage* images[3];
     for (int i = 0; i < 3; i++) {

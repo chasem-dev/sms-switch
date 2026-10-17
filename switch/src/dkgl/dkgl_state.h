@@ -110,7 +110,10 @@ struct State {
     Texture* targetColor = nullptr;   // the bound render targets
     Texture* targetDepth = nullptr;
     int targetW = 0, targetH = 0;
-    Texture backbuffer;  // the default framebuffer
+    // the default framebuffer: the swapchain's images, one acquired for the
+    // frame when it is first drawn into (or read), presented at the swap
+    Texture swapTex[3];
+    int frontSlot = -1;
     Alloc defaultUbo;    // the bound program's loose uniforms, as last uploaded
 };
 extern State g;
@@ -127,6 +130,7 @@ DkResHandle textureHandle(Texture* t, const SamplerParams& s);
 void barrierBeforeTransfer();
 void barrierBeforeDraw();
 Texture* attachmentTexture(const Attachment& a);
+Texture* defaultFramebuffer();  // dkgl_api.cpp
 void destroyTexture(Texture* t);
 
 // dkgl_program.cpp
