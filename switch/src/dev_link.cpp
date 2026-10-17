@@ -169,3 +169,23 @@ extern "C" bool GXPC_WindowShotSink(uint32_t frame, const uint8_t* rgba, int w, 
 	}
 	return true;
 }
+
+void sms_dev_link_end(int stdio_socket)
+{
+	fflush(stdout);
+	fflush(stderr);
+	{
+		std::lock_guard<std::mutex> lock(g_shot_mutex);
+		if (g_shot_socket >= 0) {
+			shutdown(g_shot_socket, SHUT_RDWR);
+			close(g_shot_socket);
+			g_shot_socket = -1;
+		}
+	}
+	if (stdio_socket < 0)
+		return;
+	shutdown(stdio_socket, SHUT_RDWR);
+	close(STDOUT_FILENO);
+	close(STDERR_FILENO);
+	close(stdio_socket);
+}

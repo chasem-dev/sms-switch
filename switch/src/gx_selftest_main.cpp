@@ -15,12 +15,27 @@
 
 extern int gx_selftest_main(int argc, char** argv);
 
+static int g_link = -1;  // stdout and stderr's socket, if they go to the PC
+
+// low_memory.cpp moved the program over the loader's heap, so it cannot go
+// back to the homebrew menu: the process ends, its log socket closed first
+// (as the game's does, switch_main.cpp). Returning crashed it, with the
+// socket open, and the console's bsdsocket service after it.
+extern "C" void __appExit(void);
+extern "C" void NX_NORETURN __libnx_exit(int)
+{
+	fflush(NULL);
+	sms_dev_link_end(g_link);
+	__appExit();
+	svcExitProcess();
+}
+
 int main(int, char**)
 {
 	// sent with tools/switch-dev.py or nxlink -s: the report goes back over
 	// the network, as it runs
-	if (sms_dev_link_start(".") >= 0) {
-	} else if (__nxlink_host.s_addr && R_SUCCEEDED(socketInitializeDefault()) && nxlinkStdio() >= 0) {
+	if ((g_link = sms_dev_link_start(".")) >= 0) {
+	} else if (__nxlink_host.s_addr && R_SUCCEEDED(socketInitializeDefault()) && (g_link = nxlinkStdio()) >= 0) {
 	} else {
 		freopen("gx_selftest.log", "w", stdout);
 		dup2(fileno(stdout), fileno(stderr));

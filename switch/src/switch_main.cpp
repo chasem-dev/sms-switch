@@ -439,8 +439,7 @@ extern "C" void NX_NORETURN __libnx_exit(int rc)
 	snprintf(line, sizeof line, "[switch] exit %d", rc);
 	sms_switch_trace(line);
 	fflush(NULL);
-	if (g_nxlink_socket >= 0)
-		close(g_nxlink_socket);
+	sms_dev_link_end(g_nxlink_socket);
 	__appExit();
 	svcExitProcess();
 }

@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <switch.h>
@@ -128,8 +129,15 @@ int main(int argc, char** argv)
 	pmdmntExit();
 	printf("botstart: done\n");
 	fflush(stdout);
-	if (link >= 0)
+	// stdout and stderr are the socket too: closed before socketExit, or
+	// exit() closes them through the removed socket device (a null pointer
+	// in _close_r), which crashed this program and then bsdsocket
+	if (link >= 0) {
+		shutdown(link, SHUT_RDWR);
+		close(STDOUT_FILENO);
+		close(STDERR_FILENO);
 		close(link);
+	}
 	socketExit();
 	return 0;
 }
