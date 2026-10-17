@@ -1070,7 +1070,83 @@ Texture* defaultFramebuffer() {
     return &g.swapTex[g.frontSlot];
 }
 
+}  // namespace dkgl
+extern "C" bool GXPC_WindowShotSink(uint32_t frame, const uint8_t* rgba, int w, int h);
+namespace dkgl {
+uint64_t g_swapCount = 0;
+
+// SMS_DKGL_TRACE_PIXEL=x,y[;x,y...] (GL coordinates of the draw target): each
+// traced draw logs those pixels' colour, alpha and depth as the draws before
+// it left them (a submit and wait each: tests only).
+void tracePixels() {
+    static std::vector<std::pair<int, int>> pts;
+    static bool parsed = false;
+    if (!parsed) {
+        parsed = true;
+        if (const char* e = getenv("SMS_DKGL_TRACE_PIXEL"))
+            for (const char* p = e; *p;) {
+                char* end;
+                const long x = strtol(p, &end, 10);
+                if (*end != ',') break;
+                const long y = strtol(end + 1, &end, 10);
+                pts.push_back({int(x), int(y)});
+                p = end;
+                while (*p == ';' || *p == ' ') p++;
+            }
+    }
+    // SMS_DKGL_TRACE_DUMP=1: the whole target before each traced draw, to the
+    // PC as captures (GXPC_WindowShotSink, tools/switch-dev.py run --shots):
+    // colour with alpha as frame 100000 + 3n, alpha alone 100001 + 3n, depth
+    // 100002 + 3n (its 24 bits as red, green, blue)
+    static const bool dump = getenv("SMS_DKGL_TRACE_DUMP") && atoi(getenv("SMS_DKGL_TRACE_DUMP"));
+    static uint32_t dumped = 0, traced = 0;
+    static const int every = getenv("SMS_DKGL_TRACE_DUMP_EVERY") ? std::max(1, atoi(getenv("SMS_DKGL_TRACE_DUMP_EVERY"))) : 1;
+    if (dump && traced++ % uint32_t(every) == 0) {
+        const Framebuffer* f = g.framebuffers.get(g.drawFbo);
+        const int w = g.targetW, h = g.targetH;
+        if (f && w > 0 && h > 0) {
+            const GLuint read = g.readFbo, pack = g.packBuffer;
+            g.readFbo = g.drawFbo;
+            g.packBuffer = 0;
+            std::vector<uint8_t> c(size_t(w) * h * 4), a(size_t(w) * h * 4);
+            std::vector<uint32_t> z(size_t(w) * h);
+            readPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, c.data());
+            readPixels(0, 0, w, h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, z.data());
+            g.readFbo = read;
+            g.packBuffer = pack;
+            for (size_t i = 0; i < z.size(); i++) {
+                a[i * 4] = a[i * 4 + 1] = a[i * 4 + 2] = c[i * 4 + 3];
+                a[i * 4 + 3] = 255;
+                const uint32_t d = z[i] >> 8;
+                uint8_t* o = reinterpret_cast<uint8_t*>(&z[i]);
+                o[0] = uint8_t(d >> 16), o[1] = uint8_t(d >> 8), o[2] = uint8_t(d), o[3] = 255;
+            }
+            GXPC_WindowShotSink(100000 + dumped * 3, c.data(), w, h);
+            GXPC_WindowShotSink(100001 + dumped * 3, a.data(), w, h);
+            GXPC_WindowShotSink(100002 + dumped * 3, reinterpret_cast<const uint8_t*>(z.data()), w, h);
+            logf("  dumped the target as captures %u-%u (before traced draw %u)", 100000 + dumped * 3,
+                 100002 + dumped * 3, traced - 1);
+            dumped++;
+        }
+    }
+    if (pts.empty()) return;
+    const GLuint read = g.readFbo;
+    const GLuint pack = g.packBuffer;
+    g.readFbo = g.drawFbo;
+    g.packBuffer = 0;
+    for (const auto& pt : pts) {
+        uint8_t c[4] = {0, 0, 0, 0};
+        uint32_t z = 0;
+        readPixels(pt.first, pt.second, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+        readPixels(pt.first, pt.second, 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, &z);
+        logf("  pixel %d,%d: %3d %3d %3d alpha %3d depth %06x", pt.first, pt.second, c[0], c[1], c[2], c[3], z >> 8);
+    }
+    g.readFbo = read;
+    g.packBuffer = pack;
+}
+
 void swap() {
+    g_swapCount++;
     if (!s_ready) return;
     static uint64_t presentTicks = 0, swapTicks = 0, lastSwap = 0;
     static uint32_t swaps = 0;

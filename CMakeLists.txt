@@ -99,6 +99,19 @@ target_link_libraries(sms PRIVATE ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouv
 # SMS_SWITCH_RENDERER=deko3d. It compiles shaders with uam built as a library
 # (tools/uam/build-uam.sh, into build/uam/); without it, only Mesa's GL.
 set(SMS_SWITCH_UAM_DIR "${CMAKE_BINARY_DIR}/uam" CACHE PATH "libuam built by tools/uam/build-uam.sh")
+# deko3d with this project's fixes (tools/deko3d/build-deko3d.sh, into
+# build/deko3d/) when built, else devkitPro's: its blend states use the
+# colour's destination factor for alpha too (the game's shadows draw solid)
+set(SMS_SWITCH_DEKO3D_DIR "${CMAKE_BINARY_DIR}/deko3d" CACHE PATH "deko3d built by tools/deko3d/build-deko3d.sh")
+if(EXISTS "${SMS_SWITCH_DEKO3D_DIR}/lib/libdeko3d.a")
+  set(SMS_SWITCH_DEKO3D ${SMS_SWITCH_DEKO3D_DIR}/lib/libdeko3d.a)
+  set(SMS_SWITCH_DEKO3DD ${SMS_SWITCH_DEKO3D_DIR}/lib/libdeko3dd.a)
+  message(STATUS "sms-switch: deko3d from ${SMS_SWITCH_DEKO3D_DIR}")
+else()
+  set(SMS_SWITCH_DEKO3D deko3d)
+  set(SMS_SWITCH_DEKO3DD deko3dd)
+  message(WARNING "sms-switch: devkitPro's deko3d (tools/deko3d/build-deko3d.sh builds the fixed one): shadows draw solid")
+endif()
 if(EXISTS "${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
   add_library(dkgl STATIC
     ${SMS_SWITCH_DIR}/src/dkgl/dkgl_api.cpp
@@ -120,7 +133,7 @@ if(EXISTS "${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
     -Wl,--wrap=SDL_GL_SetSwapInterval -Wl,--wrap=SDL_GL_GetSwapInterval -Wl,--wrap=SDL_GL_DeleteContext
     -Wl,--wrap=SDL_GL_GetProcAddress -Wl,--wrap=SDL_GL_GetDrawableSize -Wl,--wrap=SDL_EGL_CreateSurface
     -Wl,--wrap=SDL_EGL_DestroySurface -Wl,--wrap=nwindowSetDimensions)
-  target_link_libraries(sms PRIVATE dkgl deko3d)
+  target_link_libraries(sms PRIVATE dkgl ${SMS_SWITCH_DEKO3D})
   target_link_options(sms PRIVATE ${SMS_SWITCH_DKGL_WRAPS})
   target_compile_definitions(sms PRIVATE SMS_SWITCH_DKGL=1)
   message(STATUS "sms-switch: the deko3d renderer (dkgl) with ${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
@@ -250,7 +263,7 @@ if(SMS_SWITCH_GX_SELFTEST)
   if(TARGET dkgl)
     # SMS_SWITCH_RENDERER=deko3d runs the self-test on dkgl
     # deko3d's checked build: it reports misuse in the log (dkgl's debug callback)
-    target_link_libraries(gx_selftest PRIVATE dkgl deko3dd)
+    target_link_libraries(gx_selftest PRIVATE dkgl ${SMS_SWITCH_DEKO3DD})
     target_link_options(gx_selftest PRIVATE ${SMS_SWITCH_DKGL_WRAPS})
     target_compile_definitions(gx_selftest PRIVATE SMS_SWITCH_DKGL=1)
   endif()

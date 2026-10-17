@@ -397,15 +397,29 @@ bool validateDraw() {
     return true;
 }
 
-// SMS_DKGL_TRACE=n: the first n draws' state in the log.
+extern uint64_t g_swapCount;  // dkgl_api.cpp
+void tracePixels();            // dkgl_api.cpp
+
+// SMS_DKGL_TRACE=n: the first n draws' state in the log; with
+// SMS_DKGL_TRACE_FROM=frame, the first n from that frame (swap) on.
 void traceDraw(const char* what, GLenum mode, int count, uint32_t first, int base, DkGpuAddr indices) {
-    static int left = -1;
+    static int left = -1, skip = 0;
+    static uint64_t from = 0;
     if (left < 0) {
         const char* e = getenv("SMS_DKGL_TRACE");
         left = e ? atoi(e) : 0;
+        const char* f = getenv("SMS_DKGL_TRACE_FROM");
+        from = f ? strtoull(f, nullptr, 10) : 0;
+        const char* k = getenv("SMS_DKGL_TRACE_SKIP");  // draws passed over first
+        skip = k ? atoi(k) : 0;
     }
-    if (left <= 0) return;
+    if (left <= 0 || g_swapCount < from) return;
+    if (skip > 0) {
+        skip--;
+        return;
+    }
     left--;
+    tracePixels();
     const Program* p = g.programs.get(g.program);
     logf("draw %s: mode 0x%x count %d first %u base %d indices 0x%llx; fbo %u (%dx%d) viewport %d %d %d %d "
          "scissor %s %d %d %d %d; depth %d func 0x%x mask %d; cull %d 0x%x front 0x%x; blend %d; colormask %d%d%d%d",
@@ -413,9 +427,20 @@ void traceDraw(const char* what, GLenum mode, int count, uint32_t first, int bas
          g.viewport[0], g.viewport[1], g.viewport[2], g.viewport[3], g.scissorTest ? "on" : "off", g.scissor[0],
          g.scissor[1], g.scissor[2], g.scissor[3], g.depthTest, g.depthFunc, g.depthMask, g.cullFace, g.cullMode,
          g.frontFace, g.blend, g.colorMask[0], g.colorMask[1], g.colorMask[2], g.colorMask[3]);
+    logf("  frame %llu; blend eq 0x%x 0x%x func 0x%x 0x%x 0x%x 0x%x const %g %g %g %g; logic %d 0x%x",
+         (unsigned long long)g_swapCount, g.blendEq[0], g.blendEq[1], g.blendFunc[0], g.blendFunc[1], g.blendFunc[2],
+         g.blendFunc[3], g.blendColor[0], g.blendColor[1], g.blendColor[2], g.blendColor[3], g.logicOp, g.logicOpMode);
     if (!p) return;
-    logf("  program %u: attribs 0x%x, %d samplers, %zu blocks, default block %u bytes, gs %d", g.program,
-         p->attribMask, p->samplerCount, p->glsl.blocks.size(), p->glsl.defaultBlockSize, p->hasGs);
+    logf("  program %u (key %016llx): attribs 0x%x, %d samplers, %zu blocks, default block %u bytes, gs %d", g.program,
+         (unsigned long long)p->key, p->attribMask, p->samplerCount, p->glsl.blocks.size(), p->glsl.defaultBlockSize,
+         p->hasGs);
+    // SMS_DKGL_TRACE_SRC=1: each traced program's adapted GLSL, once
+    static const bool src = getenv("SMS_DKGL_TRACE_SRC") && atoi(getenv("SMS_DKGL_TRACE_SRC"));
+    if (src && !const_cast<Program*>(p)->traced) {
+        const_cast<Program*>(p)->traced = true;
+        fprintf(stderr, "[dkgl] dump %016llx.vs\n%s\n[dkgl] dump end\n[dkgl] dump %016llx.fs\n%s\n[dkgl] dump end\n",
+                (unsigned long long)p->key, p->glsl.vs.c_str(), (unsigned long long)p->key, p->glsl.fs.c_str());
+    }
     const VertexArray* va = currentVao();
     for (int loc = 0; loc < 16; loc++) {
         if (!(p->attribMask & (1u << loc))) continue;
@@ -446,9 +471,14 @@ void traceDraw(const char* what, GLenum mode, int count, uint32_t first, int bas
             logf("  sampler %s: binding %d unit %d", u.name.c_str(), u.binding, p->samplerUnits[size_t(u.binding)]);
             continue;
         }
-        uint32_t w[4] = {0, 0, 0, 0};
-        if (u.offset + 16 <= p->defaultBlock.size()) memcpy(w, &p->defaultBlock[u.offset], 16);
-        logf("  uniform %s @%u: %08x %08x %08x %08x", u.name.c_str(), u.offset, w[0], w[1], w[2], w[3]);
+        // each element of an array (up to 4), at its std140 stride
+        const int n = std::min(std::max(u.arraySize, 1), 4);
+        for (int e = 0; e < n; e++) {
+            const uint32_t at = u.offset + uint32_t(e) * (u.stride ? u.stride : 16);
+            uint32_t w[4] = {0, 0, 0, 0};
+            if (at + 16 <= p->defaultBlock.size()) memcpy(w, &p->defaultBlock[at], 16);
+            logf("  uniform %s[%d] @%u: %08x %08x %08x %08x", u.name.c_str(), e, at, w[0], w[1], w[2], w[3]);
+        }
     }
 }
 

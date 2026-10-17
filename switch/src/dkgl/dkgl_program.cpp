@@ -80,7 +80,11 @@ std::string cachePath(uint64_t key) {
     return s_cacheDir + name;
 }
 
+// SMS_DKGL_NO_CACHE=1: every program compiled here, none taken from the pack
+// or the cache (what the compiler makes now, for tests); still stored.
 bool cacheLookup(uint64_t key, std::string* rec) {
+    static const bool off = getenv("SMS_DKGL_NO_CACHE") && atoi(getenv("SMS_DKGL_NO_CACHE"));
+    if (off) return false;
     auto it = s_cached.find(key);
     if (it != s_cached.end()) {
         *rec = it->second;
@@ -209,6 +213,7 @@ bool linkProgram(Program* p) {
     }
     p->hasGs = !p->glsl.gs.empty();
     const uint64_t key = keyOf(p->glsl);
+    p->key = key;
     dumpProgram(key, p->glsl);
     static const bool dumpOnly = getenv("SMS_DKGL_DUMP_ONLY") && atoi(getenv("SMS_DKGL_DUMP_ONLY"));
     std::string rec;

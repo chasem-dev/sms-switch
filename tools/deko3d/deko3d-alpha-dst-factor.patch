@@ -1,0 +1,19 @@
+dkCmdBufBindBlendStates: the alpha destination factor from the alpha's own.
+
+FuncAlphaDst took dstColorBlendFactor, so a blend state whose alpha and
+colour destination factors differ blended alpha with the colour's: Super
+Mario Sunshine's shadows (colour by DST_ALPHA / ONE_MINUS_DST_ALPHA while
+alpha takes a constant, GXSetDstAlpha) never reset alpha, and drew solid.
+diff --git a/source/maxwell/gpu_3d_state.cpp b/source/maxwell/gpu_3d_state.cpp
+index 0a689d1..e6c864d 100644
+--- a/source/maxwell/gpu_3d_state.cpp
++++ b/source/maxwell/gpu_3d_state.cpp
+@@ -127,7 +127,7 @@ void dkCmdBufBindBlendStates(DkCmdBuf obj, uint32_t firstId, DkBlendState const
+ 			getBlendFactorSetting(state.dstColorBlendFactor), // FuncRgbDst
+ 			state.alphaBlendOp,                               // EquationAlpha
+ 			getBlendFactorSetting(state.srcAlphaBlendFactor), // FuncAlphaSrc
+-			getBlendFactorSetting(state.dstColorBlendFactor)  // FuncAlphaDst
++			getBlendFactorSetting(state.dstAlphaBlendFactor)  // FuncAlphaDst
+ 		);
+ 	}
+ }

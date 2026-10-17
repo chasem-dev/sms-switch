@@ -51,7 +51,17 @@ namespace {
     X(glClear, PFNGLCLEARPROC) \
     X(glBindAttribLocation, PFNGLBINDATTRIBLOCATIONPROC) \
     X(glBindFragDataLocation, PFNGLBINDFRAGDATALOCATIONPROC) \
-    X(glDisableVertexAttribArray, PFNGLDISABLEVERTEXATTRIBARRAYPROC)
+    X(glDisableVertexAttribArray, PFNGLDISABLEVERTEXATTRIBARRAYPROC) \
+    X(glEnable, PFNGLENABLEPROC) \
+    X(glColorMask, PFNGLCOLORMASKPROC) \
+    X(glBlendFuncSeparate, PFNGLBLENDFUNCSEPARATEPROC) \
+    X(glBlendEquationSeparate, PFNGLBLENDEQUATIONSEPARATEPROC) \
+    X(glBlendColor, PFNGLBLENDCOLORPROC) \
+    X(glDepthFunc, PFNGLDEPTHFUNCPROC) \
+    X(glDepthMask, PFNGLDEPTHMASKPROC) \
+    X(glCullFace, PFNGLCULLFACEPROC) \
+    X(glFrontFace, PFNGLFRONTFACEPROC) \
+    X(glClearDepth, PFNGLCLEARDEPTHPROC)
 
 int s_fails = 0;
 
@@ -213,6 +223,109 @@ int runChecks() {
         i4(14, 40, 80, 120, 0);
         const uint8_t want[4] = {40, 80, 120, 255};
         expect("constant integer attribute", want);
+    }
+    // 5. the game's shadow passes (ShadowUtil.cpp): alpha alone written,
+    // then colour blended by that destination alpha while alpha comes from a
+    // constant (GXSetDstAlpha)
+    {
+        GLuint p = program((std::string(kVsHead) + "void main() { gl_Position = vec4(a_pos, 1.0); v_c = a_clr; }\n").c_str(),
+                           "#version 330 core\nin vec4 v_c; out vec4 o_color; uniform vec4 u_col;\n"
+                           "void main() { o_color = u_col + v_c * 0.0; }\n");
+        glUseProgram(p);
+        const GLint col = glGetUniformLocation(p, "u_col");
+        glDisable(GL_BLEND);
+        glColorMask(1, 1, 1, 1);
+        glClearColor(0.2f, 0.4f, 0.6f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        const float quarter[4] = {1, 1, 1, 0.25f};
+        glUniform4fv(col, 1, quarter);
+        glColorMask(0, 0, 0, 1);
+        const uint8_t want1[4] = {51, 102, 153, 64};
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glColorMask(1, 1, 1, 1);
+        {
+            uint8_t got[4] = {0, 0, 0, 0};
+            glReadPixels(8, 8, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, got);
+            bool ok = true;
+            for (int i = 0; i < 4; i++) ok = ok && abs(int(got[i]) - int(want1[i])) <= 2;
+            s_fails += !ok;
+            printf("%s dkgl %-44s got %3d %3d %3d %3d want %3d %3d %3d %3d\n", ok ? "PASS" : "FAIL",
+                   "alpha-only write", got[0], got[1], got[2], got[3], want1[0], want1[1], want1[2], want1[3]);
+        }
+        const float red[4] = {1, 0, 0, 1};
+        glUniform4fv(col, 1, red);
+        glEnable(GL_BLEND);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA, GL_CONSTANT_ALPHA, GL_ZERO);
+        glBlendColor(0, 0, 0, 0);
+        const uint8_t want2[4] = {102, 77, 115, 0};
+        expect("blend by dst alpha, constant alpha", want2);
+        glDisable(GL_BLEND);
+    }
+    // 6. the shadow volume passes with depth (ShadowUtil.cpp, as sms_gx
+    // issues them): a floor, alpha cleared, front faces in front of the
+    // floor write the shadow's alpha, back faces behind it blend the shadow
+    // colour by that alpha
+    {
+        GLuint depthTex;
+        glGenTextures(1, &depthTex);
+        glBindTexture(GL_TEXTURE_2D, depthTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, 16, 16, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depthTex, 0);
+        GLuint p = program((std::string(kVsHead) + "uniform vec4 u_z;\n"
+                            "void main() { gl_Position = vec4(a_pos.xy, u_z.x, 1.0); v_c = a_clr; }\n").c_str(),
+                           "#version 330 core\nin vec4 v_c; out vec4 o_color; uniform vec4 u_col;\n"
+                           "void main() { o_color = u_col + v_c * 0.0; }\n");
+        glUseProgram(p);
+        const GLint col = glGetUniformLocation(p, "u_col"), z = glGetUniformLocation(p, "u_z");
+        auto at = [&](float zz) { const float v[4] = {zz, 0, 0, 0}; glUniform4fv(z, 1, v); };
+        auto colour = [&](float r, float g, float b, float a) { const float v[4] = {r, g, b, a}; glUniform4fv(col, 1, v); };
+        glColorMask(1, 1, 1, 1);
+        glDepthMask(1);
+        glClearColor(0, 0, 0, 1);
+        glClearDepth(1.0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // the floor
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glFrontFace(GL_CCW);
+        at(0.0f);
+        colour(0.6f, 0.6f, 0.6f, 1.0f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        // alpha cleared: no depth test, alpha only, constant alpha 0
+        glDepthMask(0);
+        glDepthFunc(GL_ALWAYS);
+        glColorMask(0, 0, 0, 1);
+        glEnable(GL_BLEND);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_CONSTANT_ALPHA, GL_ZERO);
+        glBlendColor(0, 0, 0, 0);
+        colour(0.1176f, 0.196f, 0.45f, 0.706f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        // front faces in front of the floor: the shadow's alpha
+        glDepthFunc(GL_LEQUAL);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+        at(-0.5f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        // back faces behind it: colour by destination alpha, alpha from the constant
+        glDepthFunc(GL_GEQUAL);
+        glCullFace(GL_FRONT);
+        glFrontFace(GL_CW);  // the same quad, now a back face
+        glColorMask(1, 1, 1, 1);
+        glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA, GL_CONSTANT_ALPHA, GL_ZERO);
+        at(0.5f);
+        const uint8_t want[4] = {66, 80, 126, 0};
+        expect("shadow volume passes", want);
+        glFrontFace(GL_CCW);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glDepthMask(1);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     printf("dkgl checks: %d failed\n", s_fails);
