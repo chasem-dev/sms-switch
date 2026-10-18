@@ -300,7 +300,11 @@ DkResHandle textureHandle(Texture* t, const SamplerParams& s) {
         writeImageDescriptor(t->desc, d);
         t->descDirty = false;
     }
+    // zeroed first: samplerDescriptor knows samplers by all their bytes,
+    // padding included, which dkSamplerDefaults leaves as it found it (built
+    // with -O3, every texture bound made a new sampler until none were left)
     DkSampler ds;
+    memset(&ds, 0, sizeof ds);
     dkSamplerDefaults(&ds);
     switch (s.minFilter) {
     case GL_NEAREST: ds.minFilter = DkFilter_Nearest; ds.mipFilter = DkMipFilter_None; break;
