@@ -136,7 +136,7 @@ What the Switch build does about it:
   The game's thread used to wait for the swap, so the game, the driver and the GPU took turns every frame.
   `SMS_GX_ASYNC_PRESENT=0` in `env.txt` brings the wait back, to compare.
 - **Threads** (`switch/src/performance.cpp`): the game's thread starts on core 0, the GL thread on core 1 and the rest on core 2 or 0, each free to move to any of the three; the texture pack's background work runs below the game's priority, since Horizon does not share a core between threads of equal priority by time.
-  The CPU runs at 1785 MHz and the GPU at 460.8 MHz handheld, 768 MHz docked (`SMS_SWITCH_CLOCKS=0` for the console's default profile).
+  The CPU and GPU run at the console's own clocks; the port never raises them.
 - **Widescreen** draws are placed without scanning their vertices over and over (`patches/sms-port/0006`, from the Android build).
 
 To see where a frame's time goes, show the overlay (L3 + R3): `game`, `GX`, `present`, `swap` and `idle` are the game thread's milliseconds per frame, and `GL thread: busy` the GL thread's (`swapping` is the part of it in `SDL_GL_SwapWindow`, which waits for the display and the GPU).
