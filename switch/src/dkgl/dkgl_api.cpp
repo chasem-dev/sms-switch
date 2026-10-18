@@ -875,6 +875,28 @@ void APIENTRY glRenderbufferStorage_(GLenum target, GLenum ifmt, GLsizei w, GLsi
     glRenderbufferStorageMultisample_(target, 0, ifmt, w, h);
 }
 
+// Clips a blit's rectangles to their images: what falls outside either one
+// is left out of both, in proportion when the blit scales. False when nothing
+// is left.
+bool clipBlit(const Texture* src, int sl, const Texture* dst, int dl, DkImageRect* sr, DkImageRect* dr) {
+    const double sw = std::max(1u, src->levels[0].w >> sl), sh = std::max(1u, src->levels[0].h >> sl);
+    const double dw = std::max(1u, dst->levels[0].w >> dl), dh = std::max(1u, dst->levels[0].h >> dl);
+    const double kx = double(dr->width) / sr->width, ky = double(dr->height) / sr->height;
+    // in destination units: the source's limits mapped there, then the destination's
+    double x0 = dr->x, y0 = dr->y, x1 = dr->x + dr->width, y1 = dr->y + dr->height;
+    x0 = std::max(x0, dr->x - sr->x * kx), y0 = std::max(y0, dr->y - sr->y * ky);
+    x1 = std::min(x1, dr->x + (sw - sr->x) * kx), y1 = std::min(y1, dr->y + (sh - sr->y) * ky);
+    x0 = std::max(x0, 0.0), y0 = std::max(y0, 0.0), x1 = std::min(x1, dw), y1 = std::min(y1, dh);
+    const uint32_t nx0 = uint32_t(x0 + 0.5), ny0 = uint32_t(y0 + 0.5), nx1 = uint32_t(x1 + 0.5), ny1 = uint32_t(y1 + 0.5);
+    if (nx1 <= nx0 || ny1 <= ny0) return false;
+    if (nx0 == dr->x && ny0 == dr->y && nx1 - nx0 == dr->width && ny1 - ny0 == dr->height) return true;
+    const uint32_t sx0 = uint32_t(sr->x + (nx0 - dr->x) / kx + 0.5), sy0 = uint32_t(sr->y + (ny0 - dr->y) / ky + 0.5);
+    const uint32_t sx1 = uint32_t(sr->x + (nx1 - dr->x) / kx + 0.5), sy1 = uint32_t(sr->y + (ny1 - dr->y) / ky + 0.5);
+    *dr = {nx0, ny0, 0, nx1 - nx0, ny1 - ny0, 1};
+    *sr = {sx0, sy0, 0, std::max(1u, std::min(sx1, uint32_t(sw)) - sx0), std::max(1u, std::min(sy1, uint32_t(sh)) - sy0), 1};
+    return true;
+}
+
 void APIENTRY glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1,
                                  GLbitfield mask, GLenum filter) {
     TRACE_CALL("  call glBlitFramebuffer read %u draw %u src %d,%d-%d,%d dst %d,%d-%d,%d mask 0x%x", g.readFbo, g.drawFbo, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask);
@@ -898,10 +920,20 @@ void APIENTRY glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLi
         DkImageRect dr = {uint32_t(std::min(dx0, dx1)), uint32_t(std::min(dy0, dy1)), 0, uint32_t(abs(dx1 - dx0)),
                           uint32_t(abs(dy1 - dy0)), 1};
         if (!sr.width || !sr.height || !dr.width || !dr.height) continue;
+        // inside both images, as GL clips a blit (a copy reaching outside an
+        // image hangs the GPU); a scaled blit keeps its scale
+        if (!clipBlit(src, sl, dst, dl, &sr, &dr)) continue;
         if (src->samples > 1 && dst->samples == 1 && sr.width == dr.width && sr.height == dr.height) {
             dkCmdBufResolveImage(g_dev.cmd, &sv, &dv);
-        } else if (depth || (sr.width == dr.width && sr.height == dr.height && !(flags & (DkBlitFlag_FlipX | DkBlitFlag_FlipY)))) {
+        } else if (sr.width == dr.width && sr.height == dr.height &&
+                   (depth || !(flags & (DkBlitFlag_FlipX | DkBlitFlag_FlipY)))) {
             dkCmdBufCopyImage(g_dev.cmd, &sv, &sr, &dv, &dr, flags & (DkBlitFlag_FlipX | DkBlitFlag_FlipY));
+        } else if (depth) {
+            // scaled: the 2D engine, which takes Z24S8 as 4-byte pixels; GL
+            // filters depth only by the nearest sample, which keeps them whole
+            // (a copy of the source's size overran the smaller image: the
+            // depth peeks' half-size copy at 2x hung the GPU)
+            dkCmdBufBlitImage(g_dev.cmd, &sv, &sr, &dv, &dr, (flags & ~DkBlitFlag_FilterLinear) | DkBlitFlag_FilterNearest, 0);
         } else {
             dkCmdBufBlitImage(g_dev.cmd, &sv, &sr, &dv, &dr, flags, 0);
         }

@@ -199,7 +199,11 @@ bool realize(Texture* t) {
     const FormatInfo f = formatInfo(t->internalFormat);
     uint32_t count = 1;
     const uint32_t w0 = t->levels[0].w, h0 = t->levels[0].h;
-    while (count < t->levels.size() && t->levels[count].defined && int(count) <= t->maxLevel &&
+    // every level defined so far, whatever GL_TEXTURE_MAX_LEVEL is now: that
+    // limits sampling (the image view), not storage (the HD texture packs
+    // raise it once their levels have arrived, and levels past the image's
+    // were dropped, the textures sampled at full size from any distance)
+    while (count < t->levels.size() && t->levels[count].defined &&
            t->levels[count].w == std::max(1u, w0 >> count) && t->levels[count].h == std::max(1u, h0 >> count))
         count++;
     DkImageLayoutMaker lm;
@@ -212,7 +216,8 @@ bool realize(Texture* t) {
         lm.type = DkImageType_2DMS;
         lm.msMode = t->samples >= 8 ? DkMsMode_8x : t->samples >= 4 ? DkMsMode_4x : DkMsMode_2x;
     }
-    lm.flags = f.compressed ? 0 : DkImageFlags_UsageRender | (f.depth ? 0 : DkImageFlags_Usage2DEngine);
+    // (depth too may go through the 2D engine: a scaled depth blit)
+    lm.flags = f.compressed ? 0 : DkImageFlags_UsageRender | DkImageFlags_Usage2DEngine;
     dkImageLayoutInitialize(&t->layout, &lm);
     t->mem = g_dev.heaps[HEAP_IMAGE].alloc(uint32_t(dkImageLayoutGetSize(&t->layout)), dkImageLayoutGetAlignment(&t->layout));
     if (!t->mem) {
