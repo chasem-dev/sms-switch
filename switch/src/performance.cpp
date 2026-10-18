@@ -49,16 +49,24 @@ bool spread_threads()
 
 } // namespace
 
+extern "C" void sms_switch_profile_created(Handle h, void* entry); // profiler.cpp
+
 extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem, size_t stack_sz,
                                       int prio, int cpuid)
 {
-	if (!spread_threads())
-		return __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
+	if (!spread_threads()) {
+		const Result r = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
+		if (R_SUCCEEDED(r))
+			sms_switch_profile_created(t->handle, (void*)entry);
+		return r;
+	}
 	if (prio == 0x3B) // libnx's pthread_create
 		prio = kMainPriority;
 	const bool spread = cpuid == -2;
 	const int core = spread ? kOtherCores[g_next_core.fetch_add(1) % 2] : cpuid;
 	Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, core);
+	if (R_SUCCEEDED(rc))
+		sms_switch_profile_created(t->handle, (void*)entry);
 	if (R_SUCCEEDED(rc) && spread)
 		svcSetThreadCoreMask(t->handle, core, kAllCores);
 	static int trace = -1;
@@ -78,14 +86,18 @@ extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, vo
 	return rc;
 }
 
+extern "C" void sms_switch_profile_thread(int slot); // profiler.cpp
+
 extern "C" void sms_switch_spread_main_thread(void)
 {
+	sms_switch_profile_thread(0);
 	svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, kAllCores);
 }
 
 // The port's GL thread, as it starts (gx_glthread.cpp).
 extern "C" void sms_switch_gl_thread(void)
 {
+	sms_switch_profile_thread(1);
 	if (spread_threads())
 		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kGlCore, kAllCores);
 }

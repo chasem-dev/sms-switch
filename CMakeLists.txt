@@ -43,6 +43,7 @@ target_sources(sms PRIVATE
   ${SMS_SWITCH_DIR}/src/dev_link.cpp
   ${SMS_SWITCH_DIR}/src/low_memory.cpp
   ${SMS_SWITCH_DIR}/src/performance.cpp
+  ${SMS_SWITCH_DIR}/src/profiler.cpp
   ${SMS_SWITCH_DIR}/src/posix_shims.cpp
   ${SMS_SWITCH_DIR}/src/stack_switch.cpp
   ${SMS_SWITCH_DIR}/src/switch_main.cpp)

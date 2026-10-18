@@ -44,6 +44,7 @@ extern "C" const unsigned long sms_switch_prompts_png_size;
 extern "C" int __system_argc; // libnx's argv, before main
 extern "C" char** __system_argv;
 extern "C" void sms_switch_spread_main_thread(void); // performance.cpp
+extern "C" void sms_switch_start_profiler(void);     // profiler.cpp
 
 // A line in the emulator's or debugger's log, before stderr is set up.
 void sms_switch_trace(const char* text)
@@ -384,6 +385,7 @@ __attribute__((constructor(101))) static void switch_start(void)
 	if (!getenv("SMS_TEXTURE_PACK_MB") && !settings_has(g_dir, "texture_pack_mb"))
 		setenv("SMS_TEXTURE_PACK_MB", "1024", 1);
 	sms_switch_spread_main_thread();
+	sms_switch_start_profiler();
 	if (applet_mode()) {
 		const char* allow = getenv("SMS_SWITCH_ALLOW_APPLET");
 		fprintf(stderr, "[switch] started in applet mode (applet type %d)%s\n", (int)appletGetAppletType(),
