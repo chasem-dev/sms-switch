@@ -836,6 +836,7 @@ void attach(GLenum target, GLenum attachment, GLuint name, bool renderbuffer, in
     Framebuffer* f = fboFor(target);
     if (!f) return;
     Attachment a = {name, renderbuffer, level};
+    if (Texture* t = g.textures.get(name)) t->renderTarget = true;
     if (attachment == GL_DEPTH_ATTACHMENT || attachment == GL_DEPTH_STENCIL_ATTACHMENT) f->depth = a;
     else if (attachment == GL_COLOR_ATTACHMENT0) f->color = a;
     g.dirty |= D_TARGETS;

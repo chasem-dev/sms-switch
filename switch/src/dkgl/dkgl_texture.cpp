@@ -218,6 +218,13 @@ bool realize(Texture* t) {
     }
     // (depth too may go through the 2D engine: a scaled depth blit)
     lm.flags = f.compressed ? 0 : DkImageFlags_UsageRender | DkImageFlags_Usage2DEngine;
+    // Render targets the size of the EFB and up are compressed by the GPU's
+    // memory controller: at 2x the plaza's GPU time went from 11.3 to 9.5 ms,
+    // and the game's thread, sharing the memory, ran 1.5 ms faster.
+    // SMS_DKGL_HWCOMP=0: never.
+    static const bool hwComp = !getenv("SMS_DKGL_HWCOMP") || getenv("SMS_DKGL_HWCOMP")[0] != '0';
+    t->hwCompressed = hwComp && t->renderTarget && !f.compressed && count == 1 && w0 * h0 >= 512u * 512u;
+    if (t->hwCompressed) lm.flags |= DkImageFlags_HwCompression;
     dkImageLayoutInitialize(&t->layout, &lm);
     t->mem = g_dev.heaps[HEAP_IMAGE].alloc(uint32_t(dkImageLayoutGetSize(&t->layout)), dkImageLayoutGetAlignment(&t->layout));
     if (!t->mem) {
