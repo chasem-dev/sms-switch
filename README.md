@@ -123,8 +123,11 @@ Joy-Con and Pro Controllers work as the GameCube controller (the PC port's mappi
 | --- | --- |
 | **L3 + R3** (press both sticks) | show or hide the performance overlay (frame rate, where each frame's time goes) |
 | **−** with the overlay shown | the warp menu (stages and episodes) |
+| **L3 + d-pad right** (hold the left stick in) | next graphics preset: 1x, 2x, 1x with the HD textures, 2x with them |
+| **L3 + d-pad left** | 30 or 60 fps during gameplay, from the next area or level |
 
 `SMS_OVERLAY=1` in `env.txt` shows the overlay from the start.
+The graphics preset and frame rate chosen in the game are kept in `graphics.txt` beside the NRO and used at the next start (its `NAME=value` lines, as `env.txt`'s, override `env.txt`).
 
 ## Performance
 

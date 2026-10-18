@@ -1,0 +1,370 @@
+Graphics presets while the game runs: 1x, 2x, 1x with the texture packs and
+2x with them. rendererSetScale makes the EFB again at a new internal
+resolution between frames (what reads it takes the scale as it goes, the XFB
+and EFB copy textures follow their sizes, and the samplers whose LOD bias
+follows the scale are made again); hiresSetActive draws the packs'
+replacements or the originals, freeing the loaded ones when off, with the
+packs still indexed (SMS_TEXTURE_PACKS_ACTIVE=0 starts with them off). On
+the Switch, the left stick held in (L3) and D-pad Right step through the
+presets, shown for a moment on screen and kept in graphics.txt beside the
+program.
+
+--- a/platform/gx/src/gx_internal.h
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -149,6 +149,10 @@
+ 
+ // ---------------------------------------------------------------- renderer (gx_render.cpp)
+ void rendererInit(float efbScale);
++// A new internal resolution, between frames: the EFB made again at its size
++// (the graphics presets, gx_platform.cpp).
++void rendererSetScale(float efbScale);
++void textureScaleChanged();  // gx_texture.cpp: the samplers whose LOD bias follows the scale
+ float efbScale();  // the internal resolution over the GameCube's
+ void flushBatch();
+ // adds a primitive; vertices already decoded
+@@ -231,6 +235,10 @@
+                    uint8_t* out);
+ // Texture packs (gx_hires.cpp)
+ bool hiresEnabled();
++// Whether the packs' replacements are drawn (SMS_TEXTURE_PACKS_ACTIVE=0 starts
++// with them off); off frees the loaded ones. The packs stay indexed.
++bool hiresActive();
++void hiresSetActive(bool on);
+ bool hiresLog();
+ std::string hiresName(const uint8_t* data, uint32_t fmt, uint32_t w, uint32_t h, bool mipmapped, const uint8_t* tlut,
+                       uint32_t tlutBytes, bool onlyIfPresent);
+@@ -298,8 +306,10 @@
+     OVERLAY_WARP_MENU,
+     OVERLAY_STATE_MENU,
+     OVERLAY_STATE_TOAST,
++    OVERLAY_GRAPHICS_TOAST,
+     OVERLAY_SLOTS
+ };
++void graphicsToastRender(int winW, int winH);  // gx_platform.cpp: the graphics preset just chosen, for a moment
+ void drawOverlayPanel(OverlaySlot slot, const uint8_t* rgba, int w, int h, int x, int y, int scale, int winW, int winH);
+ // SMS_WINDOW_SHOTS: the window as shown, menus included, at GX frame `frame` (GL thread, before the swap).
+ void captureWindow(uint32_t frame, int w, int h);
+--- a/platform/gx/src/gx_render.cpp
++++ b/platform/gx/src/gx_render.cpp
+@@ -2649,6 +2649,52 @@
+     }
+ }
+ 
++// The EFB at a new scale, between frames (after a display copy): its color
++// and depth made again at the new size and attached again. What reads the
++// EFB takes the scale as it goes (viewports, copies, peeks); the XFBs and EFB
++// copy textures follow their sizes; the samplers whose LOD bias makes up for
++// the scale are made again.
++void rendererSetScale(float scale) {
++    scale = std::min(8.0f, std::max(1.0f, scale));
++    if (!s_ready || scale == s_scale) return;
++    flushBatch();
++    s_scale = scale;
++    const int W = scaled(s_efbW), H = scaled(EFB_H);
++    glBindTexture(GL_TEXTURE_2D, s_efbColor);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++    glBindTexture(GL_TEXTURE_2D, s_efbDepth);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, W, H, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    if (s_msaa) {
++        glBindRenderbuffer(GL_RENDERBUFFER, s_efbMsColor);
++        glRenderbufferStorageMultisample(GL_RENDERBUFFER, s_msaa, GL_RGBA8, W, H);
++        glBindRenderbuffer(GL_RENDERBUFFER, s_efbMsDepth);
++        glRenderbufferStorageMultisample(GL_RENDERBUFFER, s_msaa, GL_DEPTH_COMPONENT24, W, H);
++        glBindRenderbuffer(GL_RENDERBUFFER, 0);
++        glBindFramebuffer(GL_FRAMEBUFFER, s_efbResolveFbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_efbColor, 0);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, s_efbDepth, 0);
++        glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, s_efbMsColor);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, s_efbMsDepth);
++    } else {
++        glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_efbColor, 0);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, s_efbDepth, 0);
++    }
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) logmsg("EFB framebuffer incomplete");
++    glDisable(GL_SCISSOR_TEST);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glDepthMask(GL_TRUE);
++    glClearColor(0, 0, 0, 1);
++    glClearDepth(1.0);
++    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++    s_resolvedGen = ~0u;
++    textureScaleChanged();
++    glcInvalidate();
++    logmsg("internal resolution scale %g: EFB %dx%d", s_scale, W, H);
++}
++
+ }  // namespace gx
+ 
+ using namespace gx;
+--- a/platform/gx/src/gx_texture.cpp
++++ b/platform/gx/src/gx_texture.cpp
+@@ -468,6 +468,13 @@
+ // sampler bind instead of seven glTexParameter calls.
+ static std::unordered_map<uint64_t, GLuint> s_samplers;
+ 
++// The internal resolution changed: samplers are made again as they are next
++// asked for (an effect texture's bias follows the scale).
++void textureScaleChanged() {
++    for (auto& kv : s_samplers) glDeleteSamplers(1, &kv.second);
++    s_samplers.clear();
++}
++
+ // SMS_ANISO=n: anisotropic filtering for every filtered texture, clamped to
+ // the driver's maximum (EXT/ARB_texture_filter_anisotropic, core in GL 4.6).
+ static float anisotropy() {
+@@ -713,7 +720,7 @@
+             return t;
+         }
+     }
+-    if (!e.hires.empty()) {  // the replacement, once decoded (the original meanwhile)
++    if (!e.hires.empty() && hiresActive()) {  // the replacement, once decoded (the original meanwhile)
+         int scale = 0;
+         if (GLuint t = hiresTexture(e.hires, map, w, h, &scale)) {
+             glcBindTexture(map, t);
+--- a/platform/gx/src/gx_hires.cpp
++++ b/platform/gx/src/gx_hires.cpp
+@@ -236,7 +236,7 @@
+     if (!s_index.empty()) {
+         queryFormats();
+         startWorker();
+-        if (preloadMode() == 2) requestPack();
++        if (preloadMode() == 2 && hiresActive()) requestPack();
+         s_state = 1;
+     }
+ }
+@@ -246,6 +246,15 @@
+     return s_state == 1;
+ }
+ 
++// The packs' replacements drawn or not (the graphics presets). Off, the
++// originals are drawn and the loaded replacements freed; on again, each is
++// read back the next time its texture is drawn.
++static bool s_active = [] {
++    const char* e = getenv("SMS_TEXTURE_PACKS_ACTIVE");
++    return !(e && *e == '0');
++}();
++bool hiresActive() { return s_active; }
++
+ // SMS_TEXTURE_PACK_LOG=1 logs the pack name of every texture the game loads,
+ // and whether the pack replaced it (for checking or making a pack).
+ bool hiresLog() {
+@@ -641,7 +650,7 @@
+ 
+ void hiresPrefetchResource(const void* ptr, uint32_t size, const char* name) {
+     // Never scan directories or query GL on a resource-loading thread.
+-    if (s_state != 1 || !preloading() || !ptr || size < 0x20) return;
++    if (s_state != 1 || !s_active || !preloading() || !ptr || size < 0x20) return;
+     const uint8_t* data = static_cast<const uint8_t*>(ptr);
+     bool model = !memcmp(data, "J3D2", 4), particle = !memcmp(data, "JEFFjpa1", 8);
+     if (!model && !particle) {
+@@ -1573,7 +1582,7 @@
+ }
+ 
+ void hiresPreload() {
+-    if (s_state != 1 || !preloading()) return;
++    if (s_state != 1 || !preloading() || !s_active) return;
+     const auto start = std::chrono::steady_clock::now();
+     uint32_t before = s_uploaded;
+     uploadPending(true);
+@@ -1626,6 +1635,30 @@
+     if (n) logmsg("texture pack: freed %zu replacements (%zu MiB) over the %zu MiB budget", n, freed >> 20, budget >> 20);
+ }
+ 
++void hiresSetActive(bool on) {
++    if (on == s_active) return;
++    s_active = on;
++    if (on) return;
++    size_t freed = 0, n = 0;
++    for (auto it = s_repl.begin(); it != s_repl.end();) {
++        if (it->second.state != Replacement::READY) {
++            ++it;
++            continue;
++        }
++        glcForgetTexture(it->second.tex);
++        glDeleteTextures(1, &it->second.tex);
++        freed += it->second.bytes;
++        {
++            std::lock_guard<std::mutex> lk(s_mu);
++            s_requested.erase(it->first);
++        }
++        it = s_repl.erase(it);
++        n++;
++    }
++    s_bytes -= std::min(s_bytes, freed);
++    logmsg("texture pack: off, %zu replacements (%zu MiB) freed", n, freed >> 20);
++}
++
+ void hiresShutdown() {
+     s_state = 0;
+     {
+--- a/platform/gx/src/gx_platform.cpp
++++ b/platform/gx/src/gx_platform.cpp
+@@ -784,6 +784,84 @@
+     return 0;
+ }
+ 
++// The graphics presets: 1x, 2x, 1x with the texture packs, 2x with them
++// (the internal resolution and the packs' replacements, changed while the
++// game runs), and the gameplay frame rate. On the Switch, the left stick held
++// in (L3) and D-pad Right steps through the presets, L3 and D-pad Left
++// switches between 30 and 60 fps; the choices are kept in graphics.txt beside
++// the program (NAME=value lines, as env.txt, read at start).
++static std::string s_graphicsToast;
++static double s_graphicsToastUntil = 0;
++
++extern "C++" void gx::graphicsToastRender(int winW, int winH) {
++    static std::vector<uint8_t> px;
++    static std::string shown;
++    static int tw = 0, th = 0, glyph = 0;
++    if (s_graphicsToast.empty() || nowSeconds() > s_graphicsToastUntil) {
++        shown.clear();
++        return;
++    }
++    const int g = std::max(3, winH / 270);  // about 28 pixels high at 1080
++    const bool changed = s_graphicsToast != shown || g != glyph;
++    if (changed) {
++        static const uint8_t bg[4] = {15, 15, 15, 240}, accent[4] = {66, 150, 250, 255}, text[4] = {255, 255, 255, 255};
++        shown = s_graphicsToast;
++        glyph = g;
++        const int pad = 6 * g;
++        tw = gx::overlayTextWidth(shown.c_str()) * g + 2 * pad;
++        th = 7 * g + 2 * pad;
++        px.assign(size_t(tw) * th * 4, 0);
++        gx::overlayFillRect(px, tw, th, 0, 0, tw, th, bg);
++        gx::overlayFillRect(px, tw, th, 0, 0, 2 * g, th, accent);
++        gx::overlayText(px, tw, th, pad, pad, shown.c_str(), text, g);
++    }
++    // a little above the middle, clear of the HUD's counters and of the
++    // messages low in the window
++    gx::drawOverlayPanel(gx::OVERLAY_GRAPHICS_TOAST, changed ? px.data() : nullptr, tw, th, (winW - tw) / 2,
++                         winH * 3 / 10, 1, winW, winH);
++}
++
++#ifdef __SWITCH__
++static bool s_stickHeld[2];  // L3, R3 held (sms_gx_pump_events)
++// The gameplay frame rate (SMS_FRAME_RATE, the port's runtime; absent in the
++// GX tests). The game takes it as a stage starts, so a change shows from the
++// next area or level on.
++extern "C" __attribute__((weak)) int port_frame_rate;
++static void saveGraphicsSettings() {
++    if (FILE* f = fopen("graphics.txt", "w")) {
++        fprintf(f, "SMS_GX_SCALE=%d\nSMS_TEXTURE_PACKS_ACTIVE=%d\n", gx::efbScale() >= 2.0f ? 2 : 1,
++                gx::hiresEnabled() && gx::hiresActive() ? 1 : 0);
++        if (&port_frame_rate) fprintf(f, "SMS_FRAME_RATE=%d\n", port_frame_rate);
++        fclose(f);
++    }
++}
++static void showGraphicsMessage(const std::string& text) {
++    s_graphicsToast = text;
++    s_graphicsToastUntil = nowSeconds() + 2.5;
++    logmsg("%s", text.c_str());
++}
++static void toggleFrameRate() {
++    if (!&port_frame_rate) return;
++    port_frame_rate = port_frame_rate == 30 ? 60 : 30;
++    saveGraphicsSettings();
++    showGraphicsMessage(std::string("Frame rate: ") + (port_frame_rate == 30 ? "30" : "60") +
++                        " fps (from the next area)");
++}
++static void cycleGraphicsPreset() {
++    const bool packs = gx::hiresEnabled();  // a pack was found: the HD presets exist
++    const bool hd = packs && gx::hiresActive();
++    int preset = (gx::efbScale() >= 2.0f ? 1 : 0) + (hd ? 2 : 0);
++    preset = (preset + 1) % (packs ? 4 : 2);
++    const float scale = (preset & 1) ? 2.0f : 1.0f;
++    const bool wantHd = preset >= 2;
++    gx::rendererSetScale(scale);
++    if (packs) gx::hiresSetActive(wantHd);
++    saveGraphicsSettings();
++    showGraphicsMessage(std::string("Graphics: ") + (scale >= 2.0f ? "2x" : "1x") + (wantHd ? " + HD textures" : "") +
++                        (packs ? "" : " (no texture pack)"));
++}
++#endif
++
+ void GXPC_Present(const void* xfb) {
+ #ifdef SMS_GX_HAVE_SDL2
+     if (s_mode == MODE_WINDOW && s_window) {
+@@ -905,6 +983,39 @@
+ void sms_gx_pump_events(void) {
+ #ifdef SMS_GX_HAVE_SDL2
+     if (s_mode != MODE_WINDOW) return;
++#ifdef __SWITCH__
++    // (SMS_GX_PRESET_AT=frame,frame...: the next graphics preset at those
++    // frames, as L3 + D-pad Right does; tests)
++    {
++        static std::vector<uint32_t> at;
++        static bool parsed = false;
++        if (!parsed) {
++            parsed = true;
++            if (const char* e = getenv("SMS_GX_PRESET_AT"))
++                for (const char* p = e; *p;) {
++                    char* end;
++                    at.push_back(uint32_t(strtoul(p, &end, 10)));
++                    p = *end ? end + 1 : end;
++                }
++        }
++        static uint32_t last = ~0u;
++        if (s_frame != last && std::find(at.begin(), at.end(), s_frame) != at.end()) cycleGraphicsPreset();
++        // (SMS_GX_FPS_AT=frame,...: 30 and 60 fps in turn at those frames)
++        static std::vector<uint32_t> fpsAt;
++        static bool fpsParsed = false;
++        if (!fpsParsed) {
++            fpsParsed = true;
++            if (const char* e = getenv("SMS_GX_FPS_AT"))
++                for (const char* p = e; *p;) {
++                    char* end;
++                    fpsAt.push_back(uint32_t(strtoul(p, &end, 10)));
++                    p = *end ? end + 1 : end;
++                }
++        }
++        if (s_frame != last && std::find(fpsAt.begin(), fpsAt.end(), s_frame) != fpsAt.end()) toggleFrameRate();
++        last = s_frame;
++    }
++#endif
+     SDL_Event ev;
+     while (SDL_PollEvent(&ev)) {
+         if (!menuVisible()) noteInputDevice(ev);
+@@ -1013,6 +1124,29 @@
+             if (ev.type == SDL_KEYDOWN && !ev.key.repeat) setFullscreen(!s_isFullscreen);
+             continue;
+         }
++#ifdef __SWITCH__
++        // The left stick held in (L3) and D-pad Right step through the
++        // graphics presets, D-pad Left switches between 30 and 60 fps; that
++        // D-pad press (and its release) is kept from the game.
++        if ((ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) &&
++            (ev.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSTICK || ev.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSTICK))
++            s_stickHeld[ev.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSTICK] = ev.type == SDL_CONTROLLERBUTTONDOWN;
++        if ((ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) &&
++            (ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT || ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT)) {
++            static bool taken[2];
++            const int left = ev.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT;
++            if (ev.type == SDL_CONTROLLERBUTTONDOWN && s_stickHeld[0] && !s_stickHeld[1]) {
++                if (left) toggleFrameRate();
++                else cycleGraphicsPreset();
++                taken[left] = true;
++                continue;
++            }
++            if (taken[left] && ev.type == SDL_CONTROLLERBUTTONUP) {
++                taken[left] = false;
++                continue;
++            }
++        }
++#endif
+         // F7 with the overlay open cycles the game speed
+         if (ev.type == SDL_KEYDOWN && ev.key.keysym.scancode == SDL_SCANCODE_F7 && GXPC_OverlayVisible()) {
+             if (!ev.key.repeat) GXPC_CycleSpeed();
+--- a/platform/gx/src/gx_savestate_overlay.cpp
++++ b/platform/gx/src/gx_savestate_overlay.cpp
+@@ -101,6 +101,7 @@
+ 
+ void savestateOverlayRender(int winW, int winH) {
+     if (winW > 0 && winH > 0) renderToast(winW, winH);
++    if (winW > 0 && winH > 0) graphicsToastRender(winW, winH);  // gx_platform.cpp
+ }
+ 
+ }  // namespace gx

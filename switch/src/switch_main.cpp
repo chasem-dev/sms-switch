@@ -108,7 +108,7 @@ void load_env_file(const std::string& path)
 		for (size_t n = strlen(s); n && (s[n - 1] == ' ' || s[n - 1] == '\t');)
 			s[--n] = 0;
 		setenv(s, value, 1);
-		fprintf(stderr, "[switch] env.txt: %s=%s\n", s, value);
+		fprintf(stderr, "[switch] %s: %s=%s\n", path.substr(path.find_last_of('/') + 1).c_str(), s, value);
 	}
 	fclose(f);
 }
@@ -314,6 +314,9 @@ __attribute__((constructor(101))) static void switch_start(void)
 	log_layout();
 
 	load_env_file(g_dir + "/env.txt");
+	// the graphics preset last chosen in the game (L3 + D-pad Right, gx_platform.cpp
+	// in sms-port): after env.txt, before the launch arguments
+	load_env_file(g_dir + "/graphics.txt");
 	take_env_arguments();
 	// SMS_SWITCH_NO_AUTOSLEEP=1 (tools/switch-dev.py's runs): the console's
 	// Auto-Sleep off, handheld and TV, as System Settings > Sleep Mode sets it
@@ -419,6 +422,12 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// A program without one of its own (Super Mario Eclipse) reads the one in
 	// Sunshine's sms-standalone.nro, beside it or in sdmc:/switch/sms/: the
 	// same textures, without a second 1.4 GB copy on the card.
+	// SMS_TEXTURE_PACKS=0 starts with the packs off but still finds them, so
+	// the game's graphics presets can turn them on.
+	if (const char* e = getenv("SMS_TEXTURE_PACKS"); e && !strcmp(e, "0")) {
+		setenv("SMS_TEXTURE_PACKS_ACTIVE", "0", 0);
+		unsetenv("SMS_TEXTURE_PACKS");
+	}
 	if (!getenv("SMS_TEXTURE_PACKS")) {
 		auto is_dir = [](const char* dir) {
 			struct stat st;
