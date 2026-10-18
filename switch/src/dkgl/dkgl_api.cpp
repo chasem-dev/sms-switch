@@ -1254,10 +1254,11 @@ void swap() {
     if (++swaps == 300) {
         static const bool timing = getenv("SMS_TIMING_LOG") && atoi(getenv("SMS_TIMING_LOG"));
         if (timing)
-            logf("swaps: acquiring %.2f ms, presenting %.2f ms, %.2f ms apart (avg); GPU memory %.1f MiB",
+            logf("swaps: acquiring %.2f ms, presenting %.2f ms, %.2f ms apart (avg); GPU busy %.2f ms/frame; GPU memory %.1f MiB",
                  armTicksToNs(s_acquireTicks) / 300e6, armTicksToNs(presentTicks) / 300e6,
-                 armTicksToNs(swapTicks) / 299e6,
+                 armTicksToNs(swapTicks) / 299e6, double(g_dev.gpuBusyNs) / 300e6,
                  double(g_dev.heaps[HEAP_DATA].used() + g_dev.heaps[HEAP_IMAGE].used()) / 1048576.0);
+        g_dev.gpuBusyNs = 0;
         s_acquireTicks = presentTicks = swapTicks = 0;
         swaps = 0;
         lastSwap = 0;

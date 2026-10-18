@@ -90,7 +90,12 @@ struct Device {
     struct Submitted {
         uint64_t serial;
         DkFence fence;
+        int timeSlot = -1;  // its GPU start and end timestamps (SMS_TIMING_LOG)
     };
+    Alloc gpuTimes;              // the timestamps' memory: two reports per slot
+    int timeSlot = -1;           // the list being recorded's slot
+    uint32_t nextTimeSlot = 0;
+    uint64_t gpuBusyNs = 0;      // GPU time of the lists finished since the last report
     std::deque<Submitted> inFlight;
     uint32_t commandsSinceSubmit = 0;  // bytes of command memory used
 

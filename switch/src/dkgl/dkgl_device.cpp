@@ -2,6 +2,8 @@
 #include "dkgl_internal.h"
 
 #include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
 #include <algorithm>
 #include <iterator>
 #include <stdio.h>
@@ -75,6 +77,7 @@ const uint32_t kCmdChunk = 1u << 20;        // command memory per chunk
 const uint32_t kTransientChunk = 4u << 20;  // transient memory per chunk
 const uint32_t kSubmitBytes = 512u << 10;   // submit once this much is recorded
 const uint32_t kImageDescriptors = 8192, kSamplerDescriptors = 2048;
+const uint32_t kTimeSlots = 256;  // GPU timestamp pairs (more than lists in flight)
 
 void addCommandMemory(void*, DkCmdBuf cmd, size_t minReqSize) {
     Alloc a;
@@ -180,6 +183,15 @@ void poll() {
         Device::Submitted& s = g_dev.inFlight.front();
         if (dkFenceWait(&s.fence, 0) != DkResult_Success) break;
         g_dev.completed = s.serial;
+        if (s.timeSlot >= 0) {
+            const uint32_t at = uint32_t(s.timeSlot) * 32;
+            dkMemBlockFlushCpuCache(g_dev.gpuTimes.block, g_dev.gpuTimes.offset + at, 32);
+            // (a report: its counter, 0 for a timestamp, then the time in ns)
+            uint64_t t0, t1;
+            memcpy(&t0, g_dev.gpuTimes.cpu + at + 8, 8);
+            memcpy(&t1, g_dev.gpuTimes.cpu + at + 16 + 8, 8);
+            if (t1 > t0 && t1 - t0 < 1000000000ull) g_dev.gpuBusyNs += t1 - t0;
+        }
         g_dev.inFlight.pop_front();
     }
     const uint64_t done = g_dev.completed;
@@ -244,14 +256,22 @@ void startList() {
     dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, kSamplerDescriptors);
     g_dev.samplerUsed.assign(kSamplerDescriptors, false);
     g_dev.imageUsed.assign(kImageDescriptors, false);
+    // (SMS_TIMING_LOG: the GPU's time per list, timestamps at its start and end)
+    if (g_dev.gpuTimes) {
+        g_dev.timeSlot = int(g_dev.nextTimeSlot++ % kTimeSlots);
+        dkCmdBufReportCounter(g_dev.cmd, DkCounter_Timestamp, g_dev.gpuTimes.gpu + uint32_t(g_dev.timeSlot) * 32);
+    }
 }
 
 void submit(bool wait) {
     // the chunk the command buffer is writing into stays with this serial
     if (!g_dev.cmdChunks.empty()) g_dev.cmdChunks.back().serial = g_dev.serial;
+    const int slot = g_dev.timeSlot;
+    if (slot >= 0)
+        dkCmdBufReportCounter(g_dev.cmd, DkCounter_Timestamp, g_dev.gpuTimes.gpu + uint32_t(slot) * 32 + 16);
     DkCmdList list = dkCmdBufFinishList(g_dev.cmd);
     if (list) dkQueueSubmitCommands(g_dev.queue, list);
-    g_dev.inFlight.push_back({g_dev.serial, {}});
+    g_dev.inFlight.push_back({g_dev.serial, {}, slot});
     dkQueueSignalFence(g_dev.queue, &g_dev.inFlight.back().fence, true);
     dkQueueFlush(g_dev.queue);
     // the transient chunk being filled ends with this serial too
@@ -405,6 +425,8 @@ bool initDevice(int width, int height) {
     g_dev.samplerDescs = g_dev.heaps[HEAP_DATA].alloc(kSamplerDescriptors * sizeof(DkSamplerDescriptor), 0x100);
     memset(g_dev.imageDescs.cpu, 0, g_dev.imageDescs.size);
     memset(g_dev.samplerDescs.cpu, 0, g_dev.samplerDescs.size);
+    if (getenv("SMS_TIMING_LOG") && atoi(getenv("SMS_TIMING_LOG")))
+        g_dev.gpuTimes = g_dev.heaps[HEAP_READBACK].alloc(kTimeSlots * 32, 32);
     startList();
 
     logf("starting: swapchain images, %dx%d", width, height);
