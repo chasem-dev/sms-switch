@@ -1,0 +1,47 @@
+Engine3D::InvalidateTextureDataCache at NVIDIA's register.
+
+The waiting variant of the texture data cache invalidation (used by
+dkCmdBufBarrier with DkBarrier_Tiles or _Fragments and
+DkInvalidateFlags_Image, the barrier for sampling what was just drawn) was
+defined at method 0x3DD (byte offset 0xF74), marked theoretical, where
+NVIDIA's Maxwell class (open-gpu-doc clb197.h) has nothing; its
+INVALIDATE_TEXTURE_DATA_CACHE is byte offset 0x1338, method 0x4CE, as
+Mesa's nouveau driver uses it (TEX_CACHE_CTL). So nothing was invalidated:
+on the console a texture drawn into and then sampled could come out stale
+(Super Mario Sunshine's ground, sky, glyphs and screen copies).
+
+diff --git a/source/maxwell/engine_3d.def b/source/maxwell/engine_3d.def
+index 30cdbc1..537314e 100644
+--- a/source/maxwell/engine_3d.def
++++ b/source/maxwell/engine_3d.def
+@@ -239,14 +239,6 @@ engine _3D 0xB197;
+ 0x3DA TiledCacheUnknownConfig0;
+ 0x3DB TiledCacheUnknownConfig1;
+ 0x3DC TiledCacheUnknownConfig3;
+-0x3DD InvalidateTextureDataCache bits (
+-	// Theoretical register, same as InvalidateTextureDataCacheNoWfi but with implicit Wfi
+-	0 Lines enum (
+-		0 All;
+-		1 One;
+-	);
+-	4..25 Tag;
+-);
+ 0x3DE DiscardRenderTarget bits (
+ 	0    DepthStencil bool;
+ 	4..6 Color;
+@@ -409,6 +401,15 @@ engine _3D 0xB197;
+ 
+ 0x4C7 BlendConstant array[4] float;
+ 
++0x4CE InvalidateTextureDataCache bits (
++	// NVB197_INVALIDATE_TEXTURE_DATA_CACHE (byte offset 0x1338, Mesa's
++	// TEX_CACHE_CTL): InvalidateTextureDataCacheNoWfi with a wait for idle
++	0 Lines enum (
++		0 All;
++		1 One;
++	);
++	4..25 Tag;
++);
+ 0x4D8 ColorBlendEnable array[8] bool;
+ 0x4E0 StencilEnable bool;
+ 0x4E1 StencilFrontOpFail;

@@ -283,6 +283,10 @@ bool validateDraw() {
         // texture binding, a test)
         static const int samplerMode = getenv("SMS_DKGL_SAMPLER_EVERY") ? atoi(getenv("SMS_DKGL_SAMPLER_EVERY")) : 2;
         if (samplerMode == 1) dkCmdBufBindSamplerDescriptorSet(c, g_dev.samplerDescs.gpu, 2048);
+        if (samplerMode == 3) {
+            dkCmdBufBindImageDescriptorSet(c, g_dev.imageDescs.gpu, 8192);
+            dkCmdBufBindSamplerDescriptorSet(c, g_dev.samplerDescs.gpu, 2048);
+        }
         if (samplerMode == 2) {
             // a sampler descriptor not read since the set was bound: bound
             // again first (test: on the console a sampler first read later
@@ -299,6 +303,23 @@ bool validateDraw() {
             for (int k = 0; k < p->samplerCount; k++) {
                 const uint32_t id = handles[k] >> 20;
                 if (id < g_dev.samplerUsed.size()) g_dev.samplerUsed[id] = true;
+            }
+            // (SMS_DKGL_IMAGE_FRESH=1: likewise the image set, a test)
+            static const bool imageFresh = getenv("SMS_DKGL_IMAGE_FRESH") && atoi(getenv("SMS_DKGL_IMAGE_FRESH"));
+            if (imageFresh) {
+                bool freshImage = false;
+                for (int k = 0; k < p->samplerCount; k++) {
+                    const uint32_t id = handles[k] & 0xFFFFF;
+                    if (id < g_dev.imageUsed.size() && !g_dev.imageUsed[id]) freshImage = true;
+                }
+                if (freshImage) {
+                    dkCmdBufBindImageDescriptorSet(c, g_dev.imageDescs.gpu, 8192);
+                    std::fill(g_dev.imageUsed.begin(), g_dev.imageUsed.end(), false);
+                }
+                for (int k = 0; k < p->samplerCount; k++) {
+                    const uint32_t id = handles[k] & 0xFFFFF;
+                    if (id < g_dev.imageUsed.size()) g_dev.imageUsed[id] = true;
+                }
             }
         }
         dkCmdBufBindTextures(c, kStages[si], 0, handles, uint32_t(p->samplerCount));
@@ -539,9 +560,10 @@ void traceDraw(const char* what, GLenum mode, int count, uint32_t first, int bas
                 const int unit = p->samplerUnits[size_t(u.binding + e)];
                 const GLuint name = unit >= 0 && unit < 32 ? g.tex2D[unit] : 0;
                 const Texture* t = g.textures.get(name);
-                logf("  sampler %s[%d]: unit %d texture %u %ux%u format 0x%x levels %u", u.name.c_str(), e, unit, name,
-                     t && !t->levels.empty() ? t->levels[0].w : 0, t && !t->levels.empty() ? t->levels[0].h : 0,
-                     t ? t->internalFormat : 0, t ? t->imageLevels : 0);
+                logf("  sampler %s[%d]: unit %d texture %u %ux%u format 0x%x levels %u handle image %u sampler %u",
+                     u.name.c_str(), e, unit, name, t && !t->levels.empty() ? t->levels[0].w : 0,
+                     t && !t->levels.empty() ? t->levels[0].h : 0, t ? t->internalFormat : 0, t ? t->imageLevels : 0,
+                     t && t->handleValid ? t->handle & 0xFFFFF : ~0u, t && t->handleValid ? t->handle >> 20 : ~0u);
             }
             continue;
         }

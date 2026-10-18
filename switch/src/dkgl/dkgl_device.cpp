@@ -243,6 +243,7 @@ void startList() {
     dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, kImageDescriptors);
     dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, kSamplerDescriptors);
     g_dev.samplerUsed.assign(kSamplerDescriptors, false);
+    g_dev.imageUsed.assign(kImageDescriptors, false);
 }
 
 void submit(bool wait) {
@@ -339,6 +340,7 @@ void writeImageDescriptor(uint32_t slot, const DkImageDescriptor& d) {
     // written directly; the descriptor cache is invalidated before the next draw
     memcpy(g_dev.imageDescs.cpu + slot * sizeof(DkImageDescriptor), &d, sizeof d);
     g_dev.descriptorsDirty = true;
+    if (g_tracing) logf("  image descriptor %u written", slot);
 }
 
 void retireImageDescriptor(uint32_t slot) {

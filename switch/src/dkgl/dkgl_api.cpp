@@ -112,6 +112,13 @@ void drawn() {
     g.unfinished = true;
     // (SMS_DKGL_SUBMIT_EVERY=n: a submission every n draws, a test)
     static const uint32_t every = getenv("SMS_DKGL_SUBMIT_EVERY") ? uint32_t(atoi(getenv("SMS_DKGL_SUBMIT_EVERY"))) : 256;
+    // (SMS_DKGL_SERIAL=1: the GPU waited for after every draw, a test)
+    static const bool serial = getenv("SMS_DKGL_SERIAL") && atoi(getenv("SMS_DKGL_SERIAL"));
+    if (serial) {
+        s_drawsSinceSubmit = 0;
+        submit(true);
+        return;
+    }
     if (++s_drawsSinceSubmit >= every) {
         s_drawsSinceSubmit = 0;
         submit();

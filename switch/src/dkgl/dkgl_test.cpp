@@ -61,7 +61,8 @@ namespace {
     X(glDepthMask, PFNGLDEPTHMASKPROC) \
     X(glCullFace, PFNGLCULLFACEPROC) \
     X(glFrontFace, PFNGLFRONTFACEPROC) \
-    X(glClearDepth, PFNGLCLEARDEPTHPROC)
+    X(glClearDepth, PFNGLCLEARDEPTHPROC) \
+    X(glScissor, PFNGLSCISSORPROC)
 
 int s_fails = 0;
 
@@ -326,6 +327,48 @@ int runChecks() {
         glDisable(GL_BLEND);
         glDepthMask(1);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    }
+    // 7. a scissored clear and a scissored draw land on the same rows (the
+    // game's copy clears; GL's y = 0 is the bottom row)
+    {
+        auto pixel = [&](int x, int y, uint8_t out[4]) { glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, out); };
+        auto report = [&](const char* what, const uint8_t got[4], const uint8_t want[4]) {
+            bool ok = true;
+            for (int i = 0; i < 4; i++) ok = ok && abs(int(got[i]) - int(want[i])) <= 2;
+            s_fails += !ok;
+            printf("%s dkgl %-44s got %3d %3d %3d %3d want %3d %3d %3d %3d\n", ok ? "PASS" : "FAIL", what, got[0], got[1],
+                   got[2], got[3], want[0], want[1], want[2], want[3]);
+        };
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glColorMask(1, 1, 1, 1);
+        glDisable(GL_SCISSOR_TEST);
+        glClearColor(1, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, 16, 4);  // the bottom four rows
+        glClearColor(0, 1, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        uint8_t bottom[4], top[4];
+        pixel(8, 1, bottom);
+        pixel(8, 14, top);
+        const uint8_t green[4] = {0, 255, 0, 255}, red[4] = {255, 0, 0, 255}, blue[4] = {0, 0, 255, 255};
+        report("scissored clear: bottom rows cleared", bottom, green);
+        report("scissored clear: top rows kept", top, red);
+        // a draw with the same scissor
+        GLuint p = program((std::string(kVsHead) + "void main() { gl_Position = vec4(a_pos, 1.0); v_c = a_clr; }\n").c_str(),
+                           "#version 330 core\nin vec4 v_c; out vec4 o_color; uniform vec4 u_col;\n"
+                           "void main() { o_color = u_col + v_c * 0.0; }\n");
+        glUseProgram(p);
+        const float bl[4] = {0, 0, 1, 1};
+        glUniform4fv(glGetUniformLocation(p, "u_col"), 1, bl);
+        glScissor(0, 12, 16, 4);  // the top four rows
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        pixel(8, 14, top);
+        pixel(8, 1, bottom);
+        report("scissored draw: top rows drawn", top, blue);
+        report("scissored draw: bottom rows kept", bottom, green);
+        glDisable(GL_SCISSOR_TEST);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     printf("dkgl checks: %d failed\n", s_fails);

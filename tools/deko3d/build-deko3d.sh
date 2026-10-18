@@ -5,6 +5,8 @@
 #
 # deko3d-alpha-dst-factor.patch: its blend state took the colour's
 # destination factor for alpha (the game's shadows drew solid).
+# deko3d-texture-cache-invalidate.patch: its texture cache invalidation
+# with a wait for idle wrote a register the GPU does not have.
 #
 # Building deko3d takes fincs' dekotools (dekodef: the GPU register
 # definitions to headers), built here too.

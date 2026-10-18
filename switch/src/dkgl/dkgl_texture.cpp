@@ -97,6 +97,16 @@ void barrierBeforeTransfer() {
 void barrierBeforeDraw() {
     uint32_t inval = 0;
     DkBarrier mode = DkBarrier_None;
+    // (SMS_DKGL_INVAL_EVERY=1: a full barrier and every cache invalidated
+    // before each draw, a test; =2 the texture cache only, waiting for idle)
+    static const int every = getenv("SMS_DKGL_INVAL_EVERY") ? atoi(getenv("SMS_DKGL_INVAL_EVERY")) : 0;
+    if (every == 1) {
+        mode = DkBarrier_Full;
+        inval |= DkInvalidateFlags_Image | DkInvalidateFlags_Shader | DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache;
+    } else if (every == 2) {
+        mode = DkBarrier_Fragments;  // with DkInvalidateFlags_Image: the waiting texture cache invalidate
+        inval |= DkInvalidateFlags_Image;
+    }
     if (g.transferred) {
         // copies wrote images and buffers: the texture cache and the
         // shaders' data (uniform) cache may hold what was there before

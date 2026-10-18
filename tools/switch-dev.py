@@ -239,8 +239,13 @@ def cmd_run(a):
     log = a.log or os.path.join(HERE, "logs", "switch", time.strftime("%Y%m%d-%H%M%S") + ".log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
     shots = None
-    # Auto-Sleep off (switch_main.cpp): asleep, the console is off Wi-Fi
+    # Auto-Sleep off (switch_main.cpp): asleep, the console is off Wi-Fi.
+    # The console's default clocks unless --fast-clocks (performance.cpp
+    # raises them to 1785/768 MHz otherwise): test runs drained the battery
+    # faster than a PC's USB port charges it.
     args = list(a.args) + [f"SMS_DEV_LISTEN={LINK_PORT}", "SMS_SWITCH_NO_AUTOSLEEP=1"]
+    if not a.fast_clocks and not any(x.startswith("SMS_SWITCH_CLOCKS=") for x in a.args):
+        args.append("SMS_SWITCH_CLOCKS=0")
     if a.shots:
         shots = os.path.splitext(log)[0] + "-shots"
         os.makedirs(shots, exist_ok=True)
@@ -337,6 +342,8 @@ def main():
     r.add_argument("--shots", type=float, default=0, help="a window capture every this many seconds (at 60 fps)")
     r.add_argument("--log", help="log file (default logs/switch/<time>.log)")
     r.add_argument("--keep", action="store_true", help="leave it running afterwards")
+    r.add_argument("--fast-clocks", action="store_true",
+                   help="the game's raised CPU/GPU clocks (fps measurements); default: the console's own, to save battery")
     r.add_argument("--quiet", action="store_true", help="only keep the log, do not print it")
     s = sub.add_parser("shot", help="a screenshot (JPEG)")
     s.add_argument("out", nargs="?", default="switch-shot.jpg")
