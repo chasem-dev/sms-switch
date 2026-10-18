@@ -119,7 +119,88 @@ Delfino Plaza on the Switch).
          s_mqFetching[par][slot] = true;
          s_mqReady[par][slot].store(0);
          const GLuint q = s_mq[par][slot];
-@@ -2414,13 +2427,24 @@
+@@ -2372,33 +2385,77 @@
+ struct WbFetch {
+     std::atomic<int> ready{0};
+     bool ok = false;
++    uint64_t hash = 0;  // of bytes, made on the GL thread
+     std::vector<uint8_t> bytes;
+ };
+ struct PendingWriteBack {
+     const void* dest;
+     uint32_t bytes;
+-    uint64_t hash;
++    uint64_t hash;       // of the destination when the copy was issued
+     GLuint pbo;
+     GLsync fence;
+     uint32_t readBytes;  // the pixel buffer's size
+     uint32_t frame;
+     bool cancelled;
+     WbFetch* fetch;      // the GL thread's read of it, or null
++    uint32_t clock;      // writeClock() when the copy was issued
+ };
+ static std::vector<PendingWriteBack> s_writeBacks;
+ static std::vector<GLuint> s_freePbos;
+ 
++// The game's own bytes at a copy's destination must not be overwritten by a
++// write-back that comes later, so a write-back is stored only if the
++// destination still holds what it did when the copy was issued. Hashing it
++// at both ends cost the game's thread more than any other part of a copy
++// (the plaza writes back three, 330 KiB, every frame), so the write stamps
++// answer instead where they can: what the last write-back stored at a
++// destination (hashed on the GL thread as it came in) is still there while no
++// write is stamped on it since, and nothing changed it while no write is
++// stamped after the copy. Every kWbRecheckFrames-th frame hashes as before;
++// SMS_GX_HASH_ALWAYS=1 always does.
++struct StoredWriteBack {
++    uint64_t hash;
++    uint32_t clock;  // writeClock() after storing it
++    uint32_t bytes;
++};
++static std::unordered_map<const void*, StoredWriteBack> s_storedWriteBacks;
++enum : uint32_t { kWbRecheckFrames = 16 };
++
++static bool wbTrustStamps(uint32_t frame) { return trustWriteStamps() && frame % kWbRecheckFrames != 0; }
++
++static uint64_t writeBackDestHash(const void* dest, uint32_t bytes) {
++    auto it = s_storedWriteBacks.find(dest);
++    if (it != s_storedWriteBacks.end() && it->second.bytes == bytes && wbTrustStamps(s_frameNo) &&
++        unwrittenSince(dest, bytes, it->second.clock))
++        return it->second.hash;
++    return hashBytes(dest, bytes);
++}
++
++// An earlier copy to the same place that was still pending when this one was
++// issued has been stored since: what it stored counts as what was there.
++static bool writeBackDestUnchanged(const PendingWriteBack& w) {
++    auto it = s_storedWriteBacks.find(w.dest);
++    const bool after = it != s_storedWriteBacks.end() && it->second.bytes == w.bytes &&
++                       int32_t(it->second.clock - w.clock) > 0;
++    if (wbTrustStamps(w.frame) && unwrittenSince(w.dest, w.bytes, after ? it->second.clock : w.clock)) return true;
++    const uint64_t h = hashBytes(w.dest, w.bytes);
++    return h == w.hash || (after && h == it->second.hash);
++}
++
+ static void resolveWriteBack(PendingWriteBack& w) {
+     if (w.fetch) {
+         {
+             GxTimer tw(&s_waitSeconds);
+             glt::waitFlag(w.fetch->ready);
+         }
+-        if (!w.cancelled && w.fetch->ok && hashBytes(w.dest, w.bytes) == w.hash)
++        if (!w.cancelled && w.fetch->ok && writeBackDestUnchanged(w)) {
+             storeEncoded(w.fetch->bytes.data(), w.dest, w.bytes);
++            s_storedWriteBacks[w.dest] = StoredWriteBack{w.fetch->hash, writeClock(), w.bytes};
++        }
+         delete w.fetch;
+         w.fetch = nullptr;
+-    } else if (!w.cancelled && hashBytes(w.dest, w.bytes) == w.hash) {
++    } else if (!w.cancelled && writeBackDestUnchanged(w)) {
++        s_storedWriteBacks.erase(w.dest);
+         const void* px;
+         {
+             GxTimer tw(&s_waitSeconds);
+@@ -2414,13 +2471,24 @@
      s_freePbos.push_back(w.pbo);
  }
  
@@ -147,7 +228,7 @@ Delfino Plaza on the Switch).
      }
      s_writeBacks.resize(keep);
  }
-@@ -2447,13 +2471,17 @@
+@@ -2447,13 +2515,17 @@
      }
      // A copy to the same place supersedes one of this frame; one from an
      // earlier frame (most games copy to the same buffer every frame) is
@@ -168,6 +249,25 @@ Delfino Plaza on the Switch).
              w.cancelled = true;
              resolveWriteBack(w);
          }
+@@ -2470,8 +2542,8 @@
+     glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(readBytes), nullptr, GL_STREAM_READ);
+     glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+-    PendingWriteBack w{dest, bytes, hashBytes(dest, bytes), pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
+-                       readBytes, s_frameNo, false, nullptr};
++    PendingWriteBack w{dest,     bytes,     writeBackDestHash(dest, bytes), pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
++                       readBytes, s_frameNo, false, nullptr, writeClock()};
+     s_writeBacks.push_back(w);
+ }
+ 
+@@ -2496,6 +2568,7 @@
+             bindPack(pbo, &prev);
+             if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
+                 memcpy(f->bytes.data(), px, n);
++                f->hash = hashBytes(f->bytes.data(), n);
+                 f->ok = true;
+                 glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+             }
 --- a/platform/os/os_thread.cpp
 +++ b/platform/os/os_thread.cpp
 @@ -66,9 +66,23 @@
