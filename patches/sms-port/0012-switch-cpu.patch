@@ -119,7 +119,50 @@ Delfino Plaza on the Switch).
          s_mqFetching[par][slot] = true;
          s_mqReady[par][slot].store(0);
          const GLuint q = s_mq[par][slot];
-@@ -2372,33 +2385,77 @@
+@@ -2083,22 +2096,24 @@
+             glVertexAttribI4ui(14, m[0], m[1], m[2], 0);
+         }
+     }
+-    // this batch's XF block (when it changed), vertices and indices, in one map
+-    static uint32_t xfBlock[736];
++    // this batch's XF block (when it changed), vertices and indices, in one
++    // map; the block's four parts go straight from XF memory, one after
++    // another (2.9 KiB, for most batches: copying it twice was the most of
++    // the game thread's memcpy)
++    const size_t kXfBlockBytes = 736 * 4;
+     static size_t s_xfOffset = 0;
+-    StreamPiece pc[3];
++    StreamPiece pc[6];
+     int np = 0;
+-    size_t worst = sizeof(xfBlock) + size_t(s_uboAlign) + s_bdata.size + s_bstride + s_bidx.size * 4 + 4;
++    size_t worst = kXfBlockBytes + size_t(s_uboAlign) + s_bdata.size + s_bstride + s_bidx.size * 4 + 4;
+     // Starting a new lap of the stream overwrites older data, possibly the
+     // block still bound: write it again with this batch.
+     if (s_stream.wouldWrap(worst)) s_xfDirty = true;
+     bool xfWritten = s_xfDirty;
+     if (s_xfDirty) {
+-        memcpy(xfBlock, &g.xfMem[0], 256 * 4);
+-        memcpy(xfBlock + 256, &g.xfMem[0x400], 96 * 4);
+-        memcpy(xfBlock + 352, &g.xfMem[0x500], 256 * 4);
+-        memcpy(xfBlock + 608, &g.xfMem[0x600], 128 * 4);
+-        pc[np++] = {xfBlock, sizeof(xfBlock), size_t(s_uboAlign), 0};
++        pc[np++] = {&g.xfMem[0], 256 * 4, size_t(s_uboAlign), 0};
++        pc[np++] = {&g.xfMem[0x400], 96 * 4, 1, 0};
++        pc[np++] = {&g.xfMem[0x500], 256 * 4, 1, 0};
++        pc[np++] = {&g.xfMem[0x600], 128 * 4, 1, 0};
+         s_xfDirty = false;
+     }
+     const bool streamed = s_bidx.size != 0;
+@@ -2109,7 +2124,7 @@
+     if (np) s_stream.appendAll(pc, np);
+     if (xfWritten) s_xfOffset = pc[0].at;
+     if (xfWritten || g_glc.uniformBuffer == ~0u) {
+-        glBindBufferRange(GL_UNIFORM_BUFFER, 0, s_stream.buf, GLintptr(s_xfOffset), sizeof(xfBlock));
++        glBindBufferRange(GL_UNIFORM_BUFFER, 0, s_stream.buf, GLintptr(s_xfOffset), GLsizeiptr(kXfBlockBytes));
+         g_glc.uniformBuffer = s_stream.buf;  // the range bind also sets the generic binding
+     }
+     const size_t vOff = streamed ? pc[np - 2].at : 0, iOff = streamed ? pc[np - 1].at : 0;
+@@ -2372,33 +2387,77 @@
  struct WbFetch {
      std::atomic<int> ready{0};
      bool ok = false;
@@ -200,7 +243,7 @@ Delfino Plaza on the Switch).
          const void* px;
          {
              GxTimer tw(&s_waitSeconds);
-@@ -2414,13 +2471,24 @@
+@@ -2414,13 +2473,24 @@
      s_freePbos.push_back(w.pbo);
  }
  
@@ -228,7 +271,7 @@ Delfino Plaza on the Switch).
      }
      s_writeBacks.resize(keep);
  }
-@@ -2447,13 +2515,17 @@
+@@ -2447,13 +2517,17 @@
      }
      // A copy to the same place supersedes one of this frame; one from an
      // earlier frame (most games copy to the same buffer every frame) is
@@ -249,7 +292,7 @@ Delfino Plaza on the Switch).
              w.cancelled = true;
              resolveWriteBack(w);
          }
-@@ -2470,8 +2542,8 @@
+@@ -2470,8 +2544,8 @@
      glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(readBytes), nullptr, GL_STREAM_READ);
      glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
@@ -260,7 +303,7 @@ Delfino Plaza on the Switch).
      s_writeBacks.push_back(w);
  }
  
-@@ -2496,6 +2568,7 @@
+@@ -2496,6 +2570,7 @@
              bindPack(pbo, &prev);
              if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
                  memcpy(f->bytes.data(), px, n);
