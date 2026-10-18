@@ -261,6 +261,15 @@ bool validateDraw() {
             n = 3;
         }
         dkCmdBufBindShaders(c, DkStageFlag_GraphicsMask, shaders, uint32_t(n));
+        // the clip distances the program writes, and only those (deko3d
+        // enables all eight: the others held what earlier programs left,
+        // and dropped the title logo and part of its sky)
+        static uint32_t clipMask = 0xFF;
+        if (p->clipMask != clipMask) {
+            clipMask = p->clipMask;
+            const uint32_t word = 0x544u | (clipMask << 16) | (4u << 29);  // 3D ClipDistanceEnable, inline
+            dkCmdBufReplayCmds(c, &word, 1);
+        }
         g.boundProgram = p;
         g.boundProgramVersion = p->version;
         g.boundTexCount[0] = g.boundTexCount[1] = 0;

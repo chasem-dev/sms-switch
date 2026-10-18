@@ -249,7 +249,9 @@ def cmd_run(a):
     if a.shots:
         shots = os.path.splitext(log)[0] + "-shots"
         os.makedirs(shots, exist_ok=True)
-        args.append(f"SMS_WINDOW_SHOTS=+{max(1, round(a.shots * 60))}")
+        # (frames named with SMS_WINDOW_SHOTS among the arguments instead)
+        if not any(x.startswith("SMS_WINDOW_SHOTS=") for x in a.args):
+            args.append(f"SMS_WINDOW_SHOTS=+{max(1, round(a.shots * 60))}")
 
     bot = connect_bot(a.ip, False)
     if bot:

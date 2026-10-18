@@ -150,6 +150,23 @@ void dumpProgram(uint64_t key, const GlslProgram& p) {
 }
 
 // Makes the DkShader for one DKSH module in code memory.
+// The clip distances a shader writes (gl_ClipDistance[n] = ...), one bit
+// each: the GPU discards pixels by every enabled clip distance, and one the
+// last stage does not write holds whatever an earlier program left there.
+uint32_t clipDistanceMask(const std::string& src) {
+    uint32_t mask = 0;
+    for (size_t at = src.find("gl_ClipDistance["); at != std::string::npos; at = src.find("gl_ClipDistance[", at + 1)) {
+        const size_t close = src.find(']', at);
+        if (close == std::string::npos) break;
+        const char* e = src.c_str() + close + 1;
+        while (*e == ' ') e++;
+        if (*e != '=' || e[1] == '=') continue;  // a write, not a read or comparison
+        const int n = atoi(src.c_str() + at + 16);
+        if (n >= 0 && n < 8) mask |= 1u << n;
+    }
+    return mask;
+}
+
 bool loadShader(const uint8_t* dksh, uint32_t size, DkShader* out, Alloc* code, uint32_t* codeUsed) {
     if (size < 24) return false;
     uint32_t hdr[6];
@@ -212,6 +229,7 @@ bool linkProgram(Program* p) {
         return false;
     }
     p->hasGs = !p->glsl.gs.empty();
+    p->clipMask = clipDistanceMask(p->hasGs ? p->glsl.gs : p->glsl.vs);
     const uint64_t key = keyOf(p->glsl);
     p->key = key;
     dumpProgram(key, p->glsl);

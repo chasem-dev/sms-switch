@@ -153,33 +153,40 @@ void readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum ty
     if (!t || !realize(t) || w <= 0 || h <= 0) return;
     const uint32_t bpp = 4;  // RGBA8 and 24-bit depth
     const uint32_t rowBytes = uint32_t(w) * bpp;
+    // the part inside the image (GL leaves the rest of the destination
+    // alone; a copy reaching outside the image hangs the GPU)
+    const int lw = int(std::max(1u, t->levels[0].w >> level)), lh = int(std::max(1u, t->levels[0].h >> level));
+    const int x0 = std::max(x, 0), y0 = std::max(y, 0), x1 = std::min(x + w, lw), y1 = std::min(y + h, lh);
+    if (x1 <= x0 || y1 <= y0) return;
+    const uint32_t cw = uint32_t(x1 - x0), ch = uint32_t(y1 - y0), skipX = uint32_t(x0 - x), skipY = uint32_t(y0 - y);
     Buffer* pack = g.buffers.get(g.packBuffer);
     barrierBeforeTransfer();
     DkImageView v = viewOf(t, level);
-    DkImageRect rect = {uint32_t(x), uint32_t(y), 0, uint32_t(w), uint32_t(h), 1};
+    DkImageRect rect = {uint32_t(x0), uint32_t(y0), 0, cw, ch, 1};
     if (pack && pack->mem) {
         // into the buffer, as the image holds them (the renderer reads depth as
         // its high 24 bits, where Z24S8 keeps it)
-        DkCopyBuf dst = {pack->mem.gpu + reinterpret_cast<uintptr_t>(pixels), rowBytes, 0};
+        DkCopyBuf dst = {pack->mem.gpu + reinterpret_cast<uintptr_t>(pixels) + skipY * rowBytes + skipX * bpp, rowBytes, 0};
         dkCmdBufCopyImageToBuffer(g_dev.cmd, &v, &rect, &dst, 0);
         g.transferred = true;
         return;
     }
-    Alloc tmp = g_dev.heaps[HEAP_READBACK].alloc(rowBytes * uint32_t(h), 256);
+    const uint32_t tmpRow = cw * bpp;
+    Alloc tmp = g_dev.heaps[HEAP_READBACK].alloc(tmpRow * ch, 256);
     if (!tmp) return;
-    DkCopyBuf dst = {tmp.gpu, rowBytes, 0};
+    DkCopyBuf dst = {tmp.gpu, tmpRow, 0};
     dkCmdBufCopyImageToBuffer(g_dev.cmd, &v, &rect, &dst, 0);
     submit(true);
     dkMemBlockFlushCpuCache(tmp.block, tmp.offset, tmp.size);
     const uint32_t align = uint32_t(std::max(1, g.packAlign));
     const uint32_t rowLen = g.packRowLength ? uint32_t(g.packRowLength) : uint32_t(w);
-    const uint32_t outBpp = format == GL_DEPTH_COMPONENT ? 4 : type == GL_UNSIGNED_BYTE && format == GL_RGBA ? 4 : 4;
-    const uint32_t outStride = (rowLen * outBpp + align - 1) / align * align;
-    for (int r = 0; r < h; r++) {
-        uint8_t* out = static_cast<uint8_t*>(pixels) + size_t(r) * outStride;
-        const uint8_t* in = tmp.cpu + size_t(r) * rowBytes;
+    const uint32_t outStride = (rowLen * 4 + align - 1) / align * align;
+    (void)type;
+    for (uint32_t r = 0; r < ch; r++) {
+        uint8_t* out = static_cast<uint8_t*>(pixels) + size_t(r + skipY) * outStride + skipX * 4;
+        const uint8_t* in = tmp.cpu + size_t(r) * tmpRow;
         if (format == GL_DEPTH_COMPONENT) {
-            for (int i = 0; i < w; i++) {
+            for (uint32_t i = 0; i < cw; i++) {
                 uint32_t raw;
                 memcpy(&raw, in + i * 4, 4);
                 const uint32_t d24 = raw >> 8;
@@ -187,14 +194,14 @@ void readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum ty
                 memcpy(out + i * 4, &v32, 4);
             }
         } else if (format == GL_BGRA) {
-            for (int i = 0; i < w; i++) {
+            for (uint32_t i = 0; i < cw; i++) {
                 out[i * 4 + 0] = in[i * 4 + 2];
                 out[i * 4 + 1] = in[i * 4 + 1];
                 out[i * 4 + 2] = in[i * 4 + 0];
                 out[i * 4 + 3] = in[i * 4 + 3];
             }
         } else {
-            memcpy(out, in, rowBytes);
+            memcpy(out, in, tmpRow);
         }
     }
     g_dev.heaps[HEAP_READBACK].free(tmp);

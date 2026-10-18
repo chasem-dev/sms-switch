@@ -252,6 +252,7 @@ struct Program {
     std::vector<int> blockBindings;    // block index -> GL uniform buffer binding
     uint32_t version = 1;              // bumped when samplers or blocks are re-pointed
     uint32_t attribMask = 0;           // vertex input locations read
+    uint32_t clipMask = 0;             // the clip distances its last stage before rasterizing writes
     uint64_t key = 0;                  // the compiled-program cache key
     bool traced = false;               // its source is in the log (SMS_DKGL_TRACE_SRC)
 };
