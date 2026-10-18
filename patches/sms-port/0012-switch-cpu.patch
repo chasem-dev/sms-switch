@@ -6,6 +6,44 @@ has read it, or a frame later. Waiting for the previous frame's results kept
 the game from starting a frame while the GPU caught up (about 4 ms a frame in
 Delfino Plaza on the Switch).
 
+--- a/platform/gx/src/gx_hires.cpp
++++ b/platform/gx/src/gx_hires.cpp
+@@ -1403,6 +1403,23 @@
+ // request/look up replacements; uploads happen at frame boundaries/loading.
+ // SMS_TEXTURE_PACK_SYNC=1 decodes on the spot (repeatable captures).
+ GLuint hiresTexture(const std::string& name, int unit, uint32_t gxW, uint32_t gxH, int* scale) {
++    // A texture bound again in the frame it was found in (most are, by every
++    // batch that draws with it) takes what was found: looking the name up
++    // hashed it each time, half of what the pack cost the game's thread.
++    // Keyed by the cache entry's name, which stays where it is; replacements
++    // are only freed between frames (hiresEndFrame, hiresSetActive).
++    struct Seen {
++        uint32_t frame;
++        GLuint tex;
++        int scale;
++        std::string name;
++    };
++    static std::unordered_map<const std::string*, Seen> s_seen;
++    auto seen = s_seen.find(&name);
++    if (seen != s_seen.end() && seen->second.frame == s_frame && seen->second.name == name) {
++        *scale = seen->second.scale;
++        return seen->second.tex;
++    }
+     auto it = s_repl.find(name);
+     if (it == s_repl.end()) {
+         s_repl[name];
+@@ -1423,6 +1440,11 @@
+     if (it->second.state != Replacement::READY) return 0;
+     it->second.used = s_frame;
+     *scale = it->second.scale;
++    Seen& sn = s_seen[&name];
++    sn.frame = s_frame;
++    sn.tex = it->second.tex;
++    sn.scale = it->second.scale;
++    sn.name = name;
+     return it->second.tex;
+ }
+ 
 --- a/platform/gx/src/gx_fifo.cpp
 +++ b/platform/gx/src/gx_fifo.cpp
 @@ -24,7 +24,14 @@
@@ -26,7 +64,85 @@ Delfino Plaza on the Switch).
          mach_timebase_info_data_t tb;
 --- a/platform/gx/src/gx_render.cpp
 +++ b/platform/gx/src/gx_render.cpp
-@@ -1798,16 +1798,19 @@
+@@ -16,6 +16,7 @@
+ #include <time.h>
+ #include <string.h>
+ #include <atomic>
++#include <deque>
+ #include <unordered_map>
+ 
+ namespace gx {
+@@ -143,6 +144,30 @@
+ // never touches data a queued draw still reads. Replaces a glBufferData
+ // reallocation (or a glBufferSubData into a buffer every queued draw uses) per
+ // batch, and a map per piece (map/unmap were half of all GL calls).
++static uint32_t frameNumber();  // s_frameNo, from before it is declared
++
++// The newest frame the GPU has finished, as the GL thread finds it: a fence at
++// the end of each shown frame (frameShownFence), polled there without
++// waiting. ~0u until the first one passes.
++static std::atomic<uint32_t> s_gpuDoneFrame{~0u};
++static bool gpuFinishedFrame(uint32_t frame) {
++    const uint32_t done = s_gpuDoneFrame.load(std::memory_order_acquire);
++    return glt::active() && done != ~0u && int32_t(done - frame) >= 0;
++}
++static void frameShownFence(uint32_t frame) {
++    glt::post([frame] {  // on the GL thread
++        static std::deque<std::pair<uint32_t, GLsync>> pending;
++        pending.emplace_back(frame, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
++        while (!pending.empty()) {
++            const GLenum r = glClientWaitSync(pending.front().second, 0, 0);
++            if (r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED) break;
++            s_gpuDoneFrame.store(pending.front().first, std::memory_order_release);
++            glDeleteSync(pending.front().second);
++            pending.pop_front();
++        }
++    });
++}
++
+ struct StreamPiece {
+     const void* data;
+     size_t bytes, align;
+@@ -153,6 +178,7 @@
+     GLuint buf = 0;
+     size_t size = 0, pos = 0;
+     GLsync fence[kSegments] = {};
++    uint32_t fenceFrame[kSegments] = {};  // s_frameNo when each was made
+ 
+     // With ARB_buffer_storage (GL 4.4; not macOS) the buffer stays mapped:
+     // writes go straight into it, without a map/unmap pair per batch.
+@@ -201,10 +227,21 @@
+     // segments from `unfenced` through `last`.
+     void fenceThrough(size_t last) {
+         for (size_t sg = unfenced; sg <= last && sg < kSegments; sg++)
+-            if (!fence[sg]) fence[sg] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++            if (!fence[sg]) {
++                fence[sg] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++                fenceFrame[sg] = frameNumber();
++            }
+     }
+     void waitSegment(size_t seg) {
+         if (!fence[seg]) return;
++        // A lap of the ring is many frames: its fence has long passed, and
++        // asking (glClientWaitSync through the GL thread) only waited for that
++        // thread to catch up, several ms at 2x each time.
++        if (gpuFinishedFrame(fenceFrame[seg])) {
++            glDeleteSync(fence[seg]);
++            fence[seg] = 0;
++            return;
++        }
+         GxTimer tw(&s_waitSeconds);
+         glClientWaitSync(fence[seg], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+         glDeleteSync(fence[seg]);
+@@ -1781,6 +1818,7 @@
+ // from the same read one frame earlier instead (as Dolphin does), which the
+ // game cannot tell apart; SMS_GX_SYNC_READS=1 goes back to synchronous reads.
+ static uint32_t s_frameNo = 0;   // display copies so far
++static uint32_t frameNumber() { return s_frameNo; }
+ uint32_t g_displayFrames = 0;    // the same, for the rest of sms_gx
+ static uint32_t s_drawGen = 0;   // bumped by anything that changes the EFB
+ static bool asyncReads() {
+@@ -1798,16 +1836,19 @@
  // so the count is the samples that passed plus 4 per triangle. Copy passes
  // in between are left out: they end the running query, which is summed at
  // the read. Each clear/read pair of a frame is a slot; a slot that drew the
@@ -55,7 +171,7 @@ Delfino Plaza on the Switch).
  
  static uint32_t takeFetchedMetric(int par, int slot) {
      {
-@@ -1815,9 +1818,10 @@
+@@ -1815,9 +1856,10 @@
          glt::waitFlag(s_mqReady[par][slot]);
      }
      s_mqFetching[par][slot] = false;
@@ -67,7 +183,7 @@ Delfino Plaza on the Switch).
  static int s_mqSlot = -1;
  static uint32_t s_mqSlotFrame = ~0u;
  static bool s_pixActive = false, s_pixTaint = false;
-@@ -1863,9 +1867,10 @@
+@@ -1863,9 +1905,10 @@
          s_mqSlot = -1;
      }
      s_mqSlot++;
@@ -79,7 +195,7 @@ Delfino Plaza on the Switch).
          if (!s_mq[cur][s_mqSlot]) glGenQueries(1, &s_mq[cur][s_mqSlot]);
          s_pixCur = s_mq[cur][s_mqSlot];
          s_pixCurPooled = false;
-@@ -1885,15 +1890,22 @@
+@@ -1885,15 +1928,22 @@
      if (!s_ready || !s_pixActive) return 0;
      glEndQuery(GL_SAMPLES_PASSED);
      uint64_t samples = 0;
@@ -106,7 +222,7 @@ Delfino Plaza on the Switch).
              fromPrev = true;
          }
      }
-@@ -1917,9 +1929,10 @@
+@@ -1917,9 +1967,10 @@
  
  static void prefetchMetrics() {
      const uint32_t frame = s_frameNo - 1;
@@ -119,7 +235,7 @@ Delfino Plaza on the Switch).
          s_mqFetching[par][slot] = true;
          s_mqReady[par][slot].store(0);
          const GLuint q = s_mq[par][slot];
-@@ -2083,22 +2096,24 @@
+@@ -2083,22 +2134,24 @@
              glVertexAttribI4ui(14, m[0], m[1], m[2], 0);
          }
      }
@@ -153,7 +269,7 @@ Delfino Plaza on the Switch).
          s_xfDirty = false;
      }
      const bool streamed = s_bidx.size != 0;
-@@ -2109,7 +2124,7 @@
+@@ -2109,7 +2162,7 @@
      if (np) s_stream.appendAll(pc, np);
      if (xfWritten) s_xfOffset = pc[0].at;
      if (xfWritten || g_glc.uniformBuffer == ~0u) {
@@ -162,7 +278,7 @@ Delfino Plaza on the Switch).
          g_glc.uniformBuffer = s_stream.buf;  // the range bind also sets the generic binding
      }
      const size_t vOff = streamed ? pc[np - 2].at : 0, iOff = streamed ? pc[np - 1].at : 0;
-@@ -2372,33 +2387,77 @@
+@@ -2372,33 +2425,77 @@
  struct WbFetch {
      std::atomic<int> ready{0};
      bool ok = false;
@@ -243,7 +359,7 @@ Delfino Plaza on the Switch).
          const void* px;
          {
              GxTimer tw(&s_waitSeconds);
-@@ -2414,13 +2473,24 @@
+@@ -2414,13 +2511,24 @@
      s_freePbos.push_back(w.pbo);
  }
  
@@ -271,7 +387,7 @@ Delfino Plaza on the Switch).
      }
      s_writeBacks.resize(keep);
  }
-@@ -2447,13 +2517,17 @@
+@@ -2447,13 +2555,17 @@
      }
      // A copy to the same place supersedes one of this frame; one from an
      // earlier frame (most games copy to the same buffer every frame) is
@@ -292,7 +408,7 @@ Delfino Plaza on the Switch).
              w.cancelled = true;
              resolveWriteBack(w);
          }
-@@ -2470,8 +2544,8 @@
+@@ -2470,8 +2582,8 @@
      glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(readBytes), nullptr, GL_STREAM_READ);
      glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
@@ -303,7 +419,7 @@ Delfino Plaza on the Switch).
      s_writeBacks.push_back(w);
  }
  
-@@ -2496,6 +2570,7 @@
+@@ -2496,6 +2608,7 @@
              bindPack(pbo, &prev);
              if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
                  memcpy(f->bytes.data(), px, n);
@@ -311,6 +427,69 @@ Delfino Plaza on the Switch).
                  f->ok = true;
                  glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
              }
+@@ -2643,6 +2756,7 @@
+     // presenting (the hook) is timed apart from sms_gx: GXPC_GetTimes
+     if (disp && g_displayCopyHook) g_displayCopyHook(dest);
+     if (disp && glt::active()) {  // the frame is shown: the GL thread reads its results (see gx_glthread.h)
++        frameShownFence(s_frameNo - 1);
+         prefetchWriteBacks();
+         prefetchPeeks();
+         prefetchMetrics();
+@@ -2773,7 +2887,13 @@
+     std::atomic<int> ready{0};
+     const uint8_t* fetched = nullptr;
+ };
+-static PeekSnap s_peek[2][kPeekGroups][2];  // [frame parity][group][colour, depth]
++// Peeks are answered from an earlier frame's snapshot: the newest that has
++// come back of the two frames before, waiting only for the older one. At 2x
++// the frame before is often still on the GPU when the game peeks (Mario's
++// visibility test, every frame), and waiting for it cost the game's thread
++// about 2 ms a frame.
++enum { kPeekFrames = 3 };
++static PeekSnap s_peek[kPeekFrames][kPeekGroups][2];  // [frame % kPeekFrames][group][colour, depth]
+ static uint32_t s_peekDrawGen = ~0u, s_peekFrame = ~0u, s_peekIssued = 0;
+ static int s_peekGroup = -1;
+ 
+@@ -2795,7 +2915,7 @@
+     const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
+     for (int gi = 0; gi < kPeekGroups; gi++)
+         for (int t = 0; t < 2; t++) {
+-            PeekSnap& p = s_peek[frame & 1][gi][t];
++            PeekSnap& p = s_peek[frame % kPeekFrames][gi][t];
+             if (!p.pbo || p.frame != frame || p.map || p.fetching) continue;
+             p.fetching = true;
+             p.ready.store(0);
+@@ -2876,7 +2996,7 @@
+     }
+     if (s_peekGroup >= kPeekGroups) return peekSync(x, y, depth);
+     const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
+-    int cur = s_frameNo & 1, t = depth ? 1 : 0;
++    int cur = int(s_frameNo % kPeekFrames), t = depth ? 1 : 0;
+     if (!(s_peekIssued & (1u << t))) {
+         s_peekIssued |= 1u << t;
+         PeekSnap& now = s_peek[cur][s_peekGroup][t];
+@@ -2898,8 +3018,19 @@
+         now.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+         now.frame = s_frameNo;
+     }
+-    PeekSnap& prev = s_peek[cur ^ 1][s_peekGroup][t];
+-    if (prev.pbo && prev.frame + 1 == s_frameNo) {
++    PeekSnap* earlier[kPeekFrames] = {};  // by age, those of the frames before
++    for (uint32_t age = 1; age < kPeekFrames; age++) {
++        PeekSnap& p = s_peek[(s_frameNo + kPeekFrames - age) % kPeekFrames][s_peekGroup][t];
++        if (p.pbo && p.frame + age == s_frameNo) earlier[age] = &p;
++    }
++    PeekSnap* use = nullptr;
++    for (uint32_t age = 1; age < kPeekFrames && !use; age++)  // the newest already in
++        if (earlier[age] && (earlier[age]->map || (earlier[age]->fetching && earlier[age]->ready.load())))
++            use = earlier[age];
++    for (uint32_t age = kPeekFrames - 1; age >= 1 && !use; age--)  // else the oldest there is, waited for
++        use = earlier[age];
++    if (use) {
++        PeekSnap& prev = *use;
+         takeFetchedPeek(prev);
+         if (!prev.map) {
+             GxTimer tw(&s_waitSeconds);
 --- a/platform/os/os_thread.cpp
 +++ b/platform/os/os_thread.cpp
 @@ -66,9 +66,23 @@

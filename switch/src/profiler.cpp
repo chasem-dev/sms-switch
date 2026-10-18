@@ -17,7 +17,7 @@ void sms_switch_profile_add(Handle h, const char* label);
 
 namespace {
 constexpr int kMaxThreads = 32;
-constexpr int kDepth = 5;  // the address and four return addresses
+constexpr int kDepth = 8;  // the address and seven return addresses
 struct Sampled {
 	Handle handle;
 	char label[24];
@@ -106,9 +106,11 @@ void sample_loop(void*)
 		const size_t keep = std::min<size_t>(v.size(), 30000);
 		for (size_t k = 0; k < keep; k++) {
 			const Stack& s = v[k].first;
-			fprintf(stderr, "[switch] profile %d %u %llx %llx %llx %llx %llx\n", i, v[k].second,
-			        (unsigned long long)s.a[0], (unsigned long long)s.a[1], (unsigned long long)s.a[2],
-			        (unsigned long long)s.a[3], (unsigned long long)s.a[4]);
+			char line[256];
+			int n = snprintf(line, sizeof line, "[switch] profile %d %u", i, v[k].second);
+			for (int d = 0; d < kDepth; d++)
+				n += snprintf(line + n, sizeof line - size_t(n), " %llx", (unsigned long long)s.a[d]);
+			fprintf(stderr, "%s\n", line);
 		}
 	}
 	fprintf(stderr, "[switch] profile: done\n");

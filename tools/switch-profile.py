@@ -49,10 +49,10 @@ def main():
             labels[int(m.group(1))] = m.group(2)
             totals[int(m.group(1))] = int(m.group(3))
             continue
-        m = re.search(r"profile (\d+) (\d+) ([0-9a-f]+) ([0-9a-f]+) ([0-9a-f]+) ([0-9a-f]+) ([0-9a-f]+)$", line.strip())
+        m = re.search(r"profile (\d+) (\d+)((?: [0-9a-f]+)+)$", line.strip())
         if m:
             t = int(m.group(1))
-            stacks.setdefault(t, []).append((int(m.group(2)), [int(m.group(i), 16) for i in range(3, 8)]))
+            stacks.setdefault(t, []).append((int(m.group(2)), [int(x, 16) for x in m.group(3).split()]))
     addrs, names = symbols(a.elf)
 
     def name(pc):
