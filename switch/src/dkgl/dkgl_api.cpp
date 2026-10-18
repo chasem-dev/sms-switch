@@ -133,8 +133,29 @@ void drawElements(GLenum mode, GLsizei count, GLenum type, const void* indices, 
     const DkIdxFormat fmt = size == 4 ? DkIdxFormat_Uint32 : size == 2 ? DkIdxFormat_Uint16 : DkIdxFormat_Uint8;
     const uintptr_t off = reinterpret_cast<uintptr_t>(indices);
     dkCmdBufBindIdxBuffer(g_dev.cmd, fmt, ib->mem.gpu);
-    dkCmdBufDrawIndexed(g_dev.cmd, primitiveOf(mode), uint32_t(count), 1, uint32_t(off / size), baseVertex, 0);
+    // (SMS_DKGL_REBASE=1: the base vertex folded into the vertex buffers'
+    // addresses, the draw's vertex indices kept small; a test)
+    static const bool rebase = getenv("SMS_DKGL_REBASE") && atoi(getenv("SMS_DKGL_REBASE"));
+    GLint drawBase = baseVertex;
+    if (rebase && baseVertex > 0) {
+        const Program* p = g.programs.get(g.program);
+        const VertexArray* va = currentVao();
+        for (int loc = 0; p && loc < 16; loc++) {
+            if (!(p->attribMask & (1u << loc))) continue;
+            const VertexAttrib& a = va->attribs[loc];
+            const Buffer* b = a.enabled ? g.buffers.get(a.buffer) : nullptr;
+            if (!b || !b->mem || !a.stride) continue;
+            const uint64_t start = uint64_t(a.offset) + uint64_t(baseVertex) * uint64_t(a.stride);
+            if (start >= b->size) continue;
+            const DkBufExtents e = {b->mem.gpu + start, uint32_t(b->size - start)};
+            dkCmdBufBindVtxBuffers(g_dev.cmd, uint32_t(loc), &e, 1);
+        }
+        drawBase = 0;
+        g.boundVao = nullptr;  // the next draw binds them again
+    }
+    dkCmdBufDrawIndexed(g_dev.cmd, primitiveOf(mode), uint32_t(count), 1, uint32_t(off / size), drawBase, 0);
     traceDraw("indexed", mode, count, uint32_t(off / size), baseVertex, ib->mem.gpu + off);
+    checkDrawInputs(type, indices, count, 0, baseVertex);
     drawn();
 }
 
@@ -159,6 +180,11 @@ void readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum ty
     const int x0 = std::max(x, 0), y0 = std::max(y, 0), x1 = std::min(x + w, lw), y1 = std::min(y + h, lh);
     if (x1 <= x0 || y1 <= y0) return;
     const uint32_t cw = uint32_t(x1 - x0), ch = uint32_t(y1 - y0), skipX = uint32_t(x0 - x), skipY = uint32_t(y0 - y);
+    static bool said = false;
+    if (!said && (int(cw) != w || int(ch) != h)) {
+        said = true;
+        logf("read clipped to its image: %dx%d at %d,%d of %dx%d", w, h, x, y, lw, lh);
+    }
     Buffer* pack = g.buffers.get(g.packBuffer);
     barrierBeforeTransfer();
     DkImageView v = viewOf(t, level);
@@ -537,6 +563,7 @@ void APIENTRY glDrawArrays_(GLenum mode, GLint first, GLsizei count) {
     if (count <= 0 || !validateDraw()) return;
     dkCmdBufDraw(g_dev.cmd, primitiveOf(mode), uint32_t(count), 1, uint32_t(first), 0);
     traceDraw("arrays", mode, count, uint32_t(first), 0, 0);
+    checkDrawInputs(0, nullptr, count, first, 0);
     drawn();
 }
 
@@ -727,6 +754,7 @@ void APIENTRY glTexSubImage2D_(GLenum, GLint level, GLint x, GLint y, GLsizei w,
 }
 void APIENTRY glCompressedTexImage2D_(GLenum, GLint level, GLenum ifmt, GLsizei w, GLsizei h, GLint, GLsizei bytes,
                                       const void* data) {
+    TRACE_CALL("  call glCompressedTexImage2D tex %u level %d %dx%d fmt 0x%x data %d", g.tex2D[g.activeUnit], level, w, h, ifmt, data != nullptr);
     Texture* t = boundTexture2D();
     if (!t) return;
     defineLevel(t, level, ifmt, uint32_t(w), uint32_t(h));
@@ -734,6 +762,7 @@ void APIENTRY glCompressedTexImage2D_(GLenum, GLint level, GLenum ifmt, GLsizei 
 }
 void APIENTRY glCompressedTexSubImage2D_(GLenum, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum,
                                          GLsizei bytes, const void* data) {
+    TRACE_CALL("  call glCompressedTexSubImage2D tex %u level %d at %d,%d %dx%d", g.tex2D[g.activeUnit], level, x, y, w, h);
     if (Texture* t = boundTexture2D()) uploadLevel(t, level, x, y, uint32_t(w), uint32_t(h), data, uint32_t(bytes), 0, true);
 }
 
@@ -891,6 +920,12 @@ bool clipBlit(const Texture* src, int sl, const Texture* dst, int dl, DkImageRec
     const uint32_t nx0 = uint32_t(x0 + 0.5), ny0 = uint32_t(y0 + 0.5), nx1 = uint32_t(x1 + 0.5), ny1 = uint32_t(y1 + 0.5);
     if (nx1 <= nx0 || ny1 <= ny0) return false;
     if (nx0 == dr->x && ny0 == dr->y && nx1 - nx0 == dr->width && ny1 - ny0 == dr->height) return true;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        logf("blit clipped to its images: %ux%u at %u,%u of a %gx%g source into %ux%u at %u,%u of %gx%g", sr->width,
+             sr->height, sr->x, sr->y, sw, sh, dr->width, dr->height, dr->x, dr->y, dw, dh);
+    }
     const uint32_t sx0 = uint32_t(sr->x + (nx0 - dr->x) / kx + 0.5), sy0 = uint32_t(sr->y + (ny0 - dr->y) / ky + 0.5);
     const uint32_t sx1 = uint32_t(sr->x + (nx1 - dr->x) / kx + 0.5), sy1 = uint32_t(sr->y + (ny1 - dr->y) / ky + 0.5);
     *dr = {nx0, ny0, 0, nx1 - nx0, ny1 - ny0, 1};
@@ -1142,6 +1177,10 @@ Texture* defaultFramebuffer() {
 extern "C" bool GXPC_WindowShotSink(uint32_t frame, const uint8_t* rgba, int w, int h);
 namespace dkgl {
 uint64_t g_swapCount = 0;
+// glReadPixels' work, for dkgl_draw.cpp's tests
+void readPixelsTest(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void* pixels) {
+    readPixels(x, y, w, h, format, type, pixels);
+}
 
 // SMS_DKGL_TRACE_PIXEL=x,y[;x,y...] (GL coordinates of the draw target): each
 // traced draw logs those pixels' colour, alpha and depth as the draws before
@@ -1177,9 +1216,38 @@ void tracePixels() {
     const uint32_t index = traced;
     if (waitEach && int(index) != dumpAt) submit(true);
     if (dump && (dumpAt >= 0 ? int(index) == dumpAt : index % uint32_t(every) == 0) && (traced++, true)) {
+        // (SMS_DKGL_TRACE_DUMP_TEX=name: that texture's level 0 instead, as
+        // colour; its alpha alone in the second capture)
+        static const GLuint dumpTex = getenv("SMS_DKGL_TRACE_DUMP_TEX") ? GLuint(atoi(getenv("SMS_DKGL_TRACE_DUMP_TEX"))) : 0;
+        Texture* dt = dumpTex ? g.textures.get(dumpTex) : nullptr;
+        if (dt && realize(dt) && !dt->compressed && !dt->depth) {
+            const uint32_t w = dt->levels[0].w, h = dt->levels[0].h;
+            Alloc tmp = g_dev.heaps[HEAP_READBACK].alloc(w * h * 4, 256);
+            if (tmp) {
+                barrierBeforeTransfer();
+                DkImageView v = viewOf(dt, 0);
+                DkImageRect rect = {0, 0, 0, w, h, 1};
+                DkCopyBuf dst = {tmp.gpu, w * 4, 0};
+                dkCmdBufCopyImageToBuffer(g_dev.cmd, &v, &rect, &dst, 0);
+                submit(true);
+                dkMemBlockFlushCpuCache(tmp.block, tmp.offset, tmp.size);
+                // (copied out first: the socket service cannot read GPU memory)
+                std::vector<uint8_t> c(tmp.cpu, tmp.cpu + size_t(w) * h * 4), a(size_t(w) * h * 4);
+                for (size_t i = 0; i < size_t(w) * h; i++) {
+                    a[i * 4] = a[i * 4 + 1] = a[i * 4 + 2] = tmp.cpu[i * 4 + 3];
+                    a[i * 4 + 3] = 255;
+                }
+                GXPC_WindowShotSink(100000 + dumped * 3, c.data(), int(w), int(h));
+                GXPC_WindowShotSink(100001 + dumped * 3, a.data(), int(w), int(h));
+                g_dev.heaps[HEAP_READBACK].free(tmp);
+                logf("  dumped texture %u (%ux%u) as captures %u-%u (before traced draw %u)", dumpTex, w, h,
+                     100000 + dumped * 3, 100001 + dumped * 3, index);
+            }
+            dumped++;
+        }
         const Framebuffer* f = g.framebuffers.get(g.drawFbo);
         const int w = g.targetW, h = g.targetH;
-        if (f && w > 0 && h > 0) {
+        if (!dt && f && w > 0 && h > 0) {
             const GLuint read = g.readFbo, pack = g.packBuffer;
             g.readFbo = g.drawFbo;
             g.packBuffer = 0;
@@ -1274,3 +1342,4 @@ void setSwapInterval(int interval) {
 void setShaderCache(const char* dir, const char* pack) { setShaderCacheImpl(dir, pack); }
 
 }  // namespace dkgl
+

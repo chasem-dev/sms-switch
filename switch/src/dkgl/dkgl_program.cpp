@@ -173,6 +173,19 @@ bool loadShader(const uint8_t* dksh, uint32_t size, DkShader* out, Alloc* code, 
     memcpy(hdr, dksh, sizeof hdr);
     const uint32_t controlSize = hdr[2], codeSize = hdr[3];
     if (hdr[0] != 0x48534B44u || controlSize + codeSize > size) return false;
+    // the most scratch (local) memory per warp a loaded shader needs, in the
+    // log as it grows: the queue gives each warp a fixed amount
+    {
+        static uint32_t most = 0;
+        uint32_t ph[6];
+        if (hdr[4] + sizeof ph <= controlSize) {
+            memcpy(ph, dksh + hdr[4], sizeof ph);
+            if (ph[5] > most) {
+                most = ph[5];
+                logf("shader scratch: %u bytes per warp (%u registers)", ph[5], ph[2]);
+            }
+        }
+    }
     const uint32_t at = (*codeUsed + DK_SHADER_CODE_ALIGNMENT - 1) & ~(DK_SHADER_CODE_ALIGNMENT - 1);
     if (at + codeSize > code->size) return false;
     memcpy(code->cpu + at, dksh + controlSize, codeSize);

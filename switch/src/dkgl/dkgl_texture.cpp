@@ -1,10 +1,12 @@
 // dkgl's textures: formats, images made at first use, uploads, descriptors,
 // and the barriers between rendering, copies and sampling.
 #include "dkgl_state.h"
+#include <string.h>
 
 #include <algorithm>
 
 namespace dkgl {
+extern bool g_tracing;  // dkgl_draw.cpp
 
 namespace {
 
@@ -86,9 +88,16 @@ void copyIn(Texture* t, int level, int x, int y, uint32_t w, uint32_t h, const v
 // pipeline's own work, so it does not count (an EFB copy after the targets
 // changed read half-drawn pixels: the plaza's ground came out in solid
 // shadow colour on the console).
+bool tiledFlush() {
+    static const bool on = getenv("SMS_DKGL_TILED") && !strcmp(getenv("SMS_DKGL_TILED"), "flush");
+    return on;
+}
 void barrierBeforeTransfer() {
+    // (SMS_DKGL_TILED=flush: the tiled cache flushed before copies, a test)
+    if (tiledFlush() && g.unfinished) dkCmdBufTiledCacheOp(g_dev.cmd, DkTiledCacheOp_Flush);
     if (g.unfinished) {
         dkCmdBufBarrier(g_dev.cmd, DkBarrier_Primitives, 0);
+        if (g_tracing) logf("  cmd: barrier before transfer");
         g.unfinished = false;
         g.rendered = false;
     }
@@ -137,6 +146,7 @@ void barrierBeforeDraw() {
         if (samplerRebind) dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, 2048);
     }
     if (mode != DkBarrier_None || inval) dkCmdBufBarrier(g_dev.cmd, mode, inval);
+    if (g_tracing && (mode != DkBarrier_None || inval)) logf("  cmd: barrier %d inval 0x%x", int(mode), inval);
 }
 
 void defineLevel(Texture* t, int level, GLenum internalFormat, uint32_t w, uint32_t h) {

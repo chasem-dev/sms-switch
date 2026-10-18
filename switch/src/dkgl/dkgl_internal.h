@@ -148,6 +148,7 @@ extern Device g_dev;
 bool initDevice(int width, int height);
 void shutdownDevice();
 void submit(bool wait = false);
+void checkInputsAtSubmit();  // dkgl_draw.cpp (SMS_DKGL_CHECK_INPUTS)
 void poll();  // updates g_dev.completed and returns what has finished
 void waitSerial(uint64_t serial);
 void retire(const Alloc& a);

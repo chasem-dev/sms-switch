@@ -94,6 +94,7 @@ void addCommandMemory(void*, DkCmdBuf cmd, size_t minReqSize) {
     // the chunk filled so far ends with commands of this serial
     if (!g_dev.cmdChunks.empty()) g_dev.cmdChunks.back().serial = g_dev.serial;
     g_dev.cmdChunks.push_back({a, g_dev.serial});
+    if (g_tracing) logf("  command chunk gpu 0x%llx-0x%llx", (unsigned long long)a.gpu, (unsigned long long)(a.gpu + a.size));
     g_dev.commandsSinceSubmit += a.size;
     dkCmdBufAddMemory(cmd, a.block, a.offset, a.size);
 }
@@ -129,6 +130,8 @@ Alloc Heap::alloc(uint32_t size, uint32_t align) {
                 r.cpu = cpu ? cpu + start : nullptr;
                 r.gpu = dkMemBlockGetGpuAddr(b.mem) + start;
                 m_used += size;
+                if (g_tracing) logf("  alloc heap %d gpu 0x%llx-0x%llx (%u bytes)", m_id, (unsigned long long)r.gpu,
+                                    (unsigned long long)(r.gpu + size), size);
                 return r;
             }
         }
@@ -155,6 +158,8 @@ Alloc Heap::alloc(uint32_t size, uint32_t align) {
 
 void Heap::free(const Alloc& a) {
     if (!a) return;
+    if (g_tracing) logf("  free heap %d gpu 0x%llx-0x%llx (%u bytes)", m_id, (unsigned long long)a.gpu,
+                        (unsigned long long)(a.gpu + a.size), a.size);
     for (Block& b : m_blocks) {
         if (b.mem != a.block) continue;
         m_used -= a.size;
@@ -178,6 +183,7 @@ void Heap::free(const Alloc& a) {
 }
 
 // --- submissions ---------------------------------------------------------------
+bool g_pollNoFree = false;  // (a test: poll() updates `completed` only)
 void poll() {
     while (!g_dev.inFlight.empty()) {
         Device::Submitted& s = g_dev.inFlight.front();
@@ -194,6 +200,7 @@ void poll() {
         }
         g_dev.inFlight.pop_front();
     }
+    if (g_pollNoFree) return;
     const uint64_t done = g_dev.completed;
     // SMS_DKGL_NO_FREE=1: retired memory is never reused (a test for memory
     // freed while still in use; it runs out in time)
@@ -203,13 +210,17 @@ void poll() {
         g_dev.heaps[a.heap].free(a);
         g_dev.retired.pop_front();
     }
+    // (SMS_DKGL_KEEP_CMD=1, SMS_DKGL_KEEP_TRANSIENT=1: that memory never
+    // used again, tests)
+    static const bool keepCmd = getenv("SMS_DKGL_KEEP_CMD") && atoi(getenv("SMS_DKGL_KEEP_CMD"));
+    static const bool keepTransient = getenv("SMS_DKGL_KEEP_TRANSIENT") && atoi(getenv("SMS_DKGL_KEEP_TRANSIENT"));
     // (the last chunk is the one the command buffer is writing into)
     while (g_dev.cmdChunks.size() > 1 && g_dev.cmdChunks.front().serial <= done) {
-        g_dev.freeCmdChunks.push_back(g_dev.cmdChunks.front().mem);
+        if (!keepCmd) g_dev.freeCmdChunks.push_back(g_dev.cmdChunks.front().mem);
         g_dev.cmdChunks.pop_front();
     }
     while (!g_dev.transientRetired.empty() && g_dev.transientRetired.front().serial <= done) {
-        g_dev.freeTransient.push_back(g_dev.transientRetired.front().mem);
+        if (!keepTransient) g_dev.freeTransient.push_back(g_dev.transientRetired.front().mem);
         g_dev.transientRetired.pop_front();
     }
     while (!g_dev.retiredImageDescs.empty() && g_dev.retiredImageDescs.front().first <= done) {
@@ -254,6 +265,9 @@ void startList() {
                         : DkInvalidateFlags_L2Cache);
     dkCmdBufBindImageDescriptorSet(g_dev.cmd, g_dev.imageDescs.gpu, kImageDescriptors);
     dkCmdBufBindSamplerDescriptorSet(g_dev.cmd, g_dev.samplerDescs.gpu, kSamplerDescriptors);
+    // (SMS_DKGL_TILED=off: the GPU's tiled caching disabled, a test)
+    static const char* tiled = getenv("SMS_DKGL_TILED");
+    if (tiled && !strcmp(tiled, "off")) dkCmdBufTiledCacheOp(g_dev.cmd, DkTiledCacheOp_Disable);
     g_dev.samplerUsed.assign(kSamplerDescriptors, false);
     g_dev.imageUsed.assign(kImageDescriptors, false);
     // (SMS_TIMING_LOG: the GPU's time per list, timestamps at its start and end)
@@ -264,6 +278,7 @@ void startList() {
 }
 
 void submit(bool wait) {
+    checkInputsAtSubmit();
     // the chunk the command buffer is writing into stays with this serial
     if (!g_dev.cmdChunks.empty()) g_dev.cmdChunks.back().serial = g_dev.serial;
     const int slot = g_dev.timeSlot;
@@ -320,6 +335,7 @@ Alloc transient(uint32_t size, uint32_t align) {
         } else {
             t.mem = g_dev.heaps[HEAP_DATA].alloc(kTransientChunk, 0x1000);
         }
+        if (g_tracing) logf("  transient chunk gpu 0x%llx", (unsigned long long)t.mem.gpu);
         t.used = 0;
         at = 0;
     }
@@ -412,6 +428,8 @@ bool initDevice(int width, int height) {
     DkQueueMaker qm;
     dkQueueMakerDefaults(&qm, g_dev.dev);
     qm.flags = DkQueueFlags_Graphics | DkQueueFlags_MediumPrio;
+    // (SMS_DKGL_NO_ZCULL=1: without the GPU's coarse depth culling, a test)
+    if (getenv("SMS_DKGL_NO_ZCULL") && atoi(getenv("SMS_DKGL_NO_ZCULL"))) qm.flags |= DkQueueFlags_DisableZcull;
     logf("starting: queue");
     g_dev.queue = dkQueueCreate(&qm);
     if (!g_dev.queue) return false;
