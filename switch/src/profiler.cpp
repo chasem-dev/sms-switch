@@ -103,7 +103,7 @@ void sample_loop(void*)
 		          [](const std::pair<Stack, u32>& a, const std::pair<Stack, u32>& b) { return a.second > b.second; });
 		fprintf(stderr, "[switch] profile thread %d %s: %u samples, %zu stacks\n", i, g_threads[i].label, total[i],
 		        v.size());
-		const size_t keep = std::min<size_t>(v.size(), 3000);
+		const size_t keep = std::min<size_t>(v.size(), 30000);
 		for (size_t k = 0; k < keep; k++) {
 			const Stack& s = v[k].first;
 			fprintf(stderr, "[switch] profile %d %u %llx %llx %llx %llx %llx\n", i, v[k].second,
@@ -138,6 +138,12 @@ void sms_switch_profile_add(Handle h, const char* label)
 extern "C" void sms_switch_profile_thread(int slot)
 {
 	sms_switch_profile_add(threadGetCurHandle(), slot == 0 ? "main" : "gl");
+}
+
+// Any other thread, from itself, by a name.
+void sms_switch_profile_add_current(const char* label)
+{
+	sms_switch_profile_add(threadGetCurHandle(), label);
 }
 
 // A thread made with threadCreate (performance.cpp's wrap), by its entry point.

@@ -6,6 +6,24 @@ has read it, or a frame later. Waiting for the previous frame's results kept
 the game from starting a frame while the GPU caught up (about 4 ms a frame in
 Delfino Plaza on the Switch).
 
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -24,7 +24,14 @@
+ 
+ // ------------------------------------------------------------------ utilities
+ double monoSeconds() {
+-#ifdef __APPLE__
++#if defined(__SWITCH__) && defined(__aarch64__)
++    // the counter itself (19.2 MHz): clock_gettime went through newlib and
++    // libnx's tick conversion, about 1% of the game thread with a timer
++    // around every batch
++    uint64_t t;
++    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
++    return double(t) * (1.0 / 19200000.0);
++#elif defined(__APPLE__)
+     static double tick = 0;
+     if (tick == 0) {
+         mach_timebase_info_data_t tb;
 --- a/platform/gx/src/gx_render.cpp
 +++ b/platform/gx/src/gx_render.cpp
 @@ -1798,16 +1798,19 @@
@@ -150,3 +168,365 @@ Delfino Plaza on the Switch).
              w.cancelled = true;
              resolveWriteBack(w);
          }
+--- a/platform/os/os_thread.cpp
++++ b/platform/os/os_thread.cpp
+@@ -66,9 +66,23 @@
+ 	return it == g_hosts.end() ? NULL : it->second;
+ }
+ 
++// Threads doing host work away from the CPU (port_os_host_work_begin).
++OSThread* g_away[8];
++int g_away_n;
++pthread_cond_t g_away_cv = PTHREAD_COND_INITIALIZER; // one came back
++
++bool is_away(OSThread* t)
++{
++	for (int i = 0; i < g_away_n; i++)
++		if (g_away[i] == t)
++			return true;
++	return false;
++}
++
+ bool runnable(OSThread* t)
+ {
+-	return (t->state == OS_THREAD_STATE_READY || t->state == OS_THREAD_STATE_RUNNING) && t->suspend <= 0;
++	return (t->state == OS_THREAD_STATE_READY || t->state == OS_THREAD_STATE_RUNNING) && t->suspend <= 0
++	    && !(g_away_n && is_away(t));
+ }
+ 
+ // Highest priority (lowest number) runnable thread; among equals the one that
+@@ -530,7 +544,11 @@
+ 	}
+ 	return n;
+ }
+-extern "C" int port_os_irq_work_pending(void) { return !g_deferred.empty(); }
++extern "C" int port_audio_dsp_busy(void) __attribute__((weak)); // audio/dsp_hle.cpp: a subframe being mixed
++extern "C" int port_os_irq_work_pending(void)
++{
++	return !g_deferred.empty() || g_away_n || (port_audio_dsp_busy && port_audio_dsp_busy());
++}
+ 
+ extern "C" void port_os_threads_init(void)
+ {
+@@ -620,6 +638,75 @@
+ 		lower_restore();
+ }
+ 
++// Host work that touches only memory no other game thread uses until it is
++// done (a movie frame's decoding): the CPU goes to the other threads
++// meanwhile, as if the caller were blocked, and port_os_host_work_end waits
++// for its turn again. Nothing in between may call the OS or GX layers; cache
++// flushes are kept until the end (os_core.cpp). Returns the thread for the
++// end, or NULL when the CPU stayed (no other thread to run, or not allowed
++// here), in which case the work just runs on it.
++extern "C" void port_os_cache_away(int away); // os_core.cpp
++extern "C" void* port_os_host_work_begin(void)
++{
++	OSThread* self = g_cur;
++	Host* hs = host_of(self);
++	if (!hs || g_in_irq || g_sched_disabled || !g_irq_enabled || g_away_n == (int)(sizeof g_away / sizeof g_away[0]))
++		return NULL;
++	g_away[g_away_n++] = self;
++	OSThread* next = pick(self, false);
++	Host* hn = next ? host_of(next) : NULL;
++	if (!hn || !hn->started) {
++		g_away_n--;
++		return NULL;
++	}
++	// switch_to's hand-over, without waiting for the turn
++	hs->irq_enabled = g_irq_enabled;
++	self->state = OS_THREAD_STATE_READY;
++	g_cur = next;
++	g_cur_spin.store(next, std::memory_order_release);
++	__gCurrentThread = next;
++	next->state = OS_THREAD_STATE_RUNNING;
++	hn->last_ran = ++g_switch_seq;
++	g_irq_enabled = hn->irq_enabled;
++	pthread_cond_signal(&hn->cv);
++	port_os_cache_away(1);
++	pthread_mutex_unlock(&g_cpu);
++	return self;
++}
++
++extern "C" void port_os_host_work_end(void* away)
++{
++	if (!away)
++		return;
++	OSThread* self = (OSThread*)away;
++	pthread_mutex_lock(&g_cpu);
++	for (int i = 0; i < g_away_n; i++)
++		if (g_away[i] == self) {
++			g_away[i] = g_away[--g_away_n];
++			break;
++		}
++	pthread_cond_broadcast(&g_away_cv);
++	// runnable again: the running thread looks at the scheduler at its next
++	// check point (or the idle loop at once)
++	port_irq_kick();
++	Host* hs = host_of(self);
++	for (;;) {
++		if (hs->cancelled && (g_cur != self || host_of(self) != hs)) {
++			pthread_mutex_unlock(&g_cpu);
++#ifdef PORT_LOW_STACK_CALL
++			port_win64_thread_exit();
++#else
++			pthread_exit(NULL);
++#endif
++		}
++		if (g_cur == self)
++			break;
++		pthread_cond_wait(&hs->cv, &g_cpu);
++	}
++	g_irq_enabled = hs->irq_enabled;
++	port_os_cache_away(0);
++}
++
+ extern "C" int OSCreateThread(OSThread* t, void* (*func)(void*), void* param, void* stack, u32 stackSize,
+                               OSPriority prio, u16 attr)
+ {
+@@ -691,6 +778,8 @@
+ 		OSExitThread(NULL);
+ 		return;
+ 	}
++	while (g_away_n && is_away(t)) // its work may use memory the canceller frees next
++		pthread_cond_wait(&g_away_cv, &g_cpu);
+ 	if (t->state == OS_THREAD_STATE_WAITING && t->queue)
+ 		queue_remove(t->queue, t);
+ 	t->state = OS_THREAD_STATE_MORIBUND;
+--- a/platform/os/os_core.cpp
++++ b/platform/os/os_core.cpp
+@@ -7,6 +7,7 @@
+ #include <dolphin/os/OSAlloc.h>
+ #include <dolphin/os/OSCache.h>
+ #include <dolphin/os/OSStopwatch.h>
++#include <vector>
+ #include <dolphin/os/OSRtc.h>
+ #include <dolphin/os/OSReset.h>
+ #include <dolphin/os/OSResetSW.h>
+@@ -170,22 +171,49 @@
+ // The GX layer caches decoded textures by address; a flush tells it the CPU
+ // rewrote memory (weak: absent without platform/gx).
+ extern "C" __attribute__((weak)) void GXPC_InvalidateRange(const void* p, u32 n);
++// A thread doing host work away from the CPU (port_os_host_work_begin) keeps
++// its flushes until it has the CPU again: the GX layer is the CPU's.
++struct DeferredFlush {
++	void* p;
++	u32 n;
++	bool written;
++};
++static thread_local bool t_away;
++static thread_local std::vector<DeferredFlush> t_flushes;
+ static inline void gx_invalidate(void* p, u32 n)
+ {
++	if (t_away) {
++		t_flushes.push_back({ p, n, false });
++		return;
++	}
+ 	if (GXPC_InvalidateRange)
+ 		GXPC_InvalidateRange(p, n);
+ }
+ extern "C" __attribute__((weak)) void GXPC_MemoryWritten(const void* p, u32 n);
+ static inline void gx_written(void* p, u32 n)
+ {
++	if (t_away) {
++		t_flushes.push_back({ p, n, true });
++		return;
++	}
+ 	if (GXPC_MemoryWritten)
+ 		GXPC_MemoryWritten(p, n);
+ }
++extern "C" void port_os_cache_away(int away)
++{
++	t_away = away != 0;
++	if (t_away)
++		return;
++	for (const DeferredFlush& f : t_flushes)
++		f.written ? gx_written(f.p, f.n) : gx_invalidate(f.p, f.n);
++	t_flushes.clear();
++}
+ extern "C" void DCInvalidateRange(void*, u32) {}
+ extern "C" void DCFlushRange(void* p, u32 n)
+ {
+ 	gx_invalidate(p, n);
+-	port_irq_check();
++	if (!t_away)
++		port_irq_check();
+ }
+ extern "C" void DCStoreRange(void* p, u32 n) { gx_invalidate(p, n); }
+ extern "C" void DCFlushRangeNoSync(void* p, u32 n) { gx_invalidate(p, n); }
+--- a/platform/audio/dsp_hle.cpp
++++ b/platform/audio/dsp_hle.cpp
+@@ -18,13 +18,21 @@
+ #include <dolphin/dsp.h>
+ 
+ #include "dsp_mixer.h"
++#include "../os/crash.h"
+ 
++#include <pthread.h>
++
++#include <atomic>
++#include <condition_variable>
+ #include <deque>
++#include <mutex>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ extern "C" u8* port_aram_ptr(u32 addr);
+ extern "C" void __DSPHandler(int interrupt, void* context); // JSystem/osdsp_task.c
++extern "C" __attribute__((weak)) void sms_switch_dsp_thread(void); // the Switch runtime (sms-switch)
+ 
+ namespace {
+ 
+@@ -64,6 +72,102 @@
+ 
+ void reply(u32 low16) { raise_irq(0xDCD10004u, kPrefix | low16); }
+ 
++// The mixing itself can run on a thread of its own, as the DSP is a processor
++// of its own: the audio thread releases the DSP and then waits for the
++// subframe's mail, so the game's other threads have the CPU meanwhile instead
++// of the mixing taking its turn. The mail is raised (the interrupt source
++// below) once the subframe is mixed. JAudio writes the voices it hands the
++// DSP only between that mail and the next release, as it must on hardware.
++// SMS_AUDIO_DSP_THREAD=0/1 (on by default on the Switch, never with the
++// deterministic retrace clock).
++struct Mixer {
++	std::mutex mu;
++	std::condition_variable cv;
++	bool job; // under mu
++	int16_t* outA;
++	int16_t* outB;
++	int n;
++	u16 master;
++	std::atomic<int> busy; // released and its mail not yet raised (game threads)
++	std::atomic<int> done; // mixed (the mixing thread)
++	bool started;
++} m;
++
++bool mixer_thread_on()
++{
++	static int on = -1;
++	if (on < 0) {
++		const char* e = getenv("SMS_AUDIO_DSP_THREAD");
++#ifdef __SWITCH__
++		on = !(e && *e == '0');
++#else
++		on = e && *e == '1';
++#endif
++		if (on && port_vi_deterministic())
++			on = 0;
++	}
++	return on != 0;
++}
++
++void* mixer_loop(void*)
++{
++	port_crash_thread_init();
++	if (sms_switch_dsp_thread)
++		sms_switch_dsp_thread();
++	for (;;) {
++		{
++			std::unique_lock<std::mutex> lk(m.mu);
++			m.cv.wait(lk, [] { return m.job; });
++			m.job = false;
++		}
++		port_dspmix_render(m.outA, m.outB, m.n, m.master);
++		m.done.store(1, std::memory_order_release);
++		port_irq_kick();
++	}
++	return NULL;
++}
++
++// Interrupt source: the subframe the mixing thread finished.
++void mixer_poll()
++{
++	if (!m.done.load(std::memory_order_acquire))
++		return;
++	m.done.store(0, std::memory_order_relaxed);
++	m.busy.store(0, std::memory_order_relaxed);
++	g.subframesRendered++;
++	post(0xDCD10004u);
++	post(kPrefix | 0xFF00);
++	__DSPHandler(0, NULL);
++}
++
++// A command while a subframe is still being mixed (JAudio waits for the mail
++// first, so this only guards the DSP's state): the mixing finishes first.
++void mixer_wait()
++{
++	while (m.busy.load(std::memory_order_relaxed) && !m.done.load(std::memory_order_acquire))
++		std::this_thread::yield();
++}
++
++void mixer_start()
++{
++	if (m.started || !mixer_thread_on())
++		return;
++	pthread_t th;
++	pthread_attr_t a;
++	pthread_attr_init(&a);
++	pthread_attr_setstacksize(&a, 256 << 10);
++	const int rc = pthread_create(&th, &a, mixer_loop, NULL);
++	pthread_attr_destroy(&a);
++	if (rc != 0) {
++		port_log("[audio] no thread for the DSP's mixing (%d): mixing on the audio thread\n", rc);
++		return;
++	}
++	pthread_detach(th);
++	port_irq_add_source(mixer_poll);
++	m.started = true;
++	port_log("[audio] DSP mixing on a thread of its own\n");
++}
++
+ // Debug: SMS_AUDIO_ARAM_DUMP=path[,subframe] writes the 16 MiB ARAM image once
+ // (default after 40 s of audio) for offline mixer runs (tests/, PROTOCOL.md).
+ void maybe_dump_aram()
+@@ -92,6 +196,20 @@
+ {
+ 	maybe_dump_aram();
+ 	u32 n = g.subSamples;
++	if (m.started) {
++		m.busy.store(1, std::memory_order_relaxed);
++		{
++			std::lock_guard<std::mutex> lk(m.mu);
++			m.outA   = g.outA + g.sub * n;
++			m.outB   = g.outB + g.sub * n;
++			m.n      = (int)n;
++			m.master = g.master;
++			m.job    = true;
++		}
++		m.cv.notify_one();
++		g.sub++;
++		return;
++	}
+ 	port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
+ 	g.sub++;
+ 	g.subframesRendered++;
+@@ -102,6 +220,7 @@
+ {
+ 	const std::vector<u32>& w = g.words;
+ 	u32 op = w[0] >> 24;
++	mixer_wait();
+ 	if (g.release) {
+ 		// DSPReleaseHalt: the 64-bit active-voice map. The microcode renders
+ 		// the next subframe of the current frame and reports 0xFF00.
+@@ -151,6 +270,7 @@
+ 	// Task start: the microcode mails 0xDCD10000 (the handler then runs the
+ 	// task's init_cb, DspHandShake, which waits for one more mail).
+ 	(void)task;
++	mixer_start();
+ 	raise_irq(0xDCD10000u, kPrefix);
+ 	port_log("[audio] DSP HLE: audio task booted (software mixer)\n");
+ }
+@@ -197,7 +317,10 @@
+ // DSP always finishes a frame within one block period, and consuming blocks
+ // faster than JAudio produces frames makes DSPBuf repeat stale samples (gaps)
+ // while the sequencer falls behind.
+-extern "C" int port_audio_dsp_frame_pending(void) { return g.outA && g.sub < g.subframes; }
++extern "C" int port_audio_dsp_frame_pending(void) { return (g.outA && g.sub < g.subframes) || m.busy.load(); }
++
++// A subframe on the mixing thread (save states wait for it).
++extern "C" int port_audio_dsp_busy(void) { return m.busy.load(); }
+ 
+ #ifdef SMS_AUDIO_DSP_HLE
+ // SDK surface (replaces the handshake-only fake in platform/misc/sdk_data.cpp).

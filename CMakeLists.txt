@@ -73,6 +73,8 @@ set_source_files_properties(${SMS_SWITCH_DIR}/src/switch_main.cpp TARGET_DIRECTO
 target_link_options(sms PRIVATE -Wl,--wrap=threadCreate)
 # main with an argument list even when the loader gives none (switch_main.cpp)
 target_link_options(sms PRIVATE -Wl,--wrap=main)
+# Movie frames decoded off the game's CPU (switch/src/performance.cpp)
+target_link_options(sms PRIVATE -Wl,--wrap=THPVideoDecode)
 
 # Mesa (OpenGL over nouveau). Its pkg-config files carry an unexpanded
 # $(DEVKITPRO), so the libraries are named directly; order matters.

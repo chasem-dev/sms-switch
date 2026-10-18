@@ -34,6 +34,7 @@ constexpr u32 kAllCores = 0x7; // the cores applications may use
 constexpr int kMainPriority = 0x2C;
 constexpr int kBackgroundPriority = 0x2E;
 constexpr int kGlCore = 1;
+constexpr int kDspCore = 2;
 constexpr int kOtherCores[] = {2, 0}; // the cores other threads start on, in turn
 std::atomic<int> g_next_core(0);
 
@@ -87,6 +88,7 @@ extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, vo
 }
 
 extern "C" void sms_switch_profile_thread(int slot); // profiler.cpp
+void sms_switch_profile_add_current(const char* label); // profiler.cpp
 
 extern "C" void sms_switch_spread_main_thread(void)
 {
@@ -100,6 +102,39 @@ extern "C" void sms_switch_gl_thread(void)
 	sms_switch_profile_thread(1);
 	if (spread_threads())
 		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kGlCore, kAllCores);
+}
+
+// The DSP's mixing thread (sms-port's audio/dsp_hle.cpp): the audio thread
+// waits for each subframe it mixes, so it starts on the core the game's own
+// threads leave least busy.
+extern "C" void sms_switch_dsp_thread(void)
+{
+	sms_switch_profile_add_current("dsp");
+	if (spread_threads())
+		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kDspCore, kAllCores);
+}
+
+// A movie frame (the THP player's decoding thread, below the game's priority):
+// it touches only the movie's own buffers until it is done, so the game's
+// other threads have the CPU meanwhile (sms-port's port_os_host_work_begin)
+// and the decoding runs on another core beside the game instead of in the
+// game's turn (when a late frame steps down for it, a quarter frame at most).
+// SMS_SWITCH_THP_AWAY=0 decodes on the CPU as before.
+extern "C" s32 __real_THPVideoDecode(void* file, void* tileY, void* tileU, void* tileV, void* work);
+extern "C" void* port_os_host_work_begin(void);
+extern "C" void port_os_host_work_end(void* away);
+
+extern "C" s32 __wrap_THPVideoDecode(void* file, void* tileY, void* tileU, void* tileV, void* work)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char* e = getenv("SMS_SWITCH_THP_AWAY");
+		on = !(e && *e == '0');
+	}
+	void* away = on ? port_os_host_work_begin() : nullptr;
+	const s32 r = __real_THPVideoDecode(file, tileY, tileU, tileV, work);
+	port_os_host_work_end(away);
+	return r;
 }
 
 // A thread of work that may wait for idle time (gx_hires.cpp: the texture
