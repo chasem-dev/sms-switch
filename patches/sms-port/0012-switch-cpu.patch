@@ -403,7 +403,7 @@ Delfino Plaza on the Switch).
      s_recording = true;
      s_dlBegin = static_cast<uint8_t*>(list);
      s_dlSize = size;
-@@ -351,12 +465,19 @@
+@@ -351,12 +465,26 @@
          GXPC_Write32(uint32_t(nbytes));
          return;
      }
@@ -412,6 +412,13 @@ Delfino Plaza on the Switch).
 +        const uint32_t n = uint32_t(nbytes);
 +        frontCatchUp();
 +        frontScanList(s_front, dl, n);  // the API's copy sees what the list sets
++        // A list the CPU wrote in the last frames (J3D's packets, lists the
++        // game records and calls) may be written again before the worker
++        // gets to it, as on hardware the game would wait for the GPU: its
++        // bytes go along as they are now. Lists loaded with the models, by
++        // far the most bytes, stay where they are (and in the worker's cache).
++        if (n <= (256u << 10) && !unwrittenSince(dl, n, gxt::frameStartClock(2)))
++            return gxt::callRaw([](const uint8_t* d, uint32_t m) { runCommands(d, m); }, dl, n);
 +        return gxt::call([dl, n] { callDisplayList(dl, n); });
 +    }
      callDisplayList(static_cast<const uint8_t*>(list), uint32_t(nbytes));
@@ -424,7 +431,7 @@ Delfino Plaza on the Switch).
      uint32_t t = uint32_t(type) & 3;
      if (attr == GX_VA_PNMTXIDX) lo = setField(lo, 1, 0, t != 0);
      else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) lo = setField(lo, 1, 1 + (attr - GX_VA_TEX0MTXIDX), t != 0);
-@@ -365,8 +486,8 @@
+@@ -365,8 +493,8 @@
      else if (attr == GX_VA_CLR0) lo = setField(lo, 2, 13, t);
      else if (attr == GX_VA_CLR1) lo = setField(lo, 2, 15, t);
      else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) hi = setField(hi, 2, 2 * (attr - GX_VA_TEX0), t);
@@ -435,7 +442,7 @@ Delfino Plaza on the Switch).
  }
  void GXSetVtxDescv(const GXVtxDescList* list) {
      for (; list->attr != GX_VA_NULL; list++) GXSetVtxDesc(list->attr, list->type);
-@@ -376,7 +497,7 @@
+@@ -376,7 +504,7 @@
      apiCP(CP_VCD_HI, 0);
  }
  void GXGetVtxDesc(GXAttr attr, GXAttrType* type) {
@@ -444,7 +451,7 @@ Delfino Plaza on the Switch).
      if (attr == GX_VA_PNMTXIDX) t = lo & 1;
      else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) t = getField(lo, 1, 1 + attr - GX_VA_TEX0MTXIDX);
      else if (attr == GX_VA_POS) t = getField(lo, 2, 9);
-@@ -397,7 +518,7 @@
+@@ -397,7 +525,7 @@
  }
  
  void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
@@ -453,7 +460,7 @@ Delfino Plaza on the Switch).
      uint32_t c = uint32_t(cnt), t = uint32_t(type), f = frac;
      switch (attr) {
      case GX_VA_POS: A = setField(A, 1, 0, c); A = setField(A, 3, 1, t); A = setField(A, 5, 4, f); break;
-@@ -420,15 +541,15 @@
+@@ -420,15 +548,15 @@
      default: break;
      }
      A |= 1u << 30;
@@ -473,7 +480,7 @@ Delfino Plaza on the Switch).
      uint32_t c = 0, t = 0, f = 0;
      switch (attr) {
      case GX_VA_POS: c = getField(A, 1, 0); t = getField(A, 3, 1); f = getField(A, 5, 4); break;
-@@ -468,9 +589,19 @@
+@@ -468,9 +596,19 @@
          apiCP(uint8_t(CP_ARRAY_STRIDE + slot), stride);
          return;
      }
@@ -496,7 +503,7 @@ Delfino Plaza on the Switch).
      g_arrayGen++;
  }
  void GXInvalidateVtxCache(void) {}
-@@ -536,33 +667,36 @@
+@@ -536,33 +674,36 @@
  }
  
  void GXSetLineWidth(u8 width, GXTexOffset off) {
@@ -544,7 +551,7 @@ Delfino Plaza on the Switch).
  void GXSetCoPlanar(GXBool enable) { bpField(BP_GENMODE, 1, 19, enable); }
  
  // ================================================================== GXTransform
-@@ -584,13 +718,14 @@
+@@ -584,13 +725,14 @@
  }
  void GXSetProjectionv(f32* ptr) {
      traceNoteProjection(ptr);
@@ -561,7 +568,7 @@ Delfino Plaza on the Switch).
  
  void GXLoadPosMtxImm(f32 mtx[3][4], u32 id) { apiXFf(uint16_t(id * 4), 12, &mtx[0][0]); }
  void GXLoadPosMtxIndx(u16 idx, u32 id) {
-@@ -641,12 +776,13 @@
+@@ -641,12 +783,13 @@
  
  void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
      if (field == 0) top -= 0.5f;
@@ -581,7 +588,7 @@ Delfino Plaza on the Switch).
      float v[6];
      v[0] = wd * 0.5f;
      v[1] = -ht * 0.5f;
-@@ -659,13 +795,14 @@
+@@ -659,13 +802,14 @@
  void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
      GXSetViewportJitter(left, top, wd, ht, nearz, farz, 1);
  }
@@ -601,7 +608,7 @@ Delfino Plaza on the Switch).
      uint32_t tl = setField(0, 11, 0, uint32_t(top) + 342);
      tl = setField(tl, 11, 12, uint32_t(left) + 342);
      uint32_t br = setField(0, 11, 0, uint32_t(top + ht) + 341);
-@@ -674,10 +811,10 @@
+@@ -674,10 +818,10 @@
      apiBP(BP_SCISSOR_BR, br);
  }
  void GXGetScissor(u32* left, u32* top, u32* wd, u32* ht) {
@@ -616,7 +623,7 @@ Delfino Plaza on the Switch).
  }
  void GXSetScissorBoxOffset(s32 x, s32 y) {
      uint32_t r = setField(0, 10, 0, uint32_t(x + 342) >> 1);
-@@ -861,7 +998,7 @@
+@@ -861,7 +1005,7 @@
      GXSetTevAlphaOp(id, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
  }
  void GXSetTevColorIn(GXTevStageID s, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
@@ -625,7 +632,7 @@ Delfino Plaza on the Switch).
      r = setField(r, 4, 12, a);
      r = setField(r, 4, 8, b);
      r = setField(r, 4, 4, c);
-@@ -869,7 +1006,7 @@
+@@ -869,7 +1013,7 @@
      apiBP(BP_TEV_COLOR_ENV + 2 * s, r);
  }
  void GXSetTevAlphaIn(GXTevStageID s, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d) {
@@ -634,7 +641,7 @@ Delfino Plaza on the Switch).
      r = setField(r, 3, 13, a);
      r = setField(r, 3, 10, b);
      r = setField(r, 3, 7, c);
-@@ -889,10 +1026,10 @@
+@@ -889,10 +1033,10 @@
      return setField(r, 2, 22, out);
  }
  void GXSetTevColorOp(GXTevStageID s, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out) {
@@ -647,7 +654,7 @@ Delfino Plaza on the Switch).
  }
  static void tevRegWrite(uint32_t id, int r, int gg, int b, int a, bool konst) {
      uint32_t ra = setField(0, 11, 0, uint32_t(r)) | setField(0, 11, 12, uint32_t(a)) | (konst ? 0x800000u : 0);
-@@ -910,13 +1047,13 @@
+@@ -910,13 +1054,13 @@
      bpField(BP_TEV_KSEL + (s >> 1), 5, (s & 1) ? 19 : 9, sel);
  }
  void GXSetTevSwapMode(GXTevStageID s, GXTevSwapSel ras, GXTevSwapSel tex) {
@@ -664,7 +671,7 @@ Delfino Plaza on the Switch).
      apiBP(BP_TEV_KSEL + 2 * t + 1, setField(k1, 2, 2, a));
  }
  void GXSetTevClampMode(void) {}
-@@ -938,7 +1075,7 @@
+@@ -938,7 +1082,7 @@
      int sh = (s & 1) ? 12 : 0;
      uint32_t tmap = uint32_t(map) & 0xFF;
      bool enable = tmap != 0xFF && !(uint32_t(map) & 0x100);
@@ -673,7 +680,7 @@ Delfino Plaza on the Switch).
      r = setField(r, 3, sh, tmap == 0xFF ? 0 : tmap & 7);
      r = setField(r, 3, sh + 3, coord == GX_TEXCOORD_NULL ? 0 : uint32_t(coord) & 7);
      r = setField(r, 1, sh + 6, enable);
-@@ -979,11 +1116,11 @@
+@@ -979,11 +1123,11 @@
  void GXSetIndTexCoordScale(GXIndTexStageID ind, GXIndTexScale ss, GXIndTexScale ts) {
      uint32_t reg = ind < 2 ? BP_RAS1_SS0 : BP_RAS1_SS1;
      int sh = (ind & 1) ? 8 : 0;
@@ -687,7 +694,7 @@ Delfino Plaza on the Switch).
      apiBP(BP_RAS1_IREF, setField(r, 3, 6 * ind + 3, uint32_t(coord) & 7));
  }
  void GXSetNumIndStages(u8 n) { bpField(BP_GENMODE, 3, 16, n); }
-@@ -1067,7 +1204,7 @@
+@@ -1067,7 +1211,7 @@
      apiBP(BP_FOG_RANGE, (uint32_t(center) + 342) | (uint32_t(enable) << 10));
  }
  void GXSetBlendMode(GXBlendMode type, GXBlendFactor src, GXBlendFactor dst, GXLogicOp op) {
@@ -696,7 +703,7 @@ Delfino Plaza on the Switch).
      r = setField(r, 1, 0, type == GX_BM_BLEND || type == GX_BM_SUBTRACT);
      r = setField(r, 1, 1, type == GX_BM_LOGIC);
      r = setField(r, 1, 11, type == GX_BM_SUBTRACT);
-@@ -1084,7 +1221,7 @@
+@@ -1084,7 +1228,7 @@
  }
  void GXSetZCompLoc(GXBool before) { bpField(BP_PE_CONTROL, 1, 6, before); }
  void GXSetPixelFmt(GXPixelFmt pix, GXZFmt16 z) {
@@ -705,7 +712,7 @@ Delfino Plaza on the Switch).
      apiBP(BP_PE_CONTROL, setField(r, 3, 3, z));
      bpField(BP_GENMODE, 1, 9, pix == GX_PF_RGB565_Z16);
  }
-@@ -1105,8 +1242,25 @@
+@@ -1105,8 +1249,25 @@
  void GXPokeDither(GXBool) {}
  void GXPokeZMode(GXBool, GXCompare, GXBool) {}
  void GXPokeARGB(u16, u16, u32) {}
@@ -733,7 +740,7 @@ Delfino Plaza on the Switch).
  void GXPokeZ(u16, u16, u32) {}
  u32 GXCompressZ16(u32 z24, GXZFmt16) { return z24 >> 8; }
  u32 GXDecompressZ16(u32 z16, GXZFmt16) { return z16 << 8; }
-@@ -1176,19 +1330,23 @@
+@@ -1176,19 +1337,23 @@
      if (disp) apiBP(BP_COPY_YSCALE, s_dispYScale);
      // the renderer needs the host pointer; commands carry a physical address
      apiBP(BP_COPY_DST, ptrToPhys(dest) >> 5);
@@ -759,7 +766,7 @@ Delfino Plaza on the Switch).
  }
  void GXCopyDisp(void* dest, GXBool clear) { doCopy(dest, clear, true); }
  void GXCopyTex(void* dest, GXBool clear) { doCopy(dest, clear, false); }
-@@ -1335,7 +1493,10 @@
+@@ -1335,7 +1500,10 @@
          uint32_t fmt = idx < 20 ? s_tlutLoaded[idx].fmt : 0;
          apiBP(bpTexReg(BP_TX_TLUT, map), ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | fmt << 10);
      }
@@ -771,7 +778,7 @@ Delfino Plaza on the Switch).
  }
  void GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
      if (s_texRegionCb) s_texRegionCb(obj, id);
-@@ -1362,8 +1523,15 @@
+@@ -1362,8 +1530,15 @@
      uint32_t off = r->tmemAddr - TMEM_TLUT_BASE;
      uint32_t bytes = uint32_t(t->entries) * 2;
      if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
@@ -788,7 +795,7 @@ Delfino Plaza on the Switch).
  }
  void GXInitTexCacheRegion(GXTexRegion* region, u8 is32b, u32 even, GXTexCacheSize, u32 odd, GXTexCacheSize) {
      TexRegionInt* r = reinterpret_cast<TexRegionInt*>(region);
-@@ -1383,8 +1551,15 @@
+@@ -1383,8 +1558,15 @@
      r->tmemAddr = uint32_t(addr);
      r->size = uint32_t(size);
  }
@@ -805,7 +812,7 @@ Delfino Plaza on the Switch).
      flushBatch();
      textureInvalidateAll();
  }
-@@ -1401,7 +1576,8 @@
+@@ -1401,7 +1583,8 @@
  void GXPreLoadEntireTexture(GXTexObj*, GXTexRegion*) {}
  void GXSetTexCoordScaleManually(GXTexCoordID coord, u8 enable, u16 ss, u16 ts) {
      if (coord >= 8) return;
@@ -815,7 +822,7 @@ Delfino Plaza on the Switch).
      if (enable) {
          bpField(BP_SU_SSIZE + 2 * coord, 16, 0, ss - 1u);
          bpField(BP_SU_SSIZE + 2 * coord + 1, 16, 0, ts - 1u);
-@@ -1492,11 +1668,22 @@
+@@ -1492,11 +1675,22 @@
  // top/bottom pixels in and colour pixels in all report the pixels that
  // passed (plus 4 per triangle, see gx_render.cpp); the rest read zero.
  void GXReadPixMetric(u32* topIn, u32* topOut, u32* botIn, u32* botOut, u32* clrIn, u32* copyClks) {
@@ -840,7 +847,7 @@ Delfino Plaza on the Switch).
  void GXSetVCacheMetric(GXVCachePerf) {}
  void GXReadVCacheMetric(u32* a, u32* b, u32* c) { *a = *b = *c = 0; }
  void GXClearVCacheMetric(void) {}
-@@ -1507,8 +1694,8 @@
+@@ -1507,8 +1701,8 @@
  
  // ================================================================== GXDraw (SDK helper shapes)
  static void drawWithPosNrm(void (*body)()) {
@@ -2318,7 +2325,7 @@ Delfino Plaza on the Switch).
  		memset(&status[i], 0, sizeof status[i]);
 --- /dev/null
 +++ b/platform/gx/src/gx_thread.h
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,113 @@
 +// The graphics worker (SMS_GX_THREAD=1): the GX front end on a thread of its
 +// own, as a GameCube's GPU reads its FIFO while the CPU goes on.
 +//
@@ -2366,6 +2373,9 @@ Delfino Plaza on the Switch).
 +void frameQueued();
 +void frameDone();
 +uint64_t framesQueued();  // display copies the game has written
++// writeClock() as the game started writing the frame `ago` frames back (0:
++// this one), for telling a display list built lately from one loaded long ago
++uint32_t frameStartClock(unsigned ago);
 +
 +// fn(data, n) on the worker, in stream order (a private FIFO command).
 +using HostFn = void (*)(const uint8_t* data, uint32_t n);
@@ -2431,7 +2441,7 @@ Delfino Plaza on the Switch).
 +#endif
 --- /dev/null
 +++ b/platform/gx/src/gx_thread.cpp
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,302 @@
 +// The graphics worker: see gx_thread.h.
 +#include "gx_thread.h"
 +
@@ -2651,10 +2661,13 @@ Delfino Plaza on the Switch).
 +    s_idle.wait(lk, [] { return s_queue.empty() && !s_busy; });
 +}
 +
++static uint32_t s_frameClock[8];  // writeClock() at each frame's start, by framesQueued
++
 +void frameQueued() {
 +    if (!g_on || onWorker()) return;
 +    publish();
 +    s_framesQueued++;
++    s_frameClock[s_framesQueued & 7] = writeClock();
 +    if (s_framesQueued % 600 == 0) {
 +        char line[512];
 +        int k = snprintf(line, sizeof line, "graphics worker: waits per frame over 600:");
@@ -2678,6 +2691,12 @@ Delfino Plaza on the Switch).
 +}
 +
 +uint64_t framesQueued() { return s_framesQueued; }
++
++uint32_t frameStartClock(unsigned ago) {
++    if (ago > 7) ago = 7;
++    if (ago > s_framesQueued) return 0;
++    return s_frameClock[(s_framesQueued - ago) & 7];
++}
 +
 +void frameDone() {
 +    if (!g_on) return;
