@@ -114,6 +114,15 @@ extern "C" void sms_switch_dsp_thread(void)
 		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kDspCore, kAllCores);
 }
 
+// The graphics worker (sms-port's gx_thread.h, SMS_GX_THREAD=1): the GX
+// front end beside the game, on the core the GL thread does not use.
+extern "C" void sms_switch_gx_thread(void)
+{
+	sms_switch_profile_add_current("gx");
+	if (spread_threads())
+		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kDspCore, kAllCores);
+}
+
 // A movie frame (the THP player's decoding thread, below the game's priority):
 // it touches only the movie's own buffers until it is done, so the game's
 // other threads have the CPU meanwhile (sms-port's port_os_host_work_begin)
