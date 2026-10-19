@@ -705,37 +705,20 @@ Delfino Plaza on the Switch).
      apiBP(BP_PE_CONTROL, setField(r, 3, 3, z));
      bpField(BP_GENMODE, 1, 9, pix == GX_PF_RGB565_Z16);
  }
-@@ -1105,8 +1242,42 @@
+@@ -1105,8 +1242,25 @@
  void GXPokeDither(GXBool) {}
  void GXPokeZMode(GXBool, GXCompare, GXBool) {}
  void GXPokeARGB(u16, u16, u32) {}
 -void GXPeekARGB(u16 x, u16 y, u32* color) { *color = peekColor(x, y); }
 -void GXPeekZ(u16 x, u16 y, u32* z) { *z = peekZ(x, y); }
-+// With the graphics worker: the snapshot is taken there where the game
-+// peeked, and the answer comes from the newest one read back (gx_render.cpp).
-+// Peeks with nothing else written between them are a group, as the
-+// renderer counts them, numbered from 0 each frame.
++// With the graphics worker: the game's peeks (the sun's 17 depth probes and
++// Mario's visibility test) are made by TDrawSyncManager's handlers, each
++// just after its draw sync token comes back, and look at the picture as it is
++// at that token. The worker takes that snapshot as it reaches the token
++// (peekAtToken), for the tokens and kinds peeked at before, and the answer
++// comes from the newest one read back (gx_render.cpp).
 +static bool peekWorker(bool depth, u16 x, u16 y, u32* out) {
-+    static uint64_t frame = ~0ull, pos = ~0ull;
-+    static int group = -1;
-+    static unsigned issued = 0;
-+    if (gxt::framesQueued() != frame) {
-+        frame = gxt::framesQueued();
-+        group = -1;
-+        pos = ~0ull;
-+    }
-+    if (pipeWrittenTotal() != pos) {
-+        group++;
-+        issued = 0;
-+    }
-+    const unsigned bit = depth ? 2u : 1u;
-+    if (!(issued & bit)) {
-+        issued |= bit;
-+        const int gr = group;
-+        gxt::call([gr, depth] { peekIssue(gr, depth); });
-+    }
-+    pos = pipeWrittenTotal();
-+    return peekThreaded(group, depth, x, y, out);
++    return peekThreaded(peekKindToken(gxt::lastToken(), depth), depth, x, y, out);
 +}
 +void GXPeekARGB(u16 x, u16 y, u32* color) {
 +    if (gxt::on() && peekWorker(false, x, y, color)) return;
@@ -750,7 +733,7 @@ Delfino Plaza on the Switch).
  void GXPokeZ(u16, u16, u32) {}
  u32 GXCompressZ16(u32 z24, GXZFmt16) { return z24 >> 8; }
  u32 GXDecompressZ16(u32 z16, GXZFmt16) { return z16 << 8; }
-@@ -1176,19 +1347,23 @@
+@@ -1176,19 +1330,23 @@
      if (disp) apiBP(BP_COPY_YSCALE, s_dispYScale);
      // the renderer needs the host pointer; commands carry a physical address
      apiBP(BP_COPY_DST, ptrToPhys(dest) >> 5);
@@ -776,7 +759,7 @@ Delfino Plaza on the Switch).
  }
  void GXCopyDisp(void* dest, GXBool clear) { doCopy(dest, clear, true); }
  void GXCopyTex(void* dest, GXBool clear) { doCopy(dest, clear, false); }
-@@ -1335,7 +1510,10 @@
+@@ -1335,7 +1493,10 @@
          uint32_t fmt = idx < 20 ? s_tlutLoaded[idx].fmt : 0;
          apiBP(bpTexReg(BP_TX_TLUT, map), ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | fmt << 10);
      }
@@ -788,7 +771,7 @@ Delfino Plaza on the Switch).
  }
  void GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
      if (s_texRegionCb) s_texRegionCb(obj, id);
-@@ -1362,8 +1540,15 @@
+@@ -1362,8 +1523,15 @@
      uint32_t off = r->tmemAddr - TMEM_TLUT_BASE;
      uint32_t bytes = uint32_t(t->entries) * 2;
      if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
@@ -805,7 +788,7 @@ Delfino Plaza on the Switch).
  }
  void GXInitTexCacheRegion(GXTexRegion* region, u8 is32b, u32 even, GXTexCacheSize, u32 odd, GXTexCacheSize) {
      TexRegionInt* r = reinterpret_cast<TexRegionInt*>(region);
-@@ -1383,8 +1568,15 @@
+@@ -1383,8 +1551,15 @@
      r->tmemAddr = uint32_t(addr);
      r->size = uint32_t(size);
  }
@@ -822,7 +805,7 @@ Delfino Plaza on the Switch).
      flushBatch();
      textureInvalidateAll();
  }
-@@ -1401,7 +1593,8 @@
+@@ -1401,7 +1576,8 @@
  void GXPreLoadEntireTexture(GXTexObj*, GXTexRegion*) {}
  void GXSetTexCoordScaleManually(GXTexCoordID coord, u8 enable, u16 ss, u16 ts) {
      if (coord >= 8) return;
@@ -832,7 +815,7 @@ Delfino Plaza on the Switch).
      if (enable) {
          bpField(BP_SU_SSIZE + 2 * coord, 16, 0, ss - 1u);
          bpField(BP_SU_SSIZE + 2 * coord + 1, 16, 0, ts - 1u);
-@@ -1492,11 +1685,22 @@
+@@ -1492,11 +1668,22 @@
  // top/bottom pixels in and colour pixels in all report the pixels that
  // passed (plus 4 per triangle, see gx_render.cpp); the rest read zero.
  void GXReadPixMetric(u32* topIn, u32* topOut, u32* botIn, u32* botOut, u32* clrIn, u32* copyClks) {
@@ -857,7 +840,7 @@ Delfino Plaza on the Switch).
  void GXSetVCacheMetric(GXVCachePerf) {}
  void GXReadVCacheMetric(u32* a, u32* b, u32* c) { *a = *b = *c = 0; }
  void GXClearVCacheMetric(void) {}
-@@ -1507,8 +1711,8 @@
+@@ -1507,8 +1694,8 @@
  
  // ================================================================== GXDraw (SDK helper shapes)
  static void drawWithPosNrm(void (*body)()) {
@@ -895,7 +878,7 @@ Delfino Plaza on the Switch).
      static double tick = 0;
      if (tick == 0) {
          mach_timebase_info_data_t tb;
-@@ -239,7 +249,15 @@
+@@ -239,7 +249,16 @@
          g.drawSyncToken = uint16_t(data & 0xFFFF);
          if (reg == BP_PE_TOKEN_INT && drawSyncCallback) {
              flushBatch();
@@ -906,13 +889,14 @@ Delfino Plaza on the Switch).
 +                    gxt::g_metricArmed = false;
 +                    metric = pixMetricRead();
 +                }
++                peekAtToken(g.drawSyncToken);  // what its callback will peek at, as it is here
 +                gxt::drawSyncReached(g.drawSyncToken, metric);
 +            }
 +            else drawSyncCallback(g.drawSyncToken);
          }
          return;
      case BP_DRAWDONE:
-@@ -404,6 +422,36 @@
+@@ -404,6 +423,36 @@
      L.size = s;
  }
  
@@ -949,7 +933,7 @@ Delfino Plaza on the Switch).
  // buildLayout for the current registers, rebuilt only when they change
  static const VtxLayout& layoutFor(int vat) {
      struct Cached {
-@@ -892,6 +940,139 @@
+@@ -892,6 +941,139 @@
  
  // Executes complete commands from [p, p+n).  Returns bytes consumed; if the
  // tail holds an incomplete command, *need receives its total length.
@@ -1089,7 +1073,7 @@ Delfino Plaza on the Switch).
  static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
      const uint8_t* start = p;
      const uint8_t* end = p + n;
-@@ -940,6 +1121,15 @@
+@@ -940,6 +1122,15 @@
              len = 5;
              if (avail < len) break;
              writeBP(be32(p + 1));
@@ -1105,7 +1089,7 @@ Delfino Plaza on the Switch).
          } else if (op >= 0x80 && op < 0xC0) {
              if (avail < 3) { len = 3; break; }
              const VtxLayout& L = layoutFor(op & 7);
-@@ -973,7 +1163,11 @@
+@@ -973,7 +1164,11 @@
          else if (op >= 0x20 && op <= 0x38) len = 5;
          else if (op == 0x40) len = 9;
          else if (op == 0x61) len = 5;
@@ -1118,7 +1102,7 @@ Delfino Plaza on the Switch).
              if (avail < 3) len = 3;
              else {
                  len = 3 + be16(p + 1) * layoutFor(op & 7).size;
-@@ -984,6 +1178,8 @@
+@@ -984,6 +1179,8 @@
      return uint32_t(p - start);
  }
  
@@ -1127,7 +1111,7 @@ Delfino Plaza on the Switch).
  void runCommands(const uint8_t* data, uint32_t size) {
      uint32_t need = 0;
      uint32_t used = parse(data, size, &need);
-@@ -1350,7 +1546,13 @@
+@@ -1350,7 +1547,13 @@
  #define s_pipeBuf GXPC_PipeBuf
  #define s_pipeLen GXPC_PipeLen
  namespace gx {
@@ -1142,7 +1126,7 @@ Delfino Plaza on the Switch).
  
  // Writes through a redirected pipe go to memory directly (uncached on the
  // GameCube, so the game flushes nothing): stamp them when the redirect ends.
-@@ -1396,9 +1598,114 @@
+@@ -1396,9 +1599,114 @@
      if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
      memcpy(s_pipeBuf + s_pipeLen, bytes, n);
      s_pipeLen += n;
@@ -1257,7 +1241,7 @@ Delfino Plaza on the Switch).
  void pipeWrite(const uint8_t* bytes, uint32_t n) { pipePut(bytes, n); }
  
  }  // namespace gx
-@@ -1416,6 +1723,7 @@
+@@ -1416,6 +1724,7 @@
  void GXPC_MemoryWritten(const void* p, uint32_t size) { memoryWritten(p, size); }
  
  void GXPC_AddBigEndianRange(const void* p, uint32_t size) {
@@ -1265,7 +1249,7 @@ Delfino Plaza on the Switch).
      if (!p || !size) return;
      uintptr_t a = reinterpret_cast<uintptr_t>(p);
      s_beRanges[a] = a + size;
-@@ -1424,6 +1732,7 @@
+@@ -1424,6 +1733,7 @@
      s_beHitHi = 0;
  }
  void GXPC_RemoveBigEndianRange(const void* p) {
@@ -1273,7 +1257,7 @@ Delfino Plaza on the Switch).
      s_beRanges.erase(reinterpret_cast<uintptr_t>(p));
      s_beGen++;
      s_beHitLo = 1;
-@@ -1433,6 +1742,7 @@
+@@ -1433,6 +1743,7 @@
  void* GXPC_PhysToPtr(uint32_t phys) { return physToPtr(phys); }
  
  void GXPC_SetArrayBigEndian(int attr, int bigEndian) {
@@ -1281,7 +1265,7 @@ Delfino Plaza on the Switch).
      int slot;
      if (attr == 25) slot = 1;           // GX_VA_NBT shares the normal array
      else if (attr >= 9 && attr <= 24) slot = attr - 9;
-@@ -1441,6 +1751,7 @@
+@@ -1441,6 +1752,7 @@
      g_arrayGen++;
  }
  void GXPC_SetDefaultArrayBigEndian(int bigEndian) {
@@ -1337,16 +1321,17 @@ Delfino Plaza on the Switch).
  #include "gl_funcs.h"
  #include "gx_glcache.h"
  #include "gx_glthread.h"
-@@ -16,6 +17,8 @@
+@@ -16,6 +17,9 @@
  #include <time.h>
  #include <string.h>
  #include <atomic>
 +#include <deque>
++#include <functional>
 +#include <mutex>
  #include <unordered_map>
  
  namespace gx {
-@@ -143,6 +146,30 @@
+@@ -143,6 +147,73 @@
  // never touches data a queued draw still reads. Replaces a glBufferData
  // reallocation (or a glBufferSubData into a buffer every queued draw uses) per
  // batch, and a map per piece (map/unmap were half of all GL calls).
@@ -1356,12 +1341,55 @@ Delfino Plaza on the Switch).
 +// the end of each shown frame (frameShownFence), polled there without
 +// waiting. ~0u until the first one passes.
 +static std::atomic<uint32_t> s_gpuDoneFrame{~0u};
++
++// Read-backs on the GL thread (metrics, write-backs, peeks) wait for the GPU
++// only when asked to: one whose result has not come in is kept here and tried
++// again without waiting as each frame ends, so the GL thread goes on with the
++// next frame's commands meanwhile (at 2x it waited for the GPU to finish each
++// frame, most of its time, and the GPU then for its commands). Whoever needs
++// a result first has the GL thread finish them, waiting (waitFetched).
++static std::vector<std::function<bool(bool)>> s_glPending;  // GL thread only
++static void glPendingRun(bool block) {
++    size_t keep = 0;
++    for (size_t i = 0; i < s_glPending.size(); i++) {
++        if (s_glPending[i](block)) continue;
++        if (keep != i) s_glPending[keep] = std::move(s_glPending[i]);
++        keep++;
++    }
++    s_glPending.resize(keep);
++}
++static void glPendingAdd(std::function<bool(bool)> fn) {
++    if (!fn(false)) s_glPending.push_back(std::move(fn));
++}
++static void waitFetched(std::atomic<int>& flag) {
++    if (flag.load(std::memory_order_acquire)) return;
++    glt::post([] { glPendingRun(true); });
++    glt::waitFlag(flag);
++}
 +static bool gpuFinishedFrame(uint32_t frame) {
 +    const uint32_t done = s_gpuDoneFrame.load(std::memory_order_acquire);
 +    return glt::active() && done != ~0u && int32_t(done - frame) >= 0;
 +}
++// With the graphics worker: the GL thread marks each frame's end as it gets
++// there, and the worker keeps it at most a frame behind (glFrameThrottle).
++// Presenting does not wait for the swap, so without this the worker ran
++// frames ahead of the GL thread, and a read-back it needed then waited for
++// that whole backlog and the GPU.
++static std::atomic<int> s_glFrameReached[4];
++static void glFrameThrottle(uint32_t frame) {
++    if (!gxt::onWorker()) return;
++    s_glFrameReached[frame & 3].store(0);
++    std::atomic<int>* f = &s_glFrameReached[frame & 3];
++    glt::post([f] { glt::signalFlag(*f); });
++    if (frame == 0) return;
++    GxTimer tw(&s_waitSeconds);
++    glt::waitFlag(s_glFrameReached[(frame - 1) & 3]);
++}
++
 +static void frameShownFence(uint32_t frame) {
++    glFrameThrottle(frame);
 +    glt::post([frame] {  // on the GL thread
++        glPendingRun(false);
 +        static std::deque<std::pair<uint32_t, GLsync>> pending;
 +        pending.emplace_back(frame, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
 +        while (!pending.empty()) {
@@ -1377,7 +1405,7 @@ Delfino Plaza on the Switch).
  struct StreamPiece {
      const void* data;
      size_t bytes, align;
-@@ -153,6 +180,7 @@
+@@ -153,6 +224,7 @@
      GLuint buf = 0;
      size_t size = 0, pos = 0;
      GLsync fence[kSegments] = {};
@@ -1385,7 +1413,7 @@ Delfino Plaza on the Switch).
  
      // With ARB_buffer_storage (GL 4.4; not macOS) the buffer stays mapped:
      // writes go straight into it, without a map/unmap pair per batch.
-@@ -201,10 +229,21 @@
+@@ -201,10 +273,21 @@
      // segments from `unfenced` through `last`.
      void fenceThrough(size_t last) {
          for (size_t sg = unfenced; sg <= last && sg < kSegments; sg++)
@@ -1408,7 +1436,7 @@ Delfino Plaza on the Switch).
          GxTimer tw(&s_waitSeconds);
          glClientWaitSync(fence[seg], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
          glDeleteSync(fence[seg]);
-@@ -1781,6 +1820,7 @@
+@@ -1781,6 +1864,7 @@
  // from the same read one frame earlier instead (as Dolphin does), which the
  // game cannot tell apart; SMS_GX_SYNC_READS=1 goes back to synchronous reads.
  static uint32_t s_frameNo = 0;   // display copies so far
@@ -1416,7 +1444,7 @@ Delfino Plaza on the Switch).
  uint32_t g_displayFrames = 0;    // the same, for the rest of sms_gx
  static uint32_t s_drawGen = 0;   // bumped by anything that changes the EFB
  static bool asyncReads() {
-@@ -1798,16 +1838,19 @@
+@@ -1798,26 +1882,33 @@
  // so the count is the samples that passed plus 4 per triangle. Copy passes
  // in between are left out: they end the running query, which is summed at
  // the read. Each clear/read pair of a frame is a slot; a slot that drew the
@@ -1428,7 +1456,10 @@ Delfino Plaza on the Switch).
 +// same number of triangles one or two frames earlier, in one query, is
 +// answered from that frame's query (the newest one already read back),
 +// otherwise the queries are waited for.
-+enum { kMetricSlots = 32, kMetricFrames = 3 };
++// Up to 5 frames old: presenting waits for a free swapchain image in the
++// GPU's queue, so at 60 fps the GPU runs that far behind; the newest result
++// that has come back is still taken, waiting only for the oldest.
++enum { kMetricSlots = 32, kMetricFrames = 6 };
 +static GLuint s_mq[kMetricFrames][kMetricSlots];
 +static uint32_t s_mqTris[kMetricFrames][kMetricSlots], s_mqFrame[kMetricFrames][kMetricSlots];
  // With the GL thread, the results of a frame's queries are read once it is
@@ -1445,8 +1476,9 @@ Delfino Plaza on the Switch).
  
  static uint32_t takeFetchedMetric(int par, int slot) {
      {
-@@ -1815,9 +1858,10 @@
-         glt::waitFlag(s_mqReady[par][slot]);
+         GxTimer tw(&s_waitSeconds);
+-        glt::waitFlag(s_mqReady[par][slot]);
++        waitFetched(s_mqReady[par][slot]);
      }
      s_mqFetching[par][slot] = false;
 +    s_mqHave[par][slot] = true;
@@ -1457,7 +1489,7 @@ Delfino Plaza on the Switch).
  static int s_mqSlot = -1;
  static uint32_t s_mqSlotFrame = ~0u;
  static bool s_pixActive = false, s_pixTaint = false;
-@@ -1863,9 +1907,10 @@
+@@ -1863,9 +1954,10 @@
          s_mqSlot = -1;
      }
      s_mqSlot++;
@@ -1469,7 +1501,7 @@ Delfino Plaza on the Switch).
          if (!s_mq[cur][s_mqSlot]) glGenQueries(1, &s_mq[cur][s_mqSlot]);
          s_pixCur = s_mq[cur][s_mqSlot];
          s_pixCurPooled = false;
-@@ -1885,15 +1930,22 @@
+@@ -1885,15 +1977,22 @@
      if (!s_ready || !s_pixActive) return 0;
      glEndQuery(GL_SAMPLES_PASSED);
      uint64_t samples = 0;
@@ -1496,7 +1528,7 @@ Delfino Plaza on the Switch).
              fromPrev = true;
          }
      }
-@@ -1917,9 +1969,10 @@
+@@ -1917,19 +2016,27 @@
  
  static void prefetchMetrics() {
      const uint32_t frame = s_frameNo - 1;
@@ -1509,7 +1541,28 @@ Delfino Plaza on the Switch).
          s_mqFetching[par][slot] = true;
          s_mqReady[par][slot].store(0);
          const GLuint q = s_mq[par][slot];
-@@ -2083,22 +2136,24 @@
+         uint32_t* out = &s_mqResult[par][slot];
+         std::atomic<int>* ready = &s_mqReady[par][slot];
+         glt::post([=] {
+-            GLuint n = 0;
+-            glGetQueryObjectuiv(q, GL_QUERY_RESULT, &n);
+-            *out = n;
+-            glt::signalFlag(*ready);
++            glPendingAdd([=](bool block) {
++                GLuint n = 0;
++                if (!block) {
++                    glGetQueryObjectuiv(q, GL_QUERY_RESULT_AVAILABLE, &n);
++                    if (!n) return false;
++                }
++                glGetQueryObjectuiv(q, GL_QUERY_RESULT, &n);
++                *out = n;
++                glt::signalFlag(*ready);
++                return true;
++            });
+         });
+     }
+ }
+@@ -2083,22 +2190,24 @@
              glVertexAttribI4ui(14, m[0], m[1], m[2], 0);
          }
      }
@@ -1543,7 +1596,7 @@ Delfino Plaza on the Switch).
          s_xfDirty = false;
      }
      const bool streamed = s_bidx.size != 0;
-@@ -2109,7 +2164,7 @@
+@@ -2109,7 +2218,7 @@
      if (np) s_stream.appendAll(pc, np);
      if (xfWritten) s_xfOffset = pc[0].at;
      if (xfWritten || g_glc.uniformBuffer == ~0u) {
@@ -1552,7 +1605,7 @@ Delfino Plaza on the Switch).
          g_glc.uniformBuffer = s_stream.buf;  // the range bind also sets the generic binding
      }
      const size_t vOff = streamed ? pc[np - 2].at : 0, iOff = streamed ? pc[np - 1].at : 0;
-@@ -2372,33 +2427,77 @@
+@@ -2372,33 +2481,77 @@
  struct WbFetch {
      std::atomic<int> ready{0};
      bool ok = false;
@@ -1618,7 +1671,8 @@ Delfino Plaza on the Switch).
      if (w.fetch) {
          {
              GxTimer tw(&s_waitSeconds);
-             glt::waitFlag(w.fetch->ready);
+-            glt::waitFlag(w.fetch->ready);
++            waitFetched(w.fetch->ready);
          }
 -        if (!w.cancelled && w.fetch->ok && hashBytes(w.dest, w.bytes) == w.hash)
 +        if (!w.cancelled && w.fetch->ok && writeBackDestUnchanged(w)) {
@@ -1633,7 +1687,7 @@ Delfino Plaza on the Switch).
          const void* px;
          {
              GxTimer tw(&s_waitSeconds);
-@@ -2414,13 +2513,24 @@
+@@ -2414,13 +2567,24 @@
      s_freePbos.push_back(w.pbo);
  }
  
@@ -1655,13 +1709,13 @@ Delfino Plaza on the Switch).
          PendingWriteBack& w = s_writeBacks[i];
 -        if (!all && !w.cancelled && w.frame >= s_frameNo) s_writeBacks[keep++] = w;
 -        else resolveWriteBack(w);
-+        const bool due = all || w.cancelled || w.frame + 1 < s_frameNo || (w.frame < s_frameNo && writeBackArrived(w));
++        const bool due = all || w.cancelled || w.frame + 4 < s_frameNo || (w.frame < s_frameNo && writeBackArrived(w));
 +        if (due) resolveWriteBack(w);
 +        else s_writeBacks[keep++] = w;
      }
      s_writeBacks.resize(keep);
  }
-@@ -2447,13 +2557,17 @@
+@@ -2447,13 +2611,17 @@
      }
      // A copy to the same place supersedes one of this frame; one from an
      // earlier frame (most games copy to the same buffer every frame) is
@@ -1676,13 +1730,13 @@ Delfino Plaza on the Switch).
 -        else if (w.frame < s_frameNo) resolveWriteBack(w);
 -        else {
 +        else if (w.frame < s_frameNo) {
-+            if (w.frame + 1 < s_frameNo || writeBackArrived(w)) resolveWriteBack(w);
++            if (w.frame + 4 < s_frameNo || writeBackArrived(w)) resolveWriteBack(w);
 +            else s_writeBacks[keep++] = w;
 +        } else {
              w.cancelled = true;
              resolveWriteBack(w);
          }
-@@ -2470,8 +2584,8 @@
+@@ -2470,8 +2638,8 @@
      glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(readBytes), nullptr, GL_STREAM_READ);
      glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
@@ -1693,15 +1747,40 @@ Delfino Plaza on the Switch).
      s_writeBacks.push_back(w);
  }
  
-@@ -2496,6 +2610,7 @@
-             bindPack(pbo, &prev);
-             if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
-                 memcpy(f->bytes.data(), px, n);
-+                f->hash = hashBytes(f->bytes.data(), n);
-                 f->ok = true;
-                 glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-             }
-@@ -2642,7 +2757,9 @@
+@@ -2491,16 +2659,22 @@
+         const GLuint pbo = w.pbo;
+         const uint32_t n = w.bytes;
+         glt::post([=] {
+-            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+-            GLint prev = 0;
+-            bindPack(pbo, &prev);
+-            if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
+-                memcpy(f->bytes.data(), px, n);
+-                f->ok = true;
+-                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+-            }
+-            bindPack(GLuint(prev), nullptr);
+-            glt::signalFlag(f->ready);
++            glPendingAdd([=](bool block) {
++                if (glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, block ? 1000000000ull : 0) == GL_TIMEOUT_EXPIRED &&
++                    !block)
++                    return false;
++                GLint prev = 0;
++                bindPack(pbo, &prev);
++                if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
++                    memcpy(f->bytes.data(), px, n);
++                    f->hash = hashBytes(f->bytes.data(), n);
++                    f->ok = true;
++                    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++                }
++                bindPack(GLuint(prev), nullptr);
++                glt::signalFlag(f->ready);
++                return true;
++            });
+         });
+         w.fetch = f;
+     }
+@@ -2642,7 +2816,9 @@
      copyEfb(ctrl);
      // presenting (the hook) is timed apart from sms_gx: GXPC_GetTimes
      if (disp && g_displayCopyHook) g_displayCopyHook(dest);
@@ -1711,7 +1790,7 @@ Delfino Plaza on the Switch).
          prefetchWriteBacks();
          prefetchPeeks();
          prefetchMetrics();
-@@ -2714,6 +2831,7 @@
+@@ -2714,6 +2890,7 @@
  }
  
  void GXPC_PreloadTextures(void) {
@@ -1719,7 +1798,7 @@ Delfino Plaza on the Switch).
      if (!s_ready) return;
      flushBatch();
      glcInvalidate();
-@@ -2721,6 +2839,7 @@
+@@ -2721,6 +2898,7 @@
  }
  
  void GXPC_PrepareStage(int stage) {
@@ -1727,7 +1806,7 @@ Delfino Plaza on the Switch).
      if (!s_ready) return;
      flushBatch();
      glcInvalidate();
-@@ -2729,6 +2848,7 @@
+@@ -2729,6 +2907,7 @@
  }
  
  void GXPC_Shutdown(void) {
@@ -1735,7 +1814,7 @@ Delfino Plaza on the Switch).
      if (!s_ready) return;
      textureShutdown();
      shaderShutdown();
-@@ -2750,6 +2870,11 @@
+@@ -2750,6 +2929,11 @@
  
  void GXPC_InvalidateRange(const void* p, uint32_t size) {
      memoryWritten(p, size);
@@ -1747,7 +1826,18 @@ Delfino Plaza on the Switch).
      if (copyWriteBackEnabled()) textureCpuWrote(p, size);
      else textureInvalidateRange(p, size);
  }
-@@ -2773,7 +2898,13 @@
+@@ -2762,7 +2946,9 @@
+ // group; the first peek of a group starts an asynchronous read of the whole
+ // buffer, and the group is answered from the same group's read one frame
+ // earlier (synchronously the first time a group appears).
+-enum { kPeekGroups = 8 };
++// groups 0-7 as peeks come (peekRaw, or numbered by the game), 8-11 taken
++// where a draw sync token is reached (peekAtToken)
++enum { kPeekGroups = 12, kTokenGroupBase = 8 };
+ struct PeekSnap {
+     GLuint pbo = 0;
+     GLsync fence = 0;
+@@ -2773,7 +2959,13 @@
      std::atomic<int> ready{0};
      const uint8_t* fetched = nullptr;
  };
@@ -1757,12 +1847,18 @@ Delfino Plaza on the Switch).
 +// the frame before is often still on the GPU when the game peeks (Mario's
 +// visibility test, every frame), and waiting for it cost the game's thread
 +// about 2 ms a frame.
-+enum { kPeekFrames = 3 };
++enum { kPeekFrames = 6 };
 +static PeekSnap s_peek[kPeekFrames][kPeekGroups][2];  // [frame % kPeekFrames][group][colour, depth]
  static uint32_t s_peekDrawGen = ~0u, s_peekFrame = ~0u, s_peekIssued = 0;
  static int s_peekGroup = -1;
  
-@@ -2787,6 +2918,7 @@
+@@ -2782,11 +2974,12 @@
+     if (!p.fetching) return;
+     {
+         GxTimer tw(&s_waitSeconds);
+-        glt::waitFlag(p.ready);
++        waitFetched(p.ready);
+     }
      p.map = p.fetched;
      p.fetching = false;
  }
@@ -1770,7 +1866,7 @@ Delfino Plaza on the Switch).
  
  // Maps the snapshots of the frame just shown on the GL thread, which waits
  // for the GPU there instead of the game at its next peek.
-@@ -2795,10 +2927,13 @@
+@@ -2795,20 +2988,30 @@
      const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
      for (int gi = 0; gi < kPeekGroups; gi++)
          for (int t = 0; t < 2; t++) {
@@ -1787,16 +1883,42 @@ Delfino Plaza on the Switch).
              PeekSnap* ps = &p;
              const GLsync fence = p.fence;
              const GLuint pbo = p.pbo;
-@@ -2876,7 +3011,7 @@
+             glt::post([=] {
+-                glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+-                GLint prev = 0;
+-                bindPack(pbo, &prev);
+-                ps->fetched = static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
+-                bindPack(GLuint(prev), nullptr);
+-                glt::signalFlag(ps->ready);
++                glPendingAdd([=](bool block) {
++                    if (glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, block ? 1000000000ull : 0) ==
++                            GL_TIMEOUT_EXPIRED &&
++                        !block)
++                        return false;
++                    GLint prev = 0;
++                    bindPack(pbo, &prev);
++                    ps->fetched =
++                        static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
++                    bindPack(GLuint(prev), nullptr);
++                    glt::signalFlag(ps->ready);
++                    return true;
++                });
+             });
+         }
+ }
+@@ -2874,9 +3077,9 @@
+         s_peekFrame = s_frameNo;
+         s_peekIssued = 0;
      }
-     if (s_peekGroup >= kPeekGroups) return peekSync(x, y, depth);
+-    if (s_peekGroup >= kPeekGroups) return peekSync(x, y, depth);
++    if (s_peekGroup >= kTokenGroupBase) return peekSync(x, y, depth);
      const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
 -    int cur = s_frameNo & 1, t = depth ? 1 : 0;
 +    int cur = int(s_frameNo % kPeekFrames), t = depth ? 1 : 0;
      if (!(s_peekIssued & (1u << t))) {
          s_peekIssued |= 1u << t;
          PeekSnap& now = s_peek[cur][s_peekGroup][t];
-@@ -2898,8 +3033,19 @@
+@@ -2898,8 +3101,19 @@
          now.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
          now.frame = s_frameNo;
      }
@@ -1818,7 +1940,7 @@ Delfino Plaza on the Switch).
          takeFetchedPeek(prev);
          if (!prev.map) {
              GxTimer tw(&s_waitSeconds);
-@@ -2917,6 +3063,70 @@
+@@ -2917,6 +3131,108 @@
      return peekSync(x, y, depth);
  }
  
@@ -1863,6 +1985,44 @@ Delfino Plaza on the Switch).
 +    now.frame = s_frameNo;
 +}
 +
++// Peeks inside a draw sync callback (the sun's 17 depth probes at token 0x7D,
++// Mario's visibility test at 0x7C) see the picture where the token is in the
++// stream; with the worker they run later, so the worker takes their
++// snapshot as it reaches the token. Each kind has its peeker (the sun the
++// depth, Mario the colour) and its token: the one most often last when the
++// game peeks that kind (peekKindToken), which a peek made a little late
++// cannot move. A kind's snapshot is group kTokenGroupBase + kind.
++static std::atomic<uint32_t> s_kindToken[2];  // token + 1, 0 none yet
++
++int peekKindToken(uint16_t token, bool depth) {  // the game's side
++    struct Seen {
++        uint16_t token;
++        uint32_t n;
++    };
++    static Seen seen[2][8];
++    Seen* s = seen[depth ? 1 : 0];
++    int at = -1;
++    for (int i = 0; i < 8; i++)
++        if (s[i].n && s[i].token == token) at = i;
++    if (at < 0) {  // a new one takes the least seen place
++        at = 0;
++        for (int i = 1; i < 8; i++)
++            if (s[i].n < s[at].n) at = i;
++        s[at] = {token, 0};
++    }
++    s[at].n++;
++    int best = 0;
++    for (int i = 1; i < 8; i++)
++        if (s[i].n > s[best].n) best = i;
++    s_kindToken[depth ? 1 : 0].store(uint32_t(s[best].token) + 1);
++    return kTokenGroupBase + (depth ? 1 : 0);
++}
++
++void peekAtToken(uint16_t token) {  // the worker, at the token
++    if (s_kindToken[0].load() == uint32_t(token) + 1) peekIssue(kTokenGroupBase, false);
++    if (s_kindToken[1].load() == uint32_t(token) + 1) peekIssue(kTokenGroupBase + 1, true);
++}
++
 +bool peekThreaded(int group, bool depth, int x, int y, uint32_t* out) {
 +    if (s_efbW != EFB_W && x >= 0) x = int((float(x) + 0.5f) * s_wide);
 +    if (group < 0 || group >= kPeekGroups || x < 0 || y < 0 || x >= s_efbW || y >= EFB_H) return false;
@@ -1889,7 +2049,7 @@ Delfino Plaza on the Switch).
  uint32_t peekColor(int x, int y) {
      uint32_t p = peekRaw(x, y, false);
      uint32_t c = (p >> 24) << 24 | (p & 0xFF) << 16 | ((p >> 8) & 0xFF) << 8 | ((p >> 16) & 0xFF);
-@@ -2933,6 +3143,7 @@
+@@ -2933,6 +3249,7 @@
  extern "C" {
  
  int GXPC_PresentXFB(const void* xfb, int winW, int winH) {
@@ -1897,7 +2057,7 @@ Delfino Plaza on the Switch).
      flushBatch();
      glcInvalidate();
      if (!xfb) xfb = s_lastXfb;
-@@ -2972,6 +3183,7 @@
+@@ -2972,6 +3289,7 @@
  }
  
  void GXPC_ReadEFB(uint8_t* rgba, int* w, int* h) {
@@ -1905,7 +2065,7 @@ Delfino Plaza on the Switch).
      flushBatch();
      glcInvalidate();
      *w = scaled(s_efbW);
-@@ -2983,6 +3195,7 @@
+@@ -2983,6 +3301,7 @@
  }
  
  int GXPC_ReadXFB(const void* xfb, uint8_t* rgba, int* w, int* h) {
@@ -1913,7 +2073,7 @@ Delfino Plaza on the Switch).
      flushBatch();
      glcInvalidate();
      if (!xfb) xfb = s_lastXfb;
-@@ -3006,6 +3219,7 @@
+@@ -3006,6 +3325,7 @@
  }
  
  void GXPC_SetHud(int on) {
@@ -1921,7 +2081,7 @@ Delfino Plaza on the Switch).
      if (!s_hudEdges || s_hud == (on != 0)) return;
      flushBatch();
      s_hud = on != 0;
-@@ -3029,24 +3243,28 @@
+@@ -3029,24 +3349,28 @@
  }
  
  void GXPC_HudPaneBegin(float x1, float x2) {
@@ -2158,7 +2318,7 @@ Delfino Plaza on the Switch).
  		memset(&status[i], 0, sizeof status[i]);
 --- /dev/null
 +++ b/platform/gx/src/gx_thread.h
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,110 @@
 +// The graphics worker (SMS_GX_THREAD=1): the GX front end on a thread of its
 +// own, as a GameCube's GPU reads its FIFO while the CPU goes on.
 +//
@@ -2232,6 +2392,7 @@ Delfino Plaza on the Switch).
 +extern bool g_metricArmed;
 +uint16_t lastToken();
 +bool inDrawSyncCallback(uint32_t* metric);
++bool inDrawSyncCallbackToken(uint16_t* token);
 +
 +}  // namespace gxt
 +
@@ -2250,6 +2411,8 @@ Delfino Plaza on the Switch).
 +// read back (false: none yet).
 +void peekIssue(int group, bool depth);
 +bool peekThreaded(int group, bool depth, int x, int y, uint32_t* out);
++int peekKindToken(uint16_t token, bool depth);  // a peek after a token: its kind's group
++void peekAtToken(uint16_t token);                // the worker, as it reaches a token
 +// Bytes written into the stream so far (gx_fifo.cpp).
 +uint64_t pipeWrittenTotal();
 +
@@ -2268,7 +2431,7 @@ Delfino Plaza on the Switch).
 +#endif
 --- /dev/null
 +++ b/platform/gx/src/gx_thread.cpp
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,293 @@
 +// The graphics worker: see gx_thread.h.
 +#include "gx_thread.h"
 +
@@ -2372,20 +2535,26 @@ Delfino Plaza on the Switch).
 +std::atomic<uint32_t> s_lastToken{0};
 +bool s_inCallback = false;  // game side
 +uint32_t s_callbackMetric = 0;
++uint16_t s_callbackToken = 0;
 +
 +// Interrupt source, on the game's side: the callbacks of the tokens reached.
 +void deliverDrawSyncs() {
++    // one token a pass: TDrawSyncManager's thread handles each (and peeks)
++    // before the next one is the last token
 +    std::vector<Reached> now;
 +    {
 +        std::lock_guard<std::mutex> lk(s_syncMu);
 +        if (s_reached.empty()) return;
-+        now.swap(s_reached);
++        now.push_back(s_reached.front());
++        s_reached.erase(s_reached.begin());
++        if (!s_reached.empty()) port_irq_kick();
 +    }
 +    for (const Reached& r : now) {
 +        s_lastToken.store(r.token, std::memory_order_relaxed);
 +        if (!drawSyncCallback) continue;
 +        s_inCallback = true;
 +        s_callbackMetric = r.metric;
++        s_callbackToken = r.token;
 +        drawSyncCallback(r.token);
 +        s_inCallback = false;
 +    }
@@ -2538,6 +2707,12 @@ Delfino Plaza on the Switch).
 +}
 +
 +uint16_t lastToken() { return uint16_t(s_lastToken.load(std::memory_order_relaxed)); }
++
++bool inDrawSyncCallbackToken(uint16_t* token) {
++    if (!s_inCallback) return false;
++    *token = s_callbackToken;
++    return true;
++}
 +
 +bool inDrawSyncCallback(uint32_t* metric) {
 +    if (!s_inCallback) return false;
