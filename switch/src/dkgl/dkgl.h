@@ -14,6 +14,7 @@
 #define SMS_SWITCH_DKGL_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 namespace dkgl {
 
@@ -29,6 +30,9 @@ void setSwapInterval(int interval);
 // Where compiled programs are cached (a directory), and a prebuilt pack of
 // them to read first (a file, or null).
 void setShaderCache(const char* dir, const char* pack);
+// GPU memory by heap (data, readback, image, shader code, commands): in use, and the
+// memory blocks made for it, in bytes (memoryStats may be called from any thread).
+void memoryStats(uint64_t used[5], uint64_t reserved[5]);
 // dkgl's own pixel checks (gx_selftest.nro), after init: the number failed.
 int runChecks();
 

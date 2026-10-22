@@ -37,6 +37,7 @@ constexpr int kGlCore = 1;
 constexpr int kDspCore = 2;
 constexpr int kOtherCores[] = {2, 0}; // the cores other threads start on, in turn
 std::atomic<int> g_next_core(0);
+std::atomic<unsigned> g_threads_created(0); // (diagnostics.cpp's memory lines)
 
 bool spread_threads()
 {
@@ -52,9 +53,12 @@ bool spread_threads()
 
 extern "C" void sms_switch_profile_created(Handle h, void* entry); // profiler.cpp
 
+extern "C" unsigned sms_switch_threads_created(void) { return g_threads_created.load(std::memory_order_relaxed); }
+
 extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem, size_t stack_sz,
                                       int prio, int cpuid)
 {
+	g_threads_created.fetch_add(1, std::memory_order_relaxed);
 	if (!spread_threads()) {
 		const Result r = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
 		if (R_SUCCEEDED(r))

@@ -7,6 +7,11 @@
 # destination factor for alpha (the game's shadows drew solid).
 # deko3d-texture-cache-invalidate.patch: its texture cache invalidation
 # with a wait for idle wrote a register the GPU does not have.
+# deko3d-cmd-reserve.patch: commands that reserved fewer words than they
+# wrote (dkCmdBufBindVtxBuffers: the console's GPU method errors, 2359-0001).
+# deko3d-error-report.patch: the release build's report of the queue's GPU
+# error (a page fault and its address, ...), which it compiled out, to the
+# program's dkErrorReport (dkgl's log).
 #
 # Building deko3d takes fincs' dekotools (dekodef: the GPU register
 # definitions to headers), built here too.

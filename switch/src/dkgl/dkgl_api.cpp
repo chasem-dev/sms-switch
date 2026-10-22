@@ -1177,6 +1177,64 @@ Texture* defaultFramebuffer() {
 extern "C" bool GXPC_WindowShotSink(uint32_t frame, const uint8_t* rgba, int w, int h);
 namespace dkgl {
 uint64_t g_swapCount = 0;
+void logObjectsAt(DkGpuAddr addr) {
+    auto in = [&](const Alloc& a) { return a && addr >= a.gpu && addr < a.gpu + a.size; };
+    bool any = false;
+    for (size_t i = 1; i < g.buffers.objs.size(); i++)
+        if (const Buffer* b = g.buffers.objs[i].get(); b && in(b->mem)) {
+            logf("  buffer %u + 0x%llx: %u bytes, usage 0x%x", unsigned(i), (unsigned long long)(addr - b->mem.gpu),
+                 b->size, b->usage);
+            any = true;
+        }
+    for (size_t i = 1; i < g.textures.objs.size(); i++)
+        if (const Texture* t = g.textures.objs[i].get(); t && in(t->mem)) {
+            logf("  texture %u + 0x%llx: %ux%u, %u levels, format %d, %s%s", unsigned(i),
+                 (unsigned long long)(addr - t->mem.gpu), t->levels.empty() ? 0 : t->levels[0].w,
+                 t->levels.empty() ? 0 : t->levels[0].h, t->imageLevels, int(t->format),
+                 t->isRenderbuffer ? "renderbuffer" : "texture", t->renderTarget ? ", render target" : "");
+            any = true;
+        }
+    for (size_t i = 1; i < g.programs.objs.size(); i++)
+        if (const Program* p = g.programs.objs[i].get(); p && in(p->code)) {
+            logf("  program %u's code + 0x%llx", unsigned(i), (unsigned long long)(addr - p->code.gpu));
+            any = true;
+        }
+    for (size_t i = 1; i < g.queries.objs.size(); i++)
+        if (const Query* q = g.queries.objs[i].get(); q && in(q->mem)) {
+            logf("  query %u + 0x%llx", unsigned(i), (unsigned long long)(addr - q->mem.gpu));
+            any = true;
+        }
+    for (const auto& c : g_dev.cmdChunks)
+        if (in(c.mem)) {
+            logf("  command memory of submission %llu", (unsigned long long)c.serial);
+            any = true;
+        }
+    if (in(g_dev.transient.mem)) {
+        logf("  the transient chunk being filled (%u bytes used)", g_dev.transient.used);
+        any = true;
+    }
+    for (const auto& t : g_dev.transientRetired)
+        if (in(t.mem)) {
+            logf("  a transient chunk of submission %llu", (unsigned long long)t.serial);
+            any = true;
+        }
+    if (in(g_dev.imageDescs) || in(g_dev.samplerDescs)) {
+        logf("  the %s descriptors", in(g_dev.imageDescs) ? "image" : "sampler");
+        any = true;
+    }
+    for (int i = 0; i < 3; i++)
+        if (in(g_dev.swapMem[i])) {
+            logf("  swapchain image %d", i);
+            any = true;
+        }
+    for (const auto& r : g_dev.retired)
+        if (in(r.alloc)) {
+            logf("  memory freed at submission %llu (not yet reused)", (unsigned long long)r.serial);
+            any = true;
+        }
+    if (!any) logf("  (no GL object's or dkgl's memory)");
+}
+
 // glReadPixels' work, for dkgl_draw.cpp's tests
 void readPixelsTest(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void* pixels) {
     readPixels(x, y, w, h, format, type, pixels);
@@ -1293,6 +1351,14 @@ void tracePixels() {
 void swap() {
     g_swapCount++;
     if (!s_ready) return;
+    // (SMS_DKGL_TEST_GPU_FAULT=n: at the n-th swap a copy to a GPU address
+    // nothing is mapped at, a test of the log's report of a GPU page fault)
+    static const uint64_t faultAt = getenv("SMS_DKGL_TEST_GPU_FAULT") ? strtoull(getenv("SMS_DKGL_TEST_GPU_FAULT"), nullptr, 10) : 0;
+    if (faultAt && g_swapCount == faultAt) {
+        logf("SMS_DKGL_TEST_GPU_FAULT: a copy to GPU address 0xfe00000000");
+        Alloc src = transient(256, 256);
+        dkCmdBufCopyBuffer(g_dev.cmd, src.gpu, 0xfe00000000ull, 256);
+    }
     static uint64_t presentTicks = 0, swapTicks = 0, lastSwap = 0;
     static uint32_t swaps = 0;
     // (the compositor shows the image flipped: its row 0, GL's y = 0, at the bottom)

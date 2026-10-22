@@ -47,10 +47,14 @@ struct Alloc {
 };
 
 enum HeapId {
-    HEAP_DATA,      // CPU-uncached, GPU-cached: buffers, uploads, commands, descriptors
+    HEAP_DATA,      // CPU-uncached, GPU-cached: buffers, uploads, descriptors
     HEAP_READBACK,  // CPU-cached: what the CPU reads back (pixel pack buffers)
     HEAP_IMAGE,     // GPU-only images: textures, render targets
     HEAP_CODE,      // shader code
+    // CPU-uncached, GPU-cached: command memory only, each chunk with a guard
+    // after it (dkgl_device.cpp's addCommandMemory), apart from data so that
+    // nothing written past a chunk lands in buffers or uniforms
+    HEAP_CMD,
     HEAP_COUNT
 };
 
@@ -62,6 +66,16 @@ public:
     Alloc alloc(uint32_t size, uint32_t align);
     void free(const Alloc& a);
     uint64_t used() const { return m_used; }
+    // (read from another thread by memoryStats, a whole word at a time)
+    uint64_t usedRelaxed() const { return __atomic_load_n(&m_used, __ATOMIC_RELAXED); }
+    uint64_t reserved() const { return __atomic_load_n(&m_reserved, __ATOMIC_RELAXED); }
+    // the blocks' GPU addresses in the log; where a GPU address falls among
+    // them, in buf (false: in none, buf naming the block it is past, if any)
+    void logBlocks() const;
+    bool describe(DkGpuAddr addr, char* buf, size_t n) const;
+    // each place a 32-bit word holds `value` in the CPU-visible blocks, in
+    // the log with the words around it, at most *budget of them
+    void logWord(uint32_t value, int* budget) const;
 
 private:
     struct Block {
@@ -74,6 +88,7 @@ private:
     int m_id = 0;
     std::vector<Block> m_blocks;
     uint64_t m_used = 0;
+    uint64_t m_reserved = 0;  // the blocks' bytes (they are never given back)
 };
 
 // --- the device ------------------------------------------------------------
@@ -149,6 +164,8 @@ bool initDevice(int width, int height);
 void shutdownDevice();
 void submit(bool wait = false);
 void checkInputsAtSubmit();  // dkgl_draw.cpp (SMS_DKGL_CHECK_INPUTS)
+// The GL objects whose memory holds a GPU address, in the log (dkgl_api.cpp).
+void logObjectsAt(DkGpuAddr addr);
 void poll();  // updates g_dev.completed and returns what has finished
 void waitSerial(uint64_t serial);
 void retire(const Alloc& a);

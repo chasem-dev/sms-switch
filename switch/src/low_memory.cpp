@@ -544,5 +544,19 @@ extern "C" int munmap(void* addr, size_t length)
 	return 0;
 }
 
+// (diagnostics.cpp's memory lines)
+extern "C" void sms_switch_low_mmap_used(u64* bytes, int* ranges)
+{
+	mutexLock(&g_mmap_lock);
+	*bytes = 0;
+	*ranges = 0;
+	for (int z = 0; z < g_info.zone_count; z++) {
+		for (int i = 0; i < g_used_count[z]; i++)
+			*bytes += g_used[z][i].size;
+		*ranges += g_used_count[z];
+	}
+	mutexUnlock(&g_mmap_lock);
+}
+
 extern "C" int mprotect(void*, size_t, int) { return 0; }
 extern "C" int madvise(void*, size_t, int) { return 0; }

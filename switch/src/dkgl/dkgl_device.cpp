@@ -79,24 +79,60 @@ const uint32_t kSubmitBytes = 512u << 10;   // submit once this much is recorded
 const uint32_t kImageDescriptors = 8192, kSamplerDescriptors = 2048;
 const uint32_t kTimeSlots = 256;  // GPU timestamp pairs (more than lists in flight)
 
+// Each command chunk ends with a guard deko3d is not told about: it writes a
+// command's words after reserving room for them, and where it reserves too
+// few (dkCmdBufBindVtxBuffers did, 5 words a buffer for 6: the console's GPU
+// method errors, 2359-0001, after minutes of play) the rest went past the
+// chunk into the memory after it, which another chunk or data then
+// overwrote before the GPU read it. In the guard they stay the chunk's, and
+// the GPU reads them as written. The log says when the command buffer moves
+// on from a chunk whose guard was written; it is filled again when the chunk
+// is used again (its commands done).
+const uint32_t kCmdGuard = 0x1000;
+const uint32_t kCmdGuardWord = 0x6b647567;  // (not a word deko3d writes there)
+
+uint32_t* cmdGuard(const Alloc& a) { return reinterpret_cast<uint32_t*>(a.cpu + a.size - kCmdGuard); }
+
+void fillCmdGuard(const Alloc& a) {
+    uint32_t* g = cmdGuard(a);
+    for (uint32_t i = 0; i < kCmdGuard / 4 && g[i] != kCmdGuardWord; i++) g[i] = kCmdGuardWord;
+}
+
+void checkCmdGuard(const Alloc& a) {
+    const uint32_t* g = cmdGuard(a);
+    uint32_t n = 0;
+    while (n < kCmdGuard / 4 && g[n] != kCmdGuardWord) n++;
+    static int said = 0;
+    if (n && said++ < 8)
+        logf("deko3d wrote %u words past a command chunk's end (into its guard; submission %llu)", n,
+             (unsigned long long)g_dev.serial);
+}
+
 void addCommandMemory(void*, DkCmdBuf cmd, size_t minReqSize) {
     Alloc a;
     if (!g_dev.freeCmdChunks.empty() && minReqSize <= kCmdChunk) {
         a = g_dev.freeCmdChunks.back();
         g_dev.freeCmdChunks.pop_back();
+        fillCmdGuard(a);
     } else {
-        a = g_dev.heaps[HEAP_DATA].alloc(std::max<uint32_t>(kCmdChunk, alignUp(uint32_t(minReqSize), 0x1000)), 0x100);
+        a = g_dev.heaps[HEAP_CMD].alloc(
+            std::max<uint32_t>(kCmdChunk, alignUp(uint32_t(minReqSize), 0x1000)) + kCmdGuard, 0x100);
+        if (a)
+            for (uint32_t i = 0; i < kCmdGuard / 4; i++) cmdGuard(a)[i] = kCmdGuardWord;
     }
     if (!a) {
         logf("out of memory for commands");
         abort();
     }
     // the chunk filled so far ends with commands of this serial
-    if (!g_dev.cmdChunks.empty()) g_dev.cmdChunks.back().serial = g_dev.serial;
+    if (!g_dev.cmdChunks.empty()) {
+        g_dev.cmdChunks.back().serial = g_dev.serial;
+        checkCmdGuard(g_dev.cmdChunks.back().mem);
+    }
     g_dev.cmdChunks.push_back({a, g_dev.serial});
     if (g_tracing) logf("  command chunk gpu 0x%llx-0x%llx", (unsigned long long)a.gpu, (unsigned long long)(a.gpu + a.size));
     g_dev.commandsSinceSubmit += a.size;
-    dkCmdBufAddMemory(cmd, a.block, a.offset, a.size);
+    dkCmdBufAddMemory(cmd, a.block, a.offset, a.size - kCmdGuard);
 }
 }  // namespace
 
@@ -152,6 +188,7 @@ Alloc Heap::alloc(uint32_t size, uint32_t align) {
         b.size = blockSize;
         b.freeRanges[0] = blockSize;
         m_blocks.push_back(std::move(b));
+        __atomic_store_n(&m_reserved, m_reserved + blockSize, __ATOMIC_RELAXED);
     }
     return r;
 }
@@ -179,6 +216,65 @@ void Heap::free(const Alloc& a) {
         }
         b.freeRanges[start] = size;
         return;
+    }
+}
+
+void Heap::logBlocks() const {
+    for (size_t i = 0; i < m_blocks.size(); i++) {
+        const DkGpuAddr gpu = dkMemBlockGetGpuAddr(m_blocks[i].mem);
+        uint64_t freeBytes = 0;
+        for (const auto& r : m_blocks[i].freeRanges) freeBytes += r.second;
+        logf("  heap %d block %u: gpu 0x%llx-0x%llx, %llu KiB free", m_id, unsigned(i), (unsigned long long)gpu,
+             (unsigned long long)(gpu + m_blocks[i].size), (unsigned long long)(freeBytes >> 10));
+    }
+}
+
+bool Heap::describe(DkGpuAddr addr, char* buf, size_t n) const {
+    for (size_t i = 0; i < m_blocks.size(); i++) {
+        const Block& b = m_blocks[i];
+        const DkGpuAddr gpu = dkMemBlockGetGpuAddr(b.mem);
+        if (addr < gpu || addr >= gpu + b.size) continue;
+        const uint32_t off = uint32_t(addr - gpu);
+        auto it = b.freeRanges.upper_bound(off);
+        const bool isFree = it != b.freeRanges.begin() && off < std::prev(it)->first + std::prev(it)->second;
+        snprintf(buf, n, "heap %d block %u + 0x%x (%s)", m_id, unsigned(i), off, isFree ? "free" : "in use");
+        return true;
+    }
+    for (size_t i = 0; i < m_blocks.size(); i++) {
+        const DkGpuAddr end = dkMemBlockGetGpuAddr(m_blocks[i].mem) + m_blocks[i].size;
+        if (addr >= end && addr < end + (16u << 20))
+            snprintf(buf, n, "0x%llx past the end of heap %d block %u", (unsigned long long)(addr - end), m_id,
+                     unsigned(i));
+    }
+    return false;
+}
+
+void Heap::logWord(uint32_t value, int* budget) const {
+    for (size_t i = 0; i < m_blocks.size() && *budget > 0; i++) {
+        const uint32_t* w = static_cast<const uint32_t*>(dkMemBlockGetCpuAddr(m_blocks[i].mem));
+        if (!w) return;  // GPU-only memory
+        const DkGpuAddr gpu = dkMemBlockGetGpuAddr(m_blocks[i].mem);
+        const size_t n = m_blocks[i].size / 4;
+        for (size_t k = 0; k < n && *budget > 0; k++) {
+            if (w[k] != value) continue;
+            --*budget;
+            char where[128];
+            describe(gpu + k * 4, where, sizeof where);
+            logf("  0x%08x at gpu 0x%llx, %s:", value, (unsigned long long)(gpu + k * 4), where);
+            char words[200];
+            int len = 0;
+            for (size_t j = k >= 8 ? k - 8 : 0; j < n && j <= k + 4; j++)
+                len += snprintf(words + len, sizeof words - size_t(len), j == k ? " [%08x]" : " %08x", w[j]);
+            logf("   %s", words);
+            logObjectsAt(gpu + k * 4);
+        }
+    }
+}
+
+void memoryStats(uint64_t used[5], uint64_t reserved[5]) {
+    for (int i = 0; i < 5; i++) {
+        used[i] = i < HEAP_COUNT ? g_dev.heaps[i].usedRelaxed() : 0;
+        reserved[i] = i < HEAP_COUNT ? g_dev.heaps[i].reserved() : 0;
     }
 }
 
@@ -229,15 +325,56 @@ void poll() {
     }
 }
 
+// A GPU page fault's address, from deko3d's report of the queue's error
+// (dkErrorReport, below), 0 if none; a method error's data.
+uint64_t g_gpuFaultAddress = 0;
+uint32_t g_gpuMethodData = 0;
+bool g_gpuMethodError = false;
+
+// Once the GPU has failed the queue (a page fault, a bad command, a timeout),
+// deko3d aborts the program at the next submission (2359-0001), so first the
+// log gets what dkgl knows: its memory blocks, and what holds a fault's
+// address. (deko3d finds the error in a fence wait.)
+void checkQueue(const char* found) {
+    static bool said = false;
+    if (said || !dkQueueIsInErrorState(g_dev.queue)) return;
+    said = true;
+    logf("the GPU failed the queue (found %s): submission %llu being recorded, %llu finished, %u draws so far", found,
+         (unsigned long long)g_dev.serial, (unsigned long long)g_dev.completed, unsigned(g_activity.draws));
+    for (const Heap& h : g_dev.heaps) h.logBlocks();
+    if (__atomic_load_n(&g_gpuMethodError, __ATOMIC_ACQUIRE)) {
+        // a method error: commands the GPU found wrong, as once floats
+        // executed as commands; where their data is in memory tells whether
+        // the commands were overwritten (in command memory) or the GPU read
+        // commands from data (only elsewhere)
+        const uint32_t data = g_gpuMethodData;
+        logf("where the method's data 0x%08x is in memory:", data);
+        int budget = 12;
+        for (int heap : {HEAP_CMD, HEAP_DATA, HEAP_READBACK, HEAP_CODE}) g_dev.heaps[heap].logWord(data, &budget);
+        if (budget == 12) logf("  nowhere");
+    }
+    const uint64_t addr = __atomic_load_n(&g_gpuFaultAddress, __ATOMIC_RELAXED);
+    if (!addr) return;
+    char where[128] = "in no memory block";
+    for (const Heap& h : g_dev.heaps)
+        if (h.describe(addr, where, sizeof where)) break;
+    logf("fault address 0x%llx: %s", (unsigned long long)addr, where);
+    logObjectsAt(addr);
+}
+
 // Waits for a fence, saying so in the log when the GPU takes over 2 seconds
 // (a GPU hang otherwise leaves nothing there).
 void waitFence(DkFence* f, uint64_t serial) {
     Waiting w("waiting for the GPU");
-    if (dkFenceWait(f, 2000000000ll) != DkResult_Timeout) return;
+    if (dkFenceWait(f, 2000000000ll) != DkResult_Timeout) {
+        checkQueue("waiting for a submission");
+        return;
+    }
     logf("the GPU has not finished submission %llu after 2 s (%llu submitted, %llu finished)",
          (unsigned long long)serial, (unsigned long long)g_dev.serial - 1, (unsigned long long)g_dev.completed);
     dkFenceWait(f, -1);
     logf("submission %llu finished", (unsigned long long)serial);
+    checkQueue("after a long wait");
 }
 
 void startWatchdog() {
@@ -285,6 +422,7 @@ void submit(bool wait) {
     if (slot >= 0)
         dkCmdBufReportCounter(g_dev.cmd, DkCounter_Timestamp, g_dev.gpuTimes.gpu + uint32_t(slot) * 32 + 16);
     DkCmdList list = dkCmdBufFinishList(g_dev.cmd);
+    checkQueue("at a submission");
     if (list) dkQueueSubmitCommands(g_dev.queue, list);
     g_dev.inFlight.push_back({g_dev.serial, {}, slot});
     dkQueueSignalFence(g_dev.queue, &g_dev.inFlight.back().fence, true);
@@ -424,6 +562,7 @@ bool initDevice(int width, int height) {
     g_dev.heaps[HEAP_CODE].init(g_dev.dev,
                                 DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code,
                                 8u << 20, HEAP_CODE);
+    g_dev.heaps[HEAP_CMD].init(g_dev.dev, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, 4u << 20, HEAP_CMD);
 
     DkQueueMaker qm;
     dkQueueMakerDefaults(&qm, g_dev.dev);
@@ -489,3 +628,26 @@ void shutdownDevice() {
 }
 
 }  // namespace dkgl
+
+// deko3d's report of the queue's error (tools/deko3d/deko3d-error-report.patch),
+// with a page fault's address kept for checkQueue.
+extern "C" void dkErrorReport(const char* fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    va_list copy;
+    va_copy(copy, ap);
+    vsnprintf(buf, sizeof buf, fmt, copy);
+    va_end(copy);
+    if (strstr(fmt, "Address:")) {  // "  Address: 0x%02x%08x"
+        const uint32_t hi = va_arg(ap, uint32_t), lo = va_arg(ap, uint32_t);
+        __atomic_store_n(&dkgl::g_gpuFaultAddress, (uint64_t(hi) << 32) | lo, __ATOMIC_RELAXED);
+    } else if (strstr(fmt, "] = 0x")) {  // a method error's "  [%04x:%03x] = 0x%08x" (class, method, data)
+        va_arg(ap, uint32_t);
+        va_arg(ap, uint32_t);
+        dkgl::g_gpuMethodData = va_arg(ap, uint32_t);
+        __atomic_store_n(&dkgl::g_gpuMethodError, true, __ATOMIC_RELEASE);
+    }
+    va_end(ap);
+    dkgl::logf("deko3d:%s", buf);
+}

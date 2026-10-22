@@ -1,0 +1,30 @@
+Queue::checkError's report in the release build.
+
+The release build compiles DK_WARNING out, so a queue's entry into its error
+state (a GPU page fault with its address and access, a method error, a
+rejected command list, a timeout) left nothing behind but the abort at the
+next submission ("attempt to submit commands to a queue in error state",
+2359-0001). In the release build the warnings in gpu_error.cpp go to a weak
+dkErrorReport(fmt, ...) when the program defines one.
+
+diff --git a/source/gpu_error.cpp b/source/gpu_error.cpp
+index 5e9dd7e..eecfd27 100644
+--- a/source/gpu_error.cpp
++++ b/source/gpu_error.cpp
+@@ -3,6 +3,16 @@
+ 
+ using namespace dk::detail;
+ 
++#ifndef DEBUG
++// The release build's warnings are compiled out, which leaves a queue's error
++// (a GPU page fault and its address, a method error, a timeout) unsaid before
++// the next submission aborts: they go to the program's dkErrorReport, if it
++// defines one.
++extern "C" void dkErrorReport(const char* fmt, ...) __attribute__((weak, format(printf, 1, 2)));
++#undef DK_WARNING
++#define DK_WARNING(...) do { if (dkErrorReport) dkErrorReport(__VA_ARGS__); } while (0)
++#endif
++
+ void Device::checkQueueErrors() noexcept
+ {
+ 	MutexHolder m{m_queueTableMutex};
