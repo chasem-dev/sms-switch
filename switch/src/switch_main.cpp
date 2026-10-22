@@ -390,6 +390,11 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// stage load) stalled a load for 6 s. Serial: a stage's own programs, and
 	// extras only within 250 ms.
 	setenv("SMS_GX_SHADER_WARMUP_SERIAL", "1", 0);
+	// The graphics worker (sms-port's gx_thread.h): the GX front end on a core
+	// of its own, a few fps more where the CPU is the limit (2x, the HD pack)
+	// for about a frame more input latency; testers found it much smoother.
+	// SMS_GX_THREAD=0 in env.txt turns it off.
+	setenv("SMS_GX_THREAD", "1", 0);
 	// HD texture packs (mods/textures here): at most 1 GiB resident, not the
 	// PC's 1.5 GiB; the console has about 3 GiB for everything.
 	if (!getenv("SMS_TEXTURE_PACK_MB") && !settings_has(g_dir, "texture_pack_mb"))
