@@ -188,6 +188,15 @@ elseif(_icon_args)
   endif()
 endif()
 
+# The build's name (build.sh passes it: git describe, + when built with
+# uncommitted changes, and the date): the log's first line and on the screen
+# at start. Only switch_main.cpp sees it, so a new name rebuilds one file.
+set(SMS_SWITCH_BUILD_NAME "" CACHE STRING "the build's name (build.sh sets it)")
+if(SMS_SWITCH_BUILD_NAME)
+  set_property(SOURCE ${SMS_SWITCH_DIR}/src/switch_main.cpp TARGET_DIRECTORY sms APPEND PROPERTY
+    COMPILE_DEFINITIONS "SMS_SWITCH_BUILD_NAME=\"${SMS_SWITCH_BUILD_NAME}\"")
+endif()
+
 nx_generate_nacp(sms.nacp
   NAME "${SMS_SWITCH_TITLE}"
   AUTHOR "sms-switch"

@@ -1,0 +1,102 @@
+The program's build on the screen: GXPC_SetBuildLabel.
+
+Testers' logs and screenshots did not say which build made them (one tester
+ran an older build than the one being tested). The platform layer now gives
+sms_gx its version and commit: a line on the overlay's panel, and alone in
+the window's lower-left corner for the first seconds of the game.
+
+--- a/platform/gx/include/sms_gx/gx_pc.h
++++ b/platform/gx/include/sms_gx/gx_pc.h
+@@ -224,6 +224,11 @@
+ void GXPC_OverlayDraw(int winW, int winH);
+ void GXPC_OverlayFrame(void);  /* every display copy, presented or not: the overlay's frame clock */
+ int GXPC_OverlayVisible(void);
++/* The program's build (its version and commit, from the platform that runs
++ * it): a line on the overlay's panel, and alone in the window's lower-left
++ * corner for the first `seconds` of the game, so that a screenshot says which
++ * build it shows. The text is copied. */
++void GXPC_SetBuildLabel(const char* label, double seconds);
+ /* Game speed multiplier (F7 while the overlay is open cycles 1, 2, 4, 10);
+  * VI retraces and host audio advance at this rate, including THP movies. */
+ void GXPC_CycleSpeed(void);
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -301,6 +301,7 @@
+ // Each slot keeps its own texture, so panels drawn in the same frame keep their
+ // cached bitmaps. GXPC_DrawOverlay draws the debug overlay's slot.
+ enum OverlaySlot {
++    OVERLAY_BUILD_LABEL,  // gx_overlay.cpp: GXPC_SetBuildLabel's, at start
+     OVERLAY_DEBUG,
+     OVERLAY_CHEAT_MENU,
+     OVERLAY_WARP_MENU,
+--- a/platform/gx/src/gx_overlay.cpp
++++ b/platform/gx/src/gx_overlay.cpp
+@@ -104,6 +104,37 @@
+ 
+ std::string s_renderer;
+ 
++// GXPC_SetBuildLabel's
++char s_buildLabel[128];
++double s_buildLabelSeconds = 0;
++
++// The build label alone in the lower-left corner for its first seconds.
++void drawBuildLabel(int winW, int winH) {
++    static double shownFrom = 0;
++    static bool done = false;
++    if (done || !s_buildLabel[0]) return;
++    const double t = nowSeconds();
++    if (!shownFrom) shownFrom = t;
++    if (t - shownFrom > s_buildLabelSeconds) {
++        done = true;
++        return;
++    }
++    static std::vector<uint8_t> px;
++    static int w = 0, h = 0;
++    if (px.empty()) {
++        const int pad = 3;
++        w = stb_easy_font_width(s_buildLabel) + pad * 2;
++        h = stb_easy_font_height(s_buildLabel) + pad * 2;
++        px.assign(size_t(w) * h * 4, 0);
++        const uint8_t bg[4] = {16, 16, 24, 160}, fg[4] = {255, 255, 255, 230};
++        gx::overlayFillRect(px, w, h, 0, 0, w, h, bg);
++        gx::overlayText(px, w, h, pad, pad, s_buildLabel, fg);
++    }
++    // (sent each frame: a small bitmap, for a few seconds)
++    const int scale = winH >= 720 ? 2 : 1;
++    gx::drawOverlayPanel(gx::OVERLAY_BUILD_LABEL, px.data(), w, h, 8, winH - h * scale - 8, scale, winW, winH);
++}
++
+ }  // namespace
+ 
+ namespace gx {
+@@ -157,6 +188,14 @@
+ 
+ void GXPC_OverlayFrame(void) { s_clock.tick(); }
+ 
++// (plain data only: it may be called before this file's constructors have
++// run, from the platform's own; the panel's lines are made at its first draw)
++void GXPC_SetBuildLabel(const char* label, double seconds) {
++    snprintf(s_buildLabel, sizeof s_buildLabel, "%s", label ? label : "");
++    s_buildLabelSeconds = seconds;
++    s_panelDirty = true;
++}
++
+ void GXPC_OverlayDraw(int winW, int winH) {
+     static bool s_envChecked = false;
+     if (!s_envChecked) {  // SMS_OVERLAY=1: start with the overlay open
+@@ -165,6 +204,7 @@
+         if (e && *e && strcmp(e, "0") != 0 && !s_visible) GXPC_OverlayToggle();
+     }
+     s_clock.shownFrames++;
++    drawBuildLabel(winW, winH);
+     if (!s_visible) return;
+     if (s_renderer.empty()) {
+         const char* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+@@ -173,6 +213,7 @@
+                     strstr(s_renderer.c_str(), "Software");
+         if (s_renderer.size() > 44) s_renderer.resize(44);
+         if (soft) s_renderer += "\nSOFTWARE RENDERING (no GPU driver): see README";
++        if (s_buildLabel[0]) s_renderer += std::string("\nbuild ") + s_buildLabel;  // (the line after GL's)
+     }
+     // Keep drawing the cached panel every frame, but only rasterise and upload
+     // at 4 Hz. Rebuilding it at the game's frame rate can miss a retrace and

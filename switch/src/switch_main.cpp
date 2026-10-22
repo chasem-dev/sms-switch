@@ -46,6 +46,13 @@ extern "C" char** __system_argv;
 extern "C" void sms_switch_spread_main_thread(void); // performance.cpp
 extern "C" void sms_switch_start_profiler(void);     // profiler.cpp
 extern "C" void sms_switch_diagnostics_start(void);  // diagnostics.cpp
+extern "C" void GXPC_SetBuildLabel(const char* label, double seconds); // sms_gx
+
+// The build's name (build.sh: git describe, + when built with uncommitted
+// changes, and the date), the log's first line and on the screen at start.
+#ifndef SMS_SWITCH_BUILD_NAME
+#define SMS_SWITCH_BUILD_NAME "unknown"
+#endif
 
 // A line in the emulator's or debugger's log, before stderr is set up.
 void sms_switch_trace(const char* text)
@@ -272,6 +279,8 @@ void write_prompts(const std::string& dir)
 
 void log_layout()
 {
+	fprintf(stderr, "[switch] sms-switch %s\n", SMS_SWITCH_BUILD_NAME);
+	GXPC_SetBuildLabel("sms-switch " SMS_SWITCH_BUILD_NAME, 10.0);
 	const LowMemoryInfo* m = sms_switch_low_memory();
 	fprintf(stderr, "[switch] image at 0x%lx (%lu KiB)%s, loaded at 0x%lx\n", (unsigned long)m->image_base,
 	        (unsigned long)(m->image_size >> 10), m->image_moved ? ", moved below 4 GiB" : "",
