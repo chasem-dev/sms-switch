@@ -18,9 +18,12 @@
 // game's threads take a core from it rather than wait for it.
 // SMS_SWITCH_SPREAD_THREADS=0 leaves all of this to libnx.
 //
-// Clocks: the console's own (CPU 1020 MHz, GPU 307-384 MHz handheld, 768 MHz
-// docked); the port never changes them. Raised clocks (CPU 1785 MHz, what the
-// system's load boost uses) ran the fan hard for a few more frames a second.
+// Clocks: in handheld the docked rates, GPU 768 MHz and memory 1600 MHz,
+// which 2x at 60 fps needs there (the handheld boost, below); the console's
+// own otherwise (CPU 1020 MHz always). R3 + D-pad Up switches the boost off
+// and on, SMS_SWITCH_HANDHELD_BOOST=0 starts with it off. Only Nintendo's own
+// table rates (no overclock). Raised CPU clocks (1785 MHz, what the system's
+// load boost uses) ran the fan hard for a few more frames a second.
 #include <switch.h>
 #include <atomic>
 #include <stdio.h>
@@ -156,4 +159,220 @@ extern "C" void sms_switch_background_thread(void)
 {
 	if (spread_threads())
 		svcSetThreadPriority(CUR_THREAD_HANDLE, kBackgroundPriority);
+}
+
+// --- clocks for tests: SMS_SWITCH_TEST_*_MHZ, and R3 + D-pad Up in game ------
+namespace {
+
+enum { CPU, GPU, MEM, DOMAINS };
+const PcvModuleId kModule[DOMAINS] = {PcvModuleId_CpuBus, PcvModuleId_GPU, PcvModuleId_EMC};
+const char* const kEnv[DOMAINS] = {"SMS_SWITCH_TEST_CPU_MHZ", "SMS_SWITCH_TEST_GPU_MHZ", "SMS_SWITCH_TEST_MEM_MHZ"};
+// Nintendo's rates in kHz, ascending (the highest of each: no overclock)
+const u32 kCpuKhz[] = {612000, 816000, 1020000, 1224000, 1428000, 1581000, 1785000};
+const u32 kGpuKhz[] = {307200, 384000, 460800, 537600, 614400, 691200, 768000, 844800, 921600};
+const u32 kMemKhz[] = {665600, 800000, 1065600, 1331200, 1600000};
+const u32* const kTable[DOMAINS] = {kCpuKhz, kGpuKhz, kMemKhz};
+const int kCount[DOMAINS] = {7, 9, 5};
+
+// The handheld boost, on unless SMS_SWITCH_HANDHELD_BOOST=0 (clocks.txt keeps
+// what R3 + D-pad Up last chose): the docked rates in handheld too, GPU 768
+// and memory 1600 (the CPU's own 1020 was enough). Delfino Plaza at 2x holds
+// 60 fps in handheld with it, where the console's own handheld rates (GPU
+// 307.2, memory 1331.2) give about 27 (2026-10-22 runs). Docked it changes
+// nothing: those are the docked rates.
+struct Profile {
+	const char* name;
+	u32 mhz[DOMAINS];
+};
+const Profile kProfiles[] = {
+	{"handheld boost off (the console's own)", {0, 0, 0}},
+	{"handheld boost on", {0, 768, 1600}},
+};
+const int kProfileCount = int(sizeof kProfiles / sizeof kProfiles[0]);
+
+std::atomic<u32> g_wanted_hz[DOMAINS];  // 0: the console's own
+int g_start_profile;
+bool g_clocks_open;
+Thread g_clock_thread;
+
+u32 nearest_hz(int d, long mhz)
+{
+	u32 best = kTable[d][0];
+	for (int i = 0; i < kCount[d]; i++)
+		if (labs(long(kTable[d][i]) - mhz * 1000) < labs(long(best) - mhz * 1000))
+			best = kTable[d][i];
+	return best * 1000u;
+}
+
+// The console's own rates for the mode it is in (homebrew's profile): what
+// a test's clocks go back to.
+u32 own_hz(int d)
+{
+	const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
+	switch (d) {
+	case CPU: return 1020000000u;
+	case GPU: return docked ? 768000000u : 307200000u;
+	default: return docked ? 1600000000u : 1331200000u;
+	}
+}
+
+u32 clock_rate(int d)
+{
+	u32 hz = 0;
+	ClkrstSession s;
+	if (R_SUCCEEDED(clkrstOpenSession(&s, kModule[d], 3))) {
+		clkrstGetClockRate(&s, &hz);
+		clkrstCloseSession(&s);
+	}
+	return hz;
+}
+
+void set_clock_rate(int d, u32 hz)
+{
+	ClkrstSession s;
+	if (R_SUCCEEDED(clkrstOpenSession(&s, kModule[d], 3))) {
+		clkrstSetClockRate(&s, hz);
+		clkrstCloseSession(&s);
+	}
+}
+
+// What the clocks should be now: the test's while the game has the screen,
+// the console's own otherwise (the HOME menu, sleep, closing it from there,
+// which ends the process without its atexit).
+void apply_clocks(bool focused)
+{
+	for (int d = 0; d < DOMAINS; d++) {
+		const u32 wanted = g_wanted_hz[d].load();
+		const u32 hz = focused && wanted ? wanted : own_hz(d);
+		if (clock_rate(d) != hz)
+			set_clock_rate(d, hz);
+	}
+}
+
+bool any_wanted()
+{
+	for (int d = 0; d < DOMAINS; d++)
+		if (g_wanted_hz[d].load())
+			return true;
+	return false;
+}
+
+void describe_clocks(char* buf, size_t n)
+{
+	snprintf(buf, n, "CPU %.0f, GPU %.1f, memory %.0f MHz", clock_rate(CPU) / 1e6, clock_rate(GPU) / 1e6,
+	         clock_rate(MEM) / 1e6);
+}
+
+extern "C" void GXPC_ShowNotice(const char* text, double seconds); // sms_gx
+extern "C" uint32_t GXPC_FrameCount(void);                         // sms_gx
+
+void clock_thread(void*)
+{
+	PadState pad;
+	padInitializeDefault(&pad);
+	int profile = g_start_profile;
+	bool was_focused = true, set = any_wanted();
+	uint32_t last_frame = 0;
+	u64 last_frame_tick = armGetSystemTick();
+	for (int tick = 0;; tick++) {
+		svcSleepThread(50000000ull);  // 20 times a second
+		if (!serviceIsActive(hidGetServiceSession()))
+			continue;  // (started before the program's input is)
+		padUpdate(&pad);
+		const u64 down = padGetButtonsDown(&pad), held = padGetButtons(&pad);
+		// On the screen: in focus, and making frames. Out of it (the HOME
+		// menu, sleep) the game's presenting stops, and with it the main
+		// thread that would read the system's focus message.
+		const uint32_t frame = GXPC_FrameCount();
+		if (frame != last_frame) {
+			last_frame = frame;
+			last_frame_tick = armGetSystemTick();
+		}
+		const bool focused = appletGetFocusState() == AppletFocusState_InFocus &&
+		                     armTicksToNs(armGetSystemTick() - last_frame_tick) < 3000000000ull;  // (loads stall for less)
+		if (focused && (down & HidNpadButton_Up) && (held & HidNpadButton_StickR) && !(held & HidNpadButton_StickL)) {
+			profile = (profile + 1) % kProfileCount;
+			for (int d = 0; d < DOMAINS; d++)
+				g_wanted_hz[d].store(kProfiles[profile].mhz[d] ? nearest_hz(d, kProfiles[profile].mhz[d]) : 0);
+			apply_clocks(true);
+			set = true;
+			char line[160], rates[96];
+			describe_clocks(rates, sizeof rates);
+			snprintf(line, sizeof line, "Clocks: %s (%s)", kProfiles[profile].name, rates);
+			GXPC_ShowNotice(line, 4.0);
+			fprintf(stderr, "[switch] %s\n", line);
+			if (FILE* f = fopen("clocks.txt", "w")) {  // (beside the NRO, read at the next start)
+				fprintf(f, "SMS_SWITCH_HANDHELD_BOOST=%d\n", profile);
+				fclose(f);
+			}
+			continue;
+		}
+		// again on leaving or regaining the screen, and every 2 s (the
+		// system resets them on a docking change)
+		if (set && (focused != was_focused || tick % 40 == 0)) {
+			apply_clocks(focused);
+			if (focused != was_focused) {
+				char rates[96];
+				describe_clocks(rates, sizeof rates);
+				fprintf(stderr, "[switch] clocks: %s (%s)\n", focused ? "the game's again" : "the console's own off the screen", rates);
+			}
+		}
+		was_focused = focused;
+	}
+}
+
+void restore_clocks()
+{
+	if (any_wanted())
+		apply_clocks(false);
+}
+
+} // namespace
+
+// The handheld boost from the start (SMS_SWITCH_HANDHELD_BOOST), or a test's
+// clocks (SMS_SWITCH_TEST_CPU_MHZ, _GPU_MHZ, _MEM_MHZ; not the old
+// SMS_SWITCH_GPU_MHZ, which env.txt files may still hold); R3 + D-pad Up
+// switches the boost in game. Nintendo's table rates only, the console's own
+// after the game ends (a close from the HOME menu leaves memory raised until
+// the next start, a docking change or another game).
+// SMS_SWITCH_CLOCK_TOGGLE=0 leaves the clocks alone entirely.
+extern "C" void sms_switch_start_clocks(void)
+{
+	const char* off = getenv("SMS_SWITCH_CLOCK_TOGGLE");
+	if (off && *off == '0')
+		return;
+	if (R_FAILED(clkrstInitialize())) {
+		fprintf(stderr, "[switch] clocks: no clock service\n");
+		return;
+	}
+	g_clocks_open = true;
+	// A run closed from the HOME menu while boosted (suspended there, it
+	// cannot put them back) leaves the memory clock raised for the HOME
+	// menu and homebrew: back to the console's own first.
+	for (int d = 0; d < DOMAINS; d++) {
+		const u32 hz = clock_rate(d), own = own_hz(d);
+		if (hz && hz != own) {
+			set_clock_rate(d, own);
+			fprintf(stderr, "[switch] clocks: %s was left at %.1f MHz; back to %.1f\n", d == CPU ? "CPU" : d == GPU ? "GPU" : "memory",
+			        hz / 1e6, clock_rate(d) / 1e6);
+		}
+	}
+	const char* boost = getenv("SMS_SWITCH_HANDHELD_BOOST");
+	g_start_profile = boost && *boost == '0' ? 0 : 1;
+	for (int d = 0; d < DOMAINS; d++) {
+		const char* e = getenv(kEnv[d]);
+		const long mhz = e ? strtol(e, nullptr, 10) : 0;
+		g_wanted_hz[d].store(mhz > 0 ? nearest_hz(d, mhz) : kProfiles[g_start_profile].mhz[d] ? nearest_hz(d, kProfiles[g_start_profile].mhz[d]) : 0);
+	}
+	if (any_wanted()) {
+		apply_clocks(true);
+		char rates[96];
+		describe_clocks(rates, sizeof rates);
+		fprintf(stderr, "[switch] clocks (%s, %s): %s\n",
+		        appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld",
+		        kProfiles[g_start_profile].name, rates);
+	}
+	atexit(restore_clocks);
+	if (R_SUCCEEDED(threadCreate(&g_clock_thread, clock_thread, nullptr, nullptr, 0x4000, 0x2C, 2)))
+		threadStart(&g_clock_thread);
 }

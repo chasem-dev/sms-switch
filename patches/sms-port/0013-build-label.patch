@@ -7,7 +7,7 @@ the window's lower-left corner for the first seconds of the game.
 
 --- a/platform/gx/include/sms_gx/gx_pc.h
 +++ b/platform/gx/include/sms_gx/gx_pc.h
-@@ -224,6 +224,11 @@
+@@ -224,6 +224,15 @@
  void GXPC_OverlayDraw(int winW, int winH);
  void GXPC_OverlayFrame(void);  /* every display copy, presented or not: the overlay's frame clock */
  int GXPC_OverlayVisible(void);
@@ -16,6 +16,10 @@ the window's lower-left corner for the first seconds of the game.
 + * corner for the first `seconds` of the game, so that a screenshot says which
 + * build it shows. The text is copied. */
 +void GXPC_SetBuildLabel(const char* label, double seconds);
++/* A line in the same corner for `seconds`, over the build label (the
++ * platform's own settings changed in game, for one); from any thread once
++ * the program runs (not from a constructor). */
++void GXPC_ShowNotice(const char* text, double seconds);
  /* Game speed multiplier (F7 while the overlay is open cycles 1, 2, 4, 10);
   * VI retraces and host audio advance at this rate, including THP movies. */
  void GXPC_CycleSpeed(void);
@@ -31,35 +35,51 @@ the window's lower-left corner for the first seconds of the game.
      OVERLAY_WARP_MENU,
 --- a/platform/gx/src/gx_overlay.cpp
 +++ b/platform/gx/src/gx_overlay.cpp
-@@ -104,6 +104,37 @@
+@@ -11,6 +11,7 @@
+ #include <string.h>
+ #include <time.h>
+ #include <atomic>
++#include <mutex>
+ #include <string>
+ #include <vector>
+ 
+@@ -104,6 +105,45 @@
  
  std::string s_renderer;
  
 +// GXPC_SetBuildLabel's
 +char s_buildLabel[128];
 +double s_buildLabelSeconds = 0;
++// GXPC_ShowNotice's (from any thread, never from a constructor)
++std::mutex s_noticeLock;
++std::string s_notice;
++double s_noticeUntil = 0;
 +
-+// The build label alone in the lower-left corner for its first seconds.
++// The lower-left corner: a notice while it lasts, else the build label for
++// the game's first seconds.
 +void drawBuildLabel(int winW, int winH) {
 +    static double shownFrom = 0;
-+    static bool done = false;
-+    if (done || !s_buildLabel[0]) return;
 +    const double t = nowSeconds();
 +    if (!shownFrom) shownFrom = t;
-+    if (t - shownFrom > s_buildLabelSeconds) {
-+        done = true;
-+        return;
++    std::string text;
++    {
++        std::lock_guard<std::mutex> l(s_noticeLock);
++        if (t < s_noticeUntil) text = s_notice;
 +    }
++    if (text.empty() && s_buildLabel[0] && t - shownFrom <= s_buildLabelSeconds) text = s_buildLabel;
++    if (text.empty()) return;
 +    static std::vector<uint8_t> px;
++    static std::string drawn;
 +    static int w = 0, h = 0;
-+    if (px.empty()) {
++    if (text != drawn) {
++        drawn = text;
 +        const int pad = 3;
-+        w = stb_easy_font_width(s_buildLabel) + pad * 2;
-+        h = stb_easy_font_height(s_buildLabel) + pad * 2;
++        w = stb_easy_font_width(const_cast<char*>(text.c_str())) + pad * 2;
++        h = stb_easy_font_height(const_cast<char*>(text.c_str())) + pad * 2;
 +        px.assign(size_t(w) * h * 4, 0);
 +        const uint8_t bg[4] = {16, 16, 24, 160}, fg[4] = {255, 255, 255, 230};
 +        gx::overlayFillRect(px, w, h, 0, 0, w, h, bg);
-+        gx::overlayText(px, w, h, pad, pad, s_buildLabel, fg);
++        gx::overlayText(px, w, h, pad, pad, text.c_str(), fg);
 +    }
 +    // (sent each frame: a small bitmap, for a few seconds)
 +    const int scale = winH >= 720 ? 2 : 1;
@@ -69,12 +89,18 @@ the window's lower-left corner for the first seconds of the game.
  }  // namespace
  
  namespace gx {
-@@ -157,6 +188,14 @@
+@@ -157,6 +197,20 @@
  
  void GXPC_OverlayFrame(void) { s_clock.tick(); }
  
 +// (plain data only: it may be called before this file's constructors have
 +// run, from the platform's own; the panel's lines are made at its first draw)
++void GXPC_ShowNotice(const char* text, double seconds) {
++    std::lock_guard<std::mutex> l(s_noticeLock);
++    s_notice = text ? text : "";
++    s_noticeUntil = nowSeconds() + seconds;
++}
++
 +void GXPC_SetBuildLabel(const char* label, double seconds) {
 +    snprintf(s_buildLabel, sizeof s_buildLabel, "%s", label ? label : "");
 +    s_buildLabelSeconds = seconds;
@@ -84,7 +110,7 @@ the window's lower-left corner for the first seconds of the game.
  void GXPC_OverlayDraw(int winW, int winH) {
      static bool s_envChecked = false;
      if (!s_envChecked) {  // SMS_OVERLAY=1: start with the overlay open
-@@ -165,6 +204,7 @@
+@@ -165,6 +219,7 @@
          if (e && *e && strcmp(e, "0") != 0 && !s_visible) GXPC_OverlayToggle();
      }
      s_clock.shownFrames++;
@@ -92,7 +118,7 @@ the window's lower-left corner for the first seconds of the game.
      if (!s_visible) return;
      if (s_renderer.empty()) {
          const char* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
-@@ -173,6 +213,7 @@
+@@ -173,6 +228,7 @@
                      strstr(s_renderer.c_str(), "Software");
          if (s_renderer.size() > 44) s_renderer.resize(44);
          if (soft) s_renderer += "\nSOFTWARE RENDERING (no GPU driver): see README";

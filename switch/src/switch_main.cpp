@@ -46,6 +46,7 @@ extern "C" char** __system_argv;
 extern "C" void sms_switch_spread_main_thread(void); // performance.cpp
 extern "C" void sms_switch_start_profiler(void);     // profiler.cpp
 extern "C" void sms_switch_diagnostics_start(void);  // diagnostics.cpp
+extern "C" void sms_switch_start_clocks(void);       // performance.cpp
 extern "C" void GXPC_SetBuildLabel(const char* label, double seconds); // sms_gx
 
 // The build's name (build.sh: git describe, + when built with uncommitted
@@ -264,11 +265,26 @@ std::string find_standalone_disc_image(const std::string& dir)
 }
 
 // prompts/switch.png from the program's copy (CMakeLists.txt), if missing.
+// The images written before Z moved from R to the - button (17498 bytes, by
+// FNV-1a): replaced with the program's, where a player's own are kept.
+bool old_default_prompts(const std::string& path)
+{
+	FILE* f = fopen(path.c_str(), "rb");
+	if (!f)
+		return false;
+	unsigned long long h = 0xcbf29ce484222325ull;
+	long n = 0;
+	for (int c; (c = fgetc(f)) != EOF; n++)
+		h = (h ^ (unsigned char)c) * 0x100000001b3ull;
+	fclose(f);
+	return n == 17498 && h == 0x6a443f9fc70a2e10ull;
+}
+
 void write_prompts(const std::string& dir)
 {
 	const std::string path = dir + "/switch.png";
 	struct stat st;
-	if (stat(path.c_str(), &st) == 0)
+	if (stat(path.c_str(), &st) == 0 && !old_default_prompts(path))
 		return;
 	mkdir(dir.c_str(), 0777);
 	if (FILE* f = fopen(path.c_str(), "wb")) {
@@ -328,6 +344,9 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// the graphics preset last chosen in the game (L3 + D-pad Right, gx_platform.cpp
 	// in sms-port): after env.txt, before the launch arguments
 	load_env_file(g_dir + "/graphics.txt");
+	// the handheld boost as last switched in the game (R3 + D-pad Up,
+	// performance.cpp)
+	load_env_file(g_dir + "/clocks.txt");
 	take_env_arguments();
 	// SMS_SWITCH_NO_AUTOSLEEP=1 (tools/switch-dev.py's runs): the console's
 	// Auto-Sleep off, handheld and TV, as System Settings > Sleep Mode sets it
@@ -374,6 +393,11 @@ __attribute__((constructor(101))) static void switch_start(void)
 	       "dpright:b14,dpup:b13,leftshoulder:b6,leftstick:b4,lefttrigger:b8,leftx:a0,lefty:a1,"
 	       "rightshoulder:b7,rightstick:b5,righttrigger:b9,rightx:a2,righty:a3,start:b10,x:b2,y:b3,",
 	       0);
+	// The Switch's layout over the PC port's (patches/sms-port/0014): R a soft
+	// spray (R part of the way, no click: Mario keeps walking), ZR the full
+	// one, - the map (the GameCube's Z), which was R; ZL stays L.
+	// bindings.txt beside the NRO changes it.
+	setenv("SMS_PAD_DEFAULTS", "Z = PAD_BACK\nR = PAD_RT\nR_SOFT = PAD_RB\n", 0);
 	// Button prompts as the Switch's buttons (button_prompts = gamecube in
 	// settings.txt for the game's own), from prompts/switch.png beside the NRO,
 	// written there from the program's copy when missing (replace it to
@@ -402,6 +426,7 @@ __attribute__((constructor(101))) static void switch_start(void)
 	sms_switch_spread_main_thread();
 	sms_switch_start_profiler();
 	sms_switch_diagnostics_start();
+	sms_switch_start_clocks();
 	if (applet_mode()) {
 		const char* allow = getenv("SMS_SWITCH_ALLOW_APPLET");
 		fprintf(stderr, "[switch] started in applet mode (applet type %d)%s\n", (int)appletGetAppletType(),
