@@ -46,6 +46,7 @@ extern "C" char** __system_argv;
 extern "C" void sms_switch_spread_main_thread(void); // performance.cpp
 extern "C" void sms_switch_start_profiler(void);     // profiler.cpp
 extern "C" void sms_switch_diagnostics_start(void);  // diagnostics.cpp
+extern "C" void sms_switch_start_clocks(void);       // performance.cpp
 extern "C" void GXPC_SetBuildLabel(const char* label, double seconds); // sms_gx
 
 // The build's name (build.sh: git describe, + when built with uncommitted
@@ -343,6 +344,9 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// the graphics preset last chosen in the game (L3 + D-pad Right, gx_platform.cpp
 	// in sms-port): after env.txt, before the launch arguments
 	load_env_file(g_dir + "/graphics.txt");
+	// the handheld boost as last switched in the game (R3 + D-pad Up,
+	// performance.cpp)
+	load_env_file(g_dir + "/clocks.txt");
 	take_env_arguments();
 	// SMS_SWITCH_NO_AUTOSLEEP=1 (tools/switch-dev.py's runs): the console's
 	// Auto-Sleep off, handheld and TV, as System Settings > Sleep Mode sets it
@@ -422,6 +426,7 @@ __attribute__((constructor(101))) static void switch_start(void)
 	sms_switch_spread_main_thread();
 	sms_switch_start_profiler();
 	sms_switch_diagnostics_start();
+	sms_switch_start_clocks();
 	if (applet_mode()) {
 		const char* allow = getenv("SMS_SWITCH_ALLOW_APPLET");
 		fprintf(stderr, "[switch] started in applet mode (applet type %d)%s\n", (int)appletGetAppletType(),

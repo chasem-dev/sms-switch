@@ -5,7 +5,7 @@ The [Super Mario Sunshine PC port](https://github.com/chasem-dev/sms-pc-port) bu
 No game data is included.
 Like the PC port, it reads the models, textures, levels, music and movies from **your own disc image** (GMSE01, North America, Rev 0) at run time.
 
-**Status: playable on a console**, at 60 fps at the console's own clocks at 1x and 2x internal resolution with the deko3d renderer; see [Status](#status).
+**Status: playable on a console**, at 60 fps at 1x and 2x internal resolution with the deko3d renderer, docked at the console's own clocks and in handheld with the handheld boost (below); see [Status](#status).
 
 ## Build
 
@@ -130,6 +130,7 @@ Joy-Con and Pro Controllers work as the GameCube controller: A/B/X/Y, + = Start,
 | **−** with the overlay shown | the warp menu (stages and episodes) |
 | **L3 + d-pad right** (hold the left stick in) | next graphics preset: 1x, 2x, 1x with the HD textures, 2x with them |
 | **L3 + d-pad left** | 30 or 60 fps during gameplay, from the next area or level |
+| **R3 + d-pad up** (hold the right stick in) | the handheld boost off or on (below) |
 
 `SMS_OVERLAY=1` in `env.txt` shows the overlay from the start.
 The graphics preset and frame rate chosen in the game are kept in `graphics.txt` beside the NRO and used at the next start (its `NAME=value` lines, as `env.txt`'s, override `env.txt`).
@@ -144,7 +145,8 @@ What the Switch build does about it:
   The game's thread used to wait for the swap, so the game, the driver and the GPU took turns every frame.
   `SMS_GX_ASYNC_PRESENT=0` in `env.txt` brings the wait back, to compare.
 - **Threads** (`switch/src/performance.cpp`): the game's thread starts on core 0, the GL thread on core 1 and the rest on core 2 or 0, each free to move to any of the three; the texture pack's background work runs below the game's priority, since Horizon does not share a core between threads of equal priority by time.
-  The CPU and GPU run at the console's own clocks; the port never raises them.
+  Docked, the CPU, GPU and memory run at the console's own clocks.
+- **The handheld boost** (`switch/src/performance.cpp`): in handheld the GPU and memory run at the docked rates, 768 MHz and 1600 MHz (Nintendo's own rates, no overclock; the CPU stays at 1020 MHz). Delfino Plaza at 2x runs at about 27 fps at the console's handheld rates (GPU 307.2, memory 1331.2) and 60 with the boost; at 1.5x (`SMS_GX_SCALE=1.5`) GPU 460.8 and memory 1600 were enough. R3 + d-pad up switches it off or on (kept in `clocks.txt` beside the NRO), `SMS_SWITCH_HANDHELD_BOOST=0` in `env.txt` starts with it off; it costs battery. The clocks go back to the console's own when the game ends; closed from the HOME menu, the memory clock stays raised until the next start, a docking change or another game.
 - **Widescreen** draws are placed without scanning their vertices over and over (`patches/sms-port/0006`, from the Android build).
 - **The deko3d renderer** (`SMS_SWITCH_RENDERER=deko3d`): the GL calls go to deko3d directly instead of through Mesa, about half the GL thread's time.
 - **The graphics worker** (`SMS_GX_THREAD`, on by default): the game's GX calls only write the command stream, and a thread of its own on another core parses it into draws, so the game's code and the GX front end run side by side; a few fps more where the CPU is the limit (2x, the HD pack), for about a frame more input latency.
@@ -237,7 +239,7 @@ Verified in Eden 0.2.1 on this machine:
 - disc, memory card, audio (DSP HLE), threads and the OpenGL 4.3 context come up;
 - the opening logos render, the same picture as the PC build (compared by eye at field 300), full screen at 1080p.
 
-On consoles, at the console's own clocks: the game plays at 60 fps with the deko3d renderer and the graphics worker at 1x and 2x internal resolution (Delfino Plaza, Bianco Hills; 2x with the HD pack about 58 to 60), and a tester's console ran it for over an hour without a crash.
+On consoles: the game plays at 60 fps with the deko3d renderer and the graphics worker at 1x and 2x internal resolution, docked at the console's own clocks and in handheld with the handheld boost (Delfino Plaza, Bianco Hills; 2x with the HD pack about 58 to 60), and a tester's console ran it for over an hour without a crash.
 
 Not yet:
 
