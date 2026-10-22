@@ -122,7 +122,7 @@ Build and install the NSP again only to change its icon or the file it starts (s
 
 ## Controls
 
-Joy-Con and Pro Controllers work as the GameCube controller (the PC port's mapping: A/B/X/Y, + = Start, R = Z, ZL/ZR = L/R, sticks, d-pad).
+Joy-Con and Pro Controllers work as the GameCube controller: A/B/X/Y, + = Start, − = Z (the map), ZL = L, ZR = R pressed all the way (a full spray, Mario stands still), R = R pressed part of the way (a soft spray: Mario keeps walking), sticks, d-pad. `bindings.txt` beside the NRO changes any of it (`R_SOFT`, `PAD_RB`, ... as on the PC).
 
 | | |
 | --- | --- |

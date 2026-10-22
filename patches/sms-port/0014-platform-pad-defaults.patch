@@ -1,0 +1,20 @@
+A platform's own controller layout: SMS_PAD_DEFAULTS.
+
+bindings.txt lines in an environment variable, read after the built-in
+layout and before bindings.txt, so a platform can give its controller a
+layout of its own (the Switch: R a soft spray, ZR the full one, - the
+map) that a player's bindings.txt still changes.
+
+--- a/platform/pad/pad.cpp
++++ b/platform/pad/pad.cpp
+@@ -536,6 +536,10 @@
+ 	for (size_t i = 0; i < sizeof kDefaultPad / sizeof kDefaultPad[0]; i++)
+ 		g_pbind[kDefaultPad[i].control][g_npbind[kDefaultPad[i].control]++] = kDefaultPad[i].source;
+ 	parse_bindings(kDefaultBindings, "defaults");
++	// SMS_PAD_DEFAULTS: bindings.txt lines (\n between them) from the platform
++	// that runs the game, its own layout, before bindings.txt changes it
++	if (const char* platform = getenv("SMS_PAD_DEFAULTS"))
++		parse_bindings(platform, "SMS_PAD_DEFAULTS");
+ 	g_invert_cx = env_on("SMS_CAMERA_INVERT_X");
+ 	g_invert_cy = env_on("SMS_CAMERA_INVERT_Y");
+ 	if (g_invert_cx || g_invert_cy)

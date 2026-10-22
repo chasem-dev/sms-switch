@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Draw switch/prompts/switch.png: the Switch's buttons for the game's button
 glyphs (sms-port gx_prompts.cpp: eight 64x64 cells, A B X Y Z L R C-stick),
-as sms-switch maps them: A B X Y, Z = R, L = ZL, R = ZR, C-stick = right stick.
+as sms-switch maps them: A B X Y, Z = minus, L = ZL, R = ZR, C-stick = right stick.
 
     python3 tools/make_prompts.py [FONT.ttf] [OUT.png]
 """
@@ -40,6 +40,15 @@ def shoulder(label):  # a shoulder button: a rounded bar
     return im
 
 
+def minus():  # the - button: a small round button with a bar
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    m = 8 * SS
+    d.ellipse((m, m, S - m, S - m), fill=FILL)
+    d.rounded_rectangle((20 * SS, 29 * SS, S - 20 * SS, S - 29 * SS), radius=3 * SS, fill=INK)
+    return im
+
+
 def stick(label):  # a stick: a ring around its cap, with its letter
     im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
@@ -50,7 +59,7 @@ def stick(label):  # a stick: a ring around its cap, with its letter
     return im
 
 
-cells = [face("A"), face("B"), face("X"), face("Y"), shoulder("R"), shoulder("ZL"), shoulder("ZR"), stick("R")]
+cells = [face("A"), face("B"), face("X"), face("Y"), minus(), shoulder("ZL"), shoulder("ZR"), stick("R")]
 atlas = Image.new("RGBA", (CELL * len(cells), CELL), (0, 0, 0, 0))
 for i, c in enumerate(cells):
     atlas.paste(c.resize((CELL, CELL), Image.LANCZOS), (i * CELL, 0))
