@@ -96,6 +96,16 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # A release published by hand first (the deko3d build, which needs
+          # build/uam and the program pack, made off CI) gets this run's
+          # Eclipse NRO and self-test beside its own files, not a second set.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            have=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+            for f in dist/sms-eclipse.nro dist/gx_selftest.nro; do
+              grep -qx "$(basename "$f")" <<<"$have" || gh release upload "$TAG" --repo "$REPO" "$f"
+            done
+            exit 0
+          fi
           versions=$(cat dist/versions.txt dist/eclipse-versions.txt)
           cat > notes.md <<EOF
           Super Mario Sunshine PC port as Nintendo Switch homebrew, and Super Mario Eclipse on it. **No game data is included**: they play your own disc images.

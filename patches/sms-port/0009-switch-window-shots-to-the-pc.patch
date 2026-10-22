@@ -1,0 +1,53 @@
+Window captures on the Switch can go to the PC (sms-switch's dev_link.cpp
+sends them over the test run's connection), and SMS_WINDOW_SHOTS=+n takes
+one every n frames.
+
+diff --git a/platform/gx/src/gx_render.cpp b/platform/gx/src/gx_render.cpp
+--- a/platform/gx/src/gx_render.cpp
++++ b/platform/gx/src/gx_render.cpp
+@@ -3046,25 +3046,41 @@
+ 
+ }  // extern "C"
+ 
++#ifdef __SWITCH__
++// The Switch's test runs send the captures to the PC instead (switch/src/
++// dev_link.cpp in sms-switch); false: write the file.
++extern "C" bool GXPC_WindowShotSink(uint32_t frame, const uint8_t* rgba, int w, int h);
++#endif
++
+ // SMS_WINDOW_SHOTS=frame,frame,...: the window as it is shown, with the menus
+ // drawn over the game, at those GX frames (GXPC_FrameCount), written to
+-// SMS_SHOT_DIR (default "shots") as window<frame>.ppm. The XFB captures
+-// (SMS_SHOTS) have the game's picture only.
++// SMS_SHOT_DIR (default "shots") as window<frame>.ppm; "+n" is every n frames.
++// The XFB captures (SMS_SHOTS) have the game's picture only.
+ void gx::captureWindow(uint32_t frame, int w, int h) {
+     static std::vector<uint32_t> frames;
++    static uint32_t every = 0;
+     static bool parsed = false;
+     if (!parsed) {
+         parsed = true;
+         if (const char* e = getenv("SMS_WINDOW_SHOTS"))
+             for (const char* p = e; *p;) {
+-                frames.push_back(uint32_t(strtoul(p, const_cast<char**>(&p), 10)));
++                if (*p == '+') every = uint32_t(strtoul(p + 1, const_cast<char**>(&p), 10));
++                else frames.push_back(uint32_t(strtoul(p, const_cast<char**>(&p), 10)));
+                 while (*p == ',' || *p == ' ') p++;
+             }
+     }
+-    if (w <= 0 || h <= 0 || std::find(frames.begin(), frames.end(), frame) == frames.end()) return;
++    const bool due = (every && frame && frame % every == 0) ||
++                     std::find(frames.begin(), frames.end(), frame) != frames.end();
++    if (w <= 0 || h <= 0 || !due) return;
+     std::vector<uint8_t> px(size_t(w) * h * 4);
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
++#ifdef __SWITCH__
++    if (GXPC_WindowShotSink(frame, px.data(), w, h)) {
++        fprintf(stderr, "[sms_gx] captured the window at frame %u -> the PC\n", frame);
++        return;
++    }
++#endif
+     const char* dir = getenv("SMS_SHOT_DIR");
+     char path[1024];
+     snprintf(path, sizeof path, "%s/window%05u.ppm", dir ? dir : "shots", frame);

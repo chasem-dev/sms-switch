@@ -1,0 +1,58 @@
+GX lighting on the Switch's deko3d renderer: each channel's colour and alpha
+worked out as whole vectors and joined once (col = vec4(colour.rgb,
+alpha.a)), and each light added to the whole sum: the same values, but no
+swizzled writes, which uam (the deko3d renderer's shader compiler)
+miscompiled on the console (a channel black, the light term lost).
+
+diff --git a/platform/gx/src/gx_shader.cpp b/platform/gx/src/gx_shader.cpp
+--- a/platform/gx/src/gx_shader.cpp
++++ b/platform/gx/src/gx_shader.cpp
+@@ -136,10 +136,13 @@
+ // coefficients (J3D leaves unused lights like that) must contribute nothing
+ // rather than 0/0 = NaN, which would turn the whole channel black; a zero
+ // denominator with a positive numerator saturates, as the hardware reciprocal does.
+-static void emitLight(std::string& s, uint32_t ctrl, const char* comp, const char* sumName, int light) {
++// Each light adds to the whole sum vector (the caller keeps only the colour or
++// the alpha of it): no swizzled compound assignment, which the Switch's
++// shader compiler (uam) got wrong on the console.
++static void emitLight(std::string& s, uint32_t ctrl, const char* sumName, int light) {
+     char buf[1024];
+-    std::string sumS = std::string(sumName) + comp;
+-    const char* sum = sumS.c_str();
++    const char* sum = sumName;
++    const char* comp = "";
+     uint32_t diff = (ctrl >> 7) & 3;
+     bool attn = (ctrl >> 9) & 1, spot = (ctrl >> 10) & 1;
+     const char* dfn = diff == 0 ? "1.0" : diff == 1 ? "dot(N, L)" : "max(dot(N, L), 0.0)";
+@@ -226,9 +229,11 @@
+             s += buf;
+             continue;
+         }
++        // colour (part 0) and alpha (part 1) each as a whole vec4, joined
++        // once: col = vec4(colour.rgb, alpha.a), no writes to swizzles
++        s += "  { vec4 part0, part1;\n";
+         for (int part = 0; part < 2; part++) {
+             uint32_t ctrl = part ? ac : cc;
+-            const char* comp = part ? ".a" : ".rgb";
+             snprintf(buf, sizeof buf, "  { vec4 mat = %s; ", (ctrl & 1) ? vtx[c] : (c ? "u_chan[3]" : "u_chan[2]"));
+             s += buf;
+             if (ctrl & 2) {
+@@ -236,13 +241,15 @@
+                 s += buf;
+                 uint32_t mask = ((ctrl >> 2) & 15) | ((ctrl >> 11) & 15) << 4;
+                 for (int l = 0; l < 8; l++)
+-                    if (mask & (1u << l)) emitLight(s, ctrl, comp, "lsum", l);
+-                snprintf(buf, sizeof buf, "    col%d%s = (mat * clamp(lsum, 0.0, 1.0))%s; }\n", c, comp, comp);
++                    if (mask & (1u << l)) emitLight(s, ctrl, "lsum", l);
++                snprintf(buf, sizeof buf, "    part%d = mat * clamp(lsum, 0.0, 1.0); }\n", part);
+             } else {
+-                snprintf(buf, sizeof buf, "col%d%s = mat%s; }\n", c, comp, comp);
++                snprintf(buf, sizeof buf, "part%d = mat; }\n", part);
+             }
+             s += buf;
+         }
++        snprintf(buf, sizeof buf, "    col%d = vec4(part0.rgb, part1.a); }\n", c);
++        s += buf;
+     }
+     s += "  v_c0 = col0;\n  v_c1 = col1;\n";
+ 

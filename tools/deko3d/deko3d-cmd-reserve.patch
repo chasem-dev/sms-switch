@@ -1,0 +1,39 @@
+Room for every word a command writes.
+
+CmdBufWriter::reserve(n) makes room for n words; the words after it are
+written without a check, and a user command buffer keeps no spare words at
+its memory's end. dkCmdBufBindVtxBuffers reserved 5 words a buffer and wrote
+6 (VertexArray::Start and VertexArrayLimit, each a header and an address), so
+binding many buffers near the end of command memory wrote up to numBuffers-1
+words past it, into memory that something else then overwrote before the GPU
+read it: on the console, after minutes of play, GPU method errors at
+VertexArrayLimit[14] (the 15th buffer's) with a float or another command's
+header as its address (2359-0001). Blit2DEngine reserved 38 words where the
+premultiplied modes with two block-linear images write 39.
+
+diff --git a/source/maxwell/gpu_3d_vbo.cpp b/source/maxwell/gpu_3d_vbo.cpp
+index d95ba5d..23913bf 100644
+--- a/source/maxwell/gpu_3d_vbo.cpp
++++ b/source/maxwell/gpu_3d_vbo.cpp
+@@ -54,7 +54,7 @@ void dkCmdBufBindVtxBuffers(DkCmdBuf obj, uint32_t firstId, DkBufExtents const b
+ 	DK_DEBUG_BAD_INPUT(firstId > DK_MAX_VERTEX_BUFFERS || numBuffers > DK_MAX_VERTEX_BUFFERS || (firstId+numBuffers) > DK_MAX_VERTEX_BUFFERS);
+ 	DK_DEBUG_NON_NULL_ARRAY(buffers, numBuffers);
+ 	CmdBufWriter w{obj};
+-	w.reserve(5*numBuffers);
++	w.reserve(6*numBuffers); // VertexArray::Start and VertexArrayLimit: 3 words each
+ 
+ 	for (uint32_t i = 0; i < numBuffers; i ++)
+ 	{
+diff --git a/source/maxwell/gpu_transfer.cpp b/source/maxwell/gpu_transfer.cpp
+index 6735660..36d5d5c 100644
+--- a/source/maxwell/gpu_transfer.cpp
++++ b/source/maxwell/gpu_transfer.cpp
+@@ -119,7 +119,7 @@ void dk::detail::BlitCopyEngine(DkCmdBuf obj, ImageInfo const& src, ImageInfo co
+ void dk::detail::Blit2DEngine(DkCmdBuf obj, ImageInfo const& src, ImageInfo const& dst, BlitParams const& params, int32_t dudx, int32_t dvdy, uint32_t flags, uint32_t factor)
+ {
+ 	CmdBufWriter w{obj};
+-	w.reserve((3 + 10*2 + 1) + 14);
++	w.reserve((3 + 10*2 + 1) + 15); // (SetBeta4 and two block-linear formats: 39 at most)
+ 
+ 	if (flags & Blit2D_SetupEngine)
+ 	{

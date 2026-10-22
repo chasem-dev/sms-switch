@@ -1,0 +1,2746 @@
+Less waiting for the GPU on the game thread. A pixel metric (Delfino's
+pollution counts) is answered from the newest of the last two frames' queries
+that has come back, not always the last frame's, which the GPU has often not
+finished yet; an EFB copy's write-back to RAM is stored once the GL thread
+has read it, or a frame later. Waiting for the previous frame's results kept
+the game from starting a frame while the GPU caught up (about 4 ms a frame in
+Delfino Plaza on the Switch).
+
+--- a/platform/audio/dsp_hle.cpp
++++ b/platform/audio/dsp_hle.cpp
+@@ -18,13 +18,21 @@
+ #include <dolphin/dsp.h>
+ 
+ #include "dsp_mixer.h"
++#include "../os/crash.h"
+ 
++#include <pthread.h>
++
++#include <atomic>
++#include <condition_variable>
+ #include <deque>
++#include <mutex>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ extern "C" u8* port_aram_ptr(u32 addr);
+ extern "C" void __DSPHandler(int interrupt, void* context); // JSystem/osdsp_task.c
++extern "C" __attribute__((weak)) void sms_switch_dsp_thread(void); // the Switch runtime (sms-switch)
+ 
+ namespace {
+ 
+@@ -64,6 +72,102 @@
+ 
+ void reply(u32 low16) { raise_irq(0xDCD10004u, kPrefix | low16); }
+ 
++// The mixing itself can run on a thread of its own, as the DSP is a processor
++// of its own: the audio thread releases the DSP and then waits for the
++// subframe's mail, so the game's other threads have the CPU meanwhile instead
++// of the mixing taking its turn. The mail is raised (the interrupt source
++// below) once the subframe is mixed. JAudio writes the voices it hands the
++// DSP only between that mail and the next release, as it must on hardware.
++// SMS_AUDIO_DSP_THREAD=0/1 (on by default on the Switch, never with the
++// deterministic retrace clock).
++struct Mixer {
++	std::mutex mu;
++	std::condition_variable cv;
++	bool job; // under mu
++	int16_t* outA;
++	int16_t* outB;
++	int n;
++	u16 master;
++	std::atomic<int> busy; // released and its mail not yet raised (game threads)
++	std::atomic<int> done; // mixed (the mixing thread)
++	bool started;
++} m;
++
++bool mixer_thread_on()
++{
++	static int on = -1;
++	if (on < 0) {
++		const char* e = getenv("SMS_AUDIO_DSP_THREAD");
++#ifdef __SWITCH__
++		on = !(e && *e == '0');
++#else
++		on = e && *e == '1';
++#endif
++		if (on && port_vi_deterministic())
++			on = 0;
++	}
++	return on != 0;
++}
++
++void* mixer_loop(void*)
++{
++	port_crash_thread_init();
++	if (sms_switch_dsp_thread)
++		sms_switch_dsp_thread();
++	for (;;) {
++		{
++			std::unique_lock<std::mutex> lk(m.mu);
++			m.cv.wait(lk, [] { return m.job; });
++			m.job = false;
++		}
++		port_dspmix_render(m.outA, m.outB, m.n, m.master);
++		m.done.store(1, std::memory_order_release);
++		port_irq_kick();
++	}
++	return NULL;
++}
++
++// Interrupt source: the subframe the mixing thread finished.
++void mixer_poll()
++{
++	if (!m.done.load(std::memory_order_acquire))
++		return;
++	m.done.store(0, std::memory_order_relaxed);
++	m.busy.store(0, std::memory_order_relaxed);
++	g.subframesRendered++;
++	post(0xDCD10004u);
++	post(kPrefix | 0xFF00);
++	__DSPHandler(0, NULL);
++}
++
++// A command while a subframe is still being mixed (JAudio waits for the mail
++// first, so this only guards the DSP's state): the mixing finishes first.
++void mixer_wait()
++{
++	while (m.busy.load(std::memory_order_relaxed) && !m.done.load(std::memory_order_acquire))
++		std::this_thread::yield();
++}
++
++void mixer_start()
++{
++	if (m.started || !mixer_thread_on())
++		return;
++	pthread_t th;
++	pthread_attr_t a;
++	pthread_attr_init(&a);
++	pthread_attr_setstacksize(&a, 256 << 10);
++	const int rc = pthread_create(&th, &a, mixer_loop, NULL);
++	pthread_attr_destroy(&a);
++	if (rc != 0) {
++		port_log("[audio] no thread for the DSP's mixing (%d): mixing on the audio thread\n", rc);
++		return;
++	}
++	pthread_detach(th);
++	port_irq_add_source(mixer_poll);
++	m.started = true;
++	port_log("[audio] DSP mixing on a thread of its own\n");
++}
++
+ // Debug: SMS_AUDIO_ARAM_DUMP=path[,subframe] writes the 16 MiB ARAM image once
+ // (default after 40 s of audio) for offline mixer runs (tests/, PROTOCOL.md).
+ void maybe_dump_aram()
+@@ -92,6 +196,20 @@
+ {
+ 	maybe_dump_aram();
+ 	u32 n = g.subSamples;
++	if (m.started) {
++		m.busy.store(1, std::memory_order_relaxed);
++		{
++			std::lock_guard<std::mutex> lk(m.mu);
++			m.outA   = g.outA + g.sub * n;
++			m.outB   = g.outB + g.sub * n;
++			m.n      = (int)n;
++			m.master = g.master;
++			m.job    = true;
++		}
++		m.cv.notify_one();
++		g.sub++;
++		return;
++	}
+ 	port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
+ 	g.sub++;
+ 	g.subframesRendered++;
+@@ -102,6 +220,7 @@
+ {
+ 	const std::vector<u32>& w = g.words;
+ 	u32 op = w[0] >> 24;
++	mixer_wait();
+ 	if (g.release) {
+ 		// DSPReleaseHalt: the 64-bit active-voice map. The microcode renders
+ 		// the next subframe of the current frame and reports 0xFF00.
+@@ -151,6 +270,7 @@
+ 	// Task start: the microcode mails 0xDCD10000 (the handler then runs the
+ 	// task's init_cb, DspHandShake, which waits for one more mail).
+ 	(void)task;
++	mixer_start();
+ 	raise_irq(0xDCD10000u, kPrefix);
+ 	port_log("[audio] DSP HLE: audio task booted (software mixer)\n");
+ }
+@@ -197,7 +317,10 @@
+ // DSP always finishes a frame within one block period, and consuming blocks
+ // faster than JAudio produces frames makes DSPBuf repeat stale samples (gaps)
+ // while the sequencer falls behind.
+-extern "C" int port_audio_dsp_frame_pending(void) { return g.outA && g.sub < g.subframes; }
++extern "C" int port_audio_dsp_frame_pending(void) { return (g.outA && g.sub < g.subframes) || m.busy.load(); }
++
++// A subframe on the mixing thread (save states wait for it).
++extern "C" int port_audio_dsp_busy(void) { return m.busy.load(); }
+ 
+ #ifdef SMS_AUDIO_DSP_HLE
+ // SDK surface (replaces the handshake-only fake in platform/misc/sdk_data.cpp).
+--- a/platform/gx/CMakeLists.txt
++++ b/platform/gx/CMakeLists.txt
+@@ -13,6 +13,7 @@
+     src/gx_bcenc.cpp
+     src/gx_fifo.cpp
+     src/gx_glthread.cpp
++    src/gx_thread.cpp
+     src/gx_hdr.cpp
+     src/gx_hires.cpp
+     src/gx_overlay.cpp
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -3,11 +3,13 @@
+ // (decomp/libs/dolphin/src/gx) so that display lists built by GD/J3D and the API
+ // agree bit for bit.
+ #include "gx_internal.h"
++#include "gx_thread.h"
+ #include "sms_gx/gx_pc.h"
+ 
+ #include <dolphin/gx.h>
+ 
+ #include <math.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "port_fpu.h"  // port_cvt_fp2unsigned: MWCC's __cvt_fp2unsigned, as the SDK converts
+@@ -27,6 +29,67 @@
+ static uint8_t* s_dlBegin = nullptr;
+ static uint32_t s_dlSize = 0;
+ 
++// The registers as the API sees them. With the graphics worker (gx_thread.h)
++// the worker owns `g`, and the API keeps this copy for its getters and the
++// setters that change part of a register; else it is `g` itself.
++static State s_front;
++static State* s_api = &g;
++static inline State& apiState() {
++    if (s_api == &s_front) frontCatchUp();  // what the stream did since
++    return *s_api;
++}
++#define GS (apiState())
++
++// A register write into the worker's stream, never into a redirected pipe:
++// unrecorded writes take effect now, as writeBP/CP/XF did them.
++static inline void streamBE32(uint8_t* p, uint32_t v) {
++    p[0] = uint8_t(v >> 24);
++    p[1] = uint8_t(v >> 16);
++    p[2] = uint8_t(v >> 8);
++    p[3] = uint8_t(v);
++}
++static void streamBP(uint32_t v) {
++    uint8_t b[5] = {0x61};
++    streamBE32(b + 1, v);
++    pipeWriteStream(b, 5);
++}
++static void streamCP(uint8_t reg, uint32_t v) {
++    uint8_t b[6] = {0x08, reg};
++    streamBE32(b + 2, v);
++    pipeWriteStream(b, 6);
++}
++static void streamXF(uint16_t addr, uint32_t n, const uint32_t* w) {
++    uint8_t b[5 + 16 * 4] = {0x10};
++    while (n) {
++        const uint32_t m = n > 16 ? 16 : n;
++        streamBE32(b + 1, ((m - 1) << 16) | addr);
++        for (uint32_t i = 0; i < m; i++) streamBE32(b + 5 + i * 4, w[i]);
++        pipeWriteStream(b, 5 + m * 4);
++        addr = uint16_t(addr + m);
++        w += m;
++        n -= m;
++    }
++}
++
++// A field of the copy the API wrote directly (shadows, pointers, TLUTs), the
++// same in the worker's state in stream order.
++struct MirrorHdr {
++    uint32_t off, n;
++};
++static void mirror(const void* field, size_t n) {
++    if (!gxt::on()) return;
++    const MirrorHdr h{uint32_t(static_cast<const uint8_t*>(field) - reinterpret_cast<const uint8_t*>(&s_front)),
++                      uint32_t(n)};
++    gxt::callRaw2(
++        [](const uint8_t* d, uint32_t) {
++            MirrorHdr hh;
++            memcpy(&hh, d, sizeof hh);
++            onStateChange();
++            memcpy(reinterpret_cast<uint8_t*>(&g) + hh.off, d + sizeof hh, hh.n);
++        },
++        &h, sizeof h, field, uint32_t(n));
++}
++
+ static inline uint32_t setField(uint32_t reg, int size, int shift, uint32_t v) {
+     uint32_t m = ((1u << size) - 1u) << shift;
+     return (reg & ~m) | ((v << shift) & m);
+@@ -40,9 +103,13 @@
+         GXPC_Write32(v);
+         return;
+     }
++    if (gxt::on()) {
++        streamBP(v);
++        return;
++    }
+     writeBP(v);
+ }
+-static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(g.bp[reg], size, shift, v)); }
++static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(GS.bp[reg], size, shift, v)); }
+ 
+ static void apiCP(uint8_t reg, uint32_t v) {
+     if (s_recording) {
+@@ -51,6 +118,10 @@
+         GXPC_Write32(v);
+         return;
+     }
++    if (gxt::on()) {
++        streamCP(reg, v);
++        return;
++    }
+     writeCP(reg, v);
+ }
+ 
+@@ -61,6 +132,10 @@
+         for (uint32_t i = 0; i < n; i++) GXPC_Write32(w[i]);
+         return;
+     }
++    if (gxt::on()) {
++        streamXF(addr, n, w);
++        return;
++    }
+     writeXF(addr, n, w);
+ }
+ static void apiXF1(uint16_t addr, uint32_t v) { apiXF(addr, 1, &v); }
+@@ -74,7 +149,7 @@
+     memcpy(&u, &f, 4);
+     return u;
+ }
+-static uint32_t xfReg(int r) { return g.xfReg[r]; }
++static uint32_t xfReg(int r) { return GS.xfReg[r]; }
+ 
+ // ------------------------------------------------------------------ internal object layouts
+ namespace {
+@@ -223,27 +298,66 @@
+     GXSetTexCopySrc(0, 0, 640, 480);
+     GXSetTexCopyDst(640, 480, GX_TF_RGBA8, GX_FALSE);
+     for (int i = 0; i < 8; i++) GXSetTexCoordScaleManually(GXTexCoordID(i), GX_FALSE, 0, 0);
++    if (!gxt::on()) {
++        s_front = g;  // before the worker can touch g
++        gxt::start();
++        if (gxt::on()) {
++            s_api = &s_front;
++            frontFollow(&s_front);
++        }
++    }
+     return &s_fifo;
+ }
+ 
+ void GXSetMisc(GXMiscToken, u32) {}
+-void GXFlush(void) { flushBatch(); }
++void GXFlush(void) {
++    if (gxt::on()) return gxt::publish();
++    flushBatch();
++}
+ void GXResetWriteGatherPipe(void) {}
+ void GXAbortFrame(void) {}
+-BOOL IsWriteGatherBufferEmpty(void) { return pipeIdle(); }
++BOOL IsWriteGatherBufferEmpty(void) {
++    if (gxt::on()) {
++        gxt::publish();
++        return TRUE;
++    }
++    return pipeIdle();
++}
+ 
+ void GXSetDrawSync(u16 token) {
+     apiBP(BP_PE_TOKEN_INT, 0x480000 | token);  // writes 0x48 with token
+     apiBP(BP_PE_TOKEN, token);
+ }
+-u16 GXReadDrawSync(void) { return g.drawSyncToken; }
++u16 GXReadDrawSync(void) { return gxt::on() ? gxt::lastToken() : g.drawSyncToken; }
+ void GXSetDrawDone(void) {
+     apiBP(BP_DRAWDONE, 2);
++    gxt::sync("setDrawDone");
+     if (s_drawDoneCb) s_drawDoneCb();
+ }
+-void GXWaitDrawDone(void) { flushBatch(); }
+-void GXDrawDone(void) {
++void GXWaitDrawDone(void) {
++    if (gxt::on()) return gxt::sync("waitDrawDone");
+     flushBatch();
++}
++// With the graphics worker the commands before already run in their order
++// there; what waits for GPU work here is the CPU reusing memory the GPU read
++// (the THP player's texture sets, every frame a movie plays), which the
++// worker's lag of at most a frame leaves alone in practice: it hands the
++// stream over and goes on. SMS_GX_THREAD_DRAWDONE=sync waits as before.
++static bool drawDoneWaits() {
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("SMS_GX_THREAD_DRAWDONE");
++        on = e && !strcmp(e, "sync");
++    }
++    return on != 0;
++}
++void GXDrawDone(void) {
++    if (gxt::on()) {
++        if (drawDoneWaits()) gxt::sync("drawDone");
++        else gxt::publish();
++    } else {
++        flushBatch();
++    }
+     if (s_drawDoneCb) s_drawDoneCb();
+ }
+ void GXPixModeSync(void) {}
+@@ -329,7 +443,7 @@
+ 
+ // ================================================================== display lists
+ void GXBeginDisplayList(void* list, u32 size) {
+-    flushBatch();
++    if (!gxt::on()) flushBatch();
+     s_recording = true;
+     s_dlBegin = static_cast<uint8_t*>(list);
+     s_dlSize = size;
+@@ -351,12 +465,26 @@
+         GXPC_Write32(uint32_t(nbytes));
+         return;
+     }
++    if (gxt::on()) {
++        const uint8_t* dl = static_cast<const uint8_t*>(list);
++        const uint32_t n = uint32_t(nbytes);
++        frontCatchUp();
++        frontScanList(s_front, dl, n);  // the API's copy sees what the list sets
++        // A list the CPU wrote in the last frames (J3D's packets, lists the
++        // game records and calls) may be written again before the worker
++        // gets to it, as on hardware the game would wait for the GPU: its
++        // bytes go along as they are now. Lists loaded with the models, by
++        // far the most bytes, stay where they are (and in the worker's cache).
++        if (n <= (256u << 10) && !unwrittenSince(dl, n, gxt::frameStartClock(2)))
++            return gxt::callRaw([](const uint8_t* d, uint32_t m) { runCommands(d, m); }, dl, n);
++        return gxt::call([dl, n] { callDisplayList(dl, n); });
++    }
+     callDisplayList(static_cast<const uint8_t*>(list), uint32_t(nbytes));
+ }
+ 
+ // ================================================================== GXGeometry / GXAttr
+ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+-    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi;
++    uint32_t lo = GS.cpVcdLo, hi = GS.cpVcdHi;
+     uint32_t t = uint32_t(type) & 3;
+     if (attr == GX_VA_PNMTXIDX) lo = setField(lo, 1, 0, t != 0);
+     else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) lo = setField(lo, 1, 1 + (attr - GX_VA_TEX0MTXIDX), t != 0);
+@@ -365,8 +493,8 @@
+     else if (attr == GX_VA_CLR0) lo = setField(lo, 2, 13, t);
+     else if (attr == GX_VA_CLR1) lo = setField(lo, 2, 15, t);
+     else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) hi = setField(hi, 2, 2 * (attr - GX_VA_TEX0), t);
+-    if (lo != g.cpVcdLo) apiCP(CP_VCD_LO, lo);
+-    if (hi != g.cpVcdHi) apiCP(CP_VCD_HI, hi);
++    if (lo != GS.cpVcdLo) apiCP(CP_VCD_LO, lo);
++    if (hi != GS.cpVcdHi) apiCP(CP_VCD_HI, hi);
+ }
+ void GXSetVtxDescv(const GXVtxDescList* list) {
+     for (; list->attr != GX_VA_NULL; list++) GXSetVtxDesc(list->attr, list->type);
+@@ -376,7 +504,7 @@
+     apiCP(CP_VCD_HI, 0);
+ }
+ void GXGetVtxDesc(GXAttr attr, GXAttrType* type) {
+-    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi, t = 0;
++    uint32_t lo = GS.cpVcdLo, hi = GS.cpVcdHi, t = 0;
+     if (attr == GX_VA_PNMTXIDX) t = lo & 1;
+     else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) t = getField(lo, 1, 1 + attr - GX_VA_TEX0MTXIDX);
+     else if (attr == GX_VA_POS) t = getField(lo, 2, 9);
+@@ -397,7 +525,7 @@
+ }
+ 
+ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
+-    uint32_t A = g.cpVatA[fmt], B = g.cpVatB[fmt], C = g.cpVatC[fmt];
++    uint32_t A = GS.cpVatA[fmt], B = GS.cpVatB[fmt], C = GS.cpVatC[fmt];
+     uint32_t c = uint32_t(cnt), t = uint32_t(type), f = frac;
+     switch (attr) {
+     case GX_VA_POS: A = setField(A, 1, 0, c); A = setField(A, 3, 1, t); A = setField(A, 5, 4, f); break;
+@@ -420,15 +548,15 @@
+     default: break;
+     }
+     A |= 1u << 30;
+-    if (A != g.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
+-    if (B != g.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
+-    if (C != g.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
++    if (A != GS.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
++    if (B != GS.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
++    if (C != GS.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
+ }
+ void GXSetVtxAttrFmtv(GXVtxFmt fmt, const GXVtxAttrFmtList* list) {
+     for (; list->attr != GX_VA_NULL; list++) GXSetVtxAttrFmt(fmt, list->attr, list->cnt, list->type, list->frac);
+ }
+ void GXGetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt* cnt, GXCompType* type, u8* frac) {
+-    uint32_t A = g.cpVatA[fmt], B = g.cpVatB[fmt], C = g.cpVatC[fmt];
++    uint32_t A = GS.cpVatA[fmt], B = GS.cpVatB[fmt], C = GS.cpVatC[fmt];
+     uint32_t c = 0, t = 0, f = 0;
+     switch (attr) {
+     case GX_VA_POS: c = getField(A, 1, 0); t = getField(A, 3, 1); f = getField(A, 5, 4); break;
+@@ -468,9 +596,19 @@
+         apiCP(uint8_t(CP_ARRAY_STRIDE + slot), stride);
+         return;
+     }
+-    g.arrayBase[slot] = static_cast<const uint8_t*>(base);
+-    g.arrayStride[slot] = stride;
+-    g.arrayBigEndian[slot] = g_defaultArrayBE || isBigEndianData(base);
++    if (gxt::on()) {  // the byte order is the worker's to find (its big-endian ranges)
++        GS.arrayBase[slot] = static_cast<const uint8_t*>(base);
++        GS.arrayStride[slot] = stride;
++        return gxt::call([slot, base, stride] {
++            g.arrayBase[slot] = static_cast<const uint8_t*>(base);
++            g.arrayStride[slot] = stride;
++            g.arrayBigEndian[slot] = g_defaultArrayBE || isBigEndianData(base);
++            g_arrayGen++;
++        });
++    }
++    GS.arrayBase[slot] = static_cast<const uint8_t*>(base);
++    GS.arrayStride[slot] = stride;
++    GS.arrayBigEndian[slot] = g_defaultArrayBE || isBigEndianData(base);
+     g_arrayGen++;
+ }
+ void GXInvalidateVtxCache(void) {}
+@@ -536,33 +674,36 @@
+ }
+ 
+ void GXSetLineWidth(u8 width, GXTexOffset off) {
+-    g.lineWidth = width;
+-    uint32_t r = setField(g.bp[BP_LPSIZE], 8, 0, width);
++    GS.lineWidth = width;
++    mirror(&GS.lineWidth, sizeof GS.lineWidth);
++    uint32_t r = setField(GS.bp[BP_LPSIZE], 8, 0, width);
+     apiBP(BP_LPSIZE, setField(r, 3, 16, off));
+ }
+ void GXGetLineWidth(u8* width, GXTexOffset* off) {
+-    *width = u8(getField(g.bp[BP_LPSIZE], 8, 0));
+-    *off = GXTexOffset(getField(g.bp[BP_LPSIZE], 3, 16));
++    *width = u8(getField(GS.bp[BP_LPSIZE], 8, 0));
++    *off = GXTexOffset(getField(GS.bp[BP_LPSIZE], 3, 16));
+ }
+ void GXSetPointSize(u8 size, GXTexOffset off) {
+-    g.pointSize = size;
+-    uint32_t r = setField(g.bp[BP_LPSIZE], 8, 8, size);
++    GS.pointSize = size;
++    mirror(&GS.pointSize, sizeof GS.pointSize);
++    uint32_t r = setField(GS.bp[BP_LPSIZE], 8, 8, size);
+     apiBP(BP_LPSIZE, setField(r, 3, 19, off));
+ }
+ void GXGetPointSize(u8* size, GXTexOffset* off) {
+-    *size = u8(getField(g.bp[BP_LPSIZE], 8, 8));
+-    *off = GXTexOffset(getField(g.bp[BP_LPSIZE], 3, 19));
++    *size = u8(getField(GS.bp[BP_LPSIZE], 8, 8));
++    *off = GXTexOffset(getField(GS.bp[BP_LPSIZE], 3, 19));
+ }
+ void GXEnableTexOffsets(GXTexCoordID coord, u8 line, u8 point) {
+-    uint32_t r = setField(g.bp[BP_SU_SSIZE + 2 * coord], 1, 18, line);
++    uint32_t r = setField(GS.bp[BP_SU_SSIZE + 2 * coord], 1, 18, line);
+     apiBP(BP_SU_SSIZE + 2 * coord, setField(r, 1, 19, point));
+ }
+ void GXSetCullMode(GXCullMode mode) {
+-    g.cullMode = mode;
++    GS.cullMode = mode;
++    mirror(&GS.cullMode, sizeof GS.cullMode);
+     uint32_t hw = mode == GX_CULL_FRONT ? 2 : mode == GX_CULL_BACK ? 1 : uint32_t(mode);
+     bpField(BP_GENMODE, 2, 14, hw);
+ }
+-void GXGetCullMode(GXCullMode* mode) { *mode = GXCullMode(g.cullMode); }
++void GXGetCullMode(GXCullMode* mode) { *mode = GXCullMode(GS.cullMode); }
+ void GXSetCoPlanar(GXBool enable) { bpField(BP_GENMODE, 1, 19, enable); }
+ 
+ // ================================================================== GXTransform
+@@ -584,13 +725,14 @@
+ }
+ void GXSetProjectionv(f32* ptr) {
+     traceNoteProjection(ptr);
+-    memcpy(g.projection, ptr, sizeof(g.projection));
++    memcpy(GS.projection, ptr, sizeof(GS.projection));
++    mirror(GS.projection, sizeof GS.projection);
+     uint32_t w[7];
+     for (int i = 0; i < 6; i++) w[i] = fbits(ptr[1 + i]);
+     w[6] = ptr[0] != 0.0f ? 1 : 0;
+     apiXF(XF_REG_BASE + XFR_PROJ, 7, w);
+ }
+-void GXGetProjectionv(f32* ptr) { memcpy(ptr, g.projection, sizeof(g.projection)); }
++void GXGetProjectionv(f32* ptr) { memcpy(ptr, GS.projection, sizeof(GS.projection)); }
+ 
+ void GXLoadPosMtxImm(f32 mtx[3][4], u32 id) { apiXFf(uint16_t(id * 4), 12, &mtx[0][0]); }
+ void GXLoadPosMtxIndx(u16 idx, u32 id) {
+@@ -641,12 +783,13 @@
+ 
+ void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
+     if (field == 0) top -= 0.5f;
+-    g.viewport[0] = left;
+-    g.viewport[1] = top;
+-    g.viewport[2] = wd;
+-    g.viewport[3] = ht;
+-    g.viewport[4] = nearz;
+-    g.viewport[5] = farz;
++    GS.viewport[0] = left;
++    GS.viewport[1] = top;
++    GS.viewport[2] = wd;
++    GS.viewport[3] = ht;
++    GS.viewport[4] = nearz;
++    GS.viewport[5] = farz;
++    mirror(GS.viewport, sizeof GS.viewport);
+     float v[6];
+     v[0] = wd * 0.5f;
+     v[1] = -ht * 0.5f;
+@@ -659,13 +802,14 @@
+ void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
+     GXSetViewportJitter(left, top, wd, ht, nearz, farz, 1);
+ }
+-void GXGetViewportv(f32* vp) { memcpy(vp, g.viewport, sizeof(g.viewport)); }
++void GXGetViewportv(f32* vp) { memcpy(vp, GS.viewport, sizeof(GS.viewport)); }
+ 
+ void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
+-    g.scissor[0] = uint32_t(left);
+-    g.scissor[1] = uint32_t(top);
+-    g.scissor[2] = uint32_t(wd);
+-    g.scissor[3] = uint32_t(ht);
++    GS.scissor[0] = uint32_t(left);
++    GS.scissor[1] = uint32_t(top);
++    GS.scissor[2] = uint32_t(wd);
++    GS.scissor[3] = uint32_t(ht);
++    mirror(GS.scissor, sizeof GS.scissor);
+     uint32_t tl = setField(0, 11, 0, uint32_t(top) + 342);
+     tl = setField(tl, 11, 12, uint32_t(left) + 342);
+     uint32_t br = setField(0, 11, 0, uint32_t(top + ht) + 341);
+@@ -674,10 +818,10 @@
+     apiBP(BP_SCISSOR_BR, br);
+ }
+ void GXGetScissor(u32* left, u32* top, u32* wd, u32* ht) {
+-    *left = g.scissor[0];
+-    *top = g.scissor[1];
+-    *wd = g.scissor[2];
+-    *ht = g.scissor[3];
++    *left = GS.scissor[0];
++    *top = GS.scissor[1];
++    *wd = GS.scissor[2];
++    *ht = GS.scissor[3];
+ }
+ void GXSetScissorBoxOffset(s32 x, s32 y) {
+     uint32_t r = setField(0, 10, 0, uint32_t(x + 342) >> 1);
+@@ -861,7 +1005,7 @@
+     GXSetTevAlphaOp(id, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+ }
+ void GXSetTevColorIn(GXTevStageID s, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
+-    uint32_t r = g.bp[BP_TEV_COLOR_ENV + 2 * s];
++    uint32_t r = GS.bp[BP_TEV_COLOR_ENV + 2 * s];
+     r = setField(r, 4, 12, a);
+     r = setField(r, 4, 8, b);
+     r = setField(r, 4, 4, c);
+@@ -869,7 +1013,7 @@
+     apiBP(BP_TEV_COLOR_ENV + 2 * s, r);
+ }
+ void GXSetTevAlphaIn(GXTevStageID s, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d) {
+-    uint32_t r = g.bp[BP_TEV_COLOR_ENV + 2 * s + 1];
++    uint32_t r = GS.bp[BP_TEV_COLOR_ENV + 2 * s + 1];
+     r = setField(r, 3, 13, a);
+     r = setField(r, 3, 10, b);
+     r = setField(r, 3, 7, c);
+@@ -889,10 +1033,10 @@
+     return setField(r, 2, 22, out);
+ }
+ void GXSetTevColorOp(GXTevStageID s, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out) {
+-    apiBP(BP_TEV_COLOR_ENV + 2 * s, tevOp(g.bp[BP_TEV_COLOR_ENV + 2 * s], op, bias, scale, clamp, out));
++    apiBP(BP_TEV_COLOR_ENV + 2 * s, tevOp(GS.bp[BP_TEV_COLOR_ENV + 2 * s], op, bias, scale, clamp, out));
+ }
+ void GXSetTevAlphaOp(GXTevStageID s, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out) {
+-    apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, tevOp(g.bp[BP_TEV_COLOR_ENV + 2 * s + 1], op, bias, scale, clamp, out));
++    apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, tevOp(GS.bp[BP_TEV_COLOR_ENV + 2 * s + 1], op, bias, scale, clamp, out));
+ }
+ static void tevRegWrite(uint32_t id, int r, int gg, int b, int a, bool konst) {
+     uint32_t ra = setField(0, 11, 0, uint32_t(r)) | setField(0, 11, 12, uint32_t(a)) | (konst ? 0x800000u : 0);
+@@ -910,13 +1054,13 @@
+     bpField(BP_TEV_KSEL + (s >> 1), 5, (s & 1) ? 19 : 9, sel);
+ }
+ void GXSetTevSwapMode(GXTevStageID s, GXTevSwapSel ras, GXTevSwapSel tex) {
+-    uint32_t r = setField(g.bp[BP_TEV_COLOR_ENV + 2 * s + 1], 2, 0, ras);
++    uint32_t r = setField(GS.bp[BP_TEV_COLOR_ENV + 2 * s + 1], 2, 0, ras);
+     apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, setField(r, 2, 2, tex));
+ }
+ void GXSetTevSwapModeTable(GXTevSwapSel t, GXTevColorChan r, GXTevColorChan gch, GXTevColorChan b, GXTevColorChan a) {
+-    uint32_t k0 = setField(g.bp[BP_TEV_KSEL + 2 * t], 2, 0, r);
++    uint32_t k0 = setField(GS.bp[BP_TEV_KSEL + 2 * t], 2, 0, r);
+     apiBP(BP_TEV_KSEL + 2 * t, setField(k0, 2, 2, gch));
+-    uint32_t k1 = setField(g.bp[BP_TEV_KSEL + 2 * t + 1], 2, 0, b);
++    uint32_t k1 = setField(GS.bp[BP_TEV_KSEL + 2 * t + 1], 2, 0, b);
+     apiBP(BP_TEV_KSEL + 2 * t + 1, setField(k1, 2, 2, a));
+ }
+ void GXSetTevClampMode(void) {}
+@@ -938,7 +1082,7 @@
+     int sh = (s & 1) ? 12 : 0;
+     uint32_t tmap = uint32_t(map) & 0xFF;
+     bool enable = tmap != 0xFF && !(uint32_t(map) & 0x100);
+-    uint32_t r = g.bp[reg];
++    uint32_t r = GS.bp[reg];
+     r = setField(r, 3, sh, tmap == 0xFF ? 0 : tmap & 7);
+     r = setField(r, 3, sh + 3, coord == GX_TEXCOORD_NULL ? 0 : uint32_t(coord) & 7);
+     r = setField(r, 1, sh + 6, enable);
+@@ -979,11 +1123,11 @@
+ void GXSetIndTexCoordScale(GXIndTexStageID ind, GXIndTexScale ss, GXIndTexScale ts) {
+     uint32_t reg = ind < 2 ? BP_RAS1_SS0 : BP_RAS1_SS1;
+     int sh = (ind & 1) ? 8 : 0;
+-    uint32_t r = setField(g.bp[reg], 4, sh, ss);
++    uint32_t r = setField(GS.bp[reg], 4, sh, ss);
+     apiBP(reg, setField(r, 4, sh + 4, ts));
+ }
+ void GXSetIndTexOrder(GXIndTexStageID ind, GXTexCoordID coord, GXTexMapID map) {
+-    uint32_t r = setField(g.bp[BP_RAS1_IREF], 3, 6 * ind, uint32_t(map) & 7);
++    uint32_t r = setField(GS.bp[BP_RAS1_IREF], 3, 6 * ind, uint32_t(map) & 7);
+     apiBP(BP_RAS1_IREF, setField(r, 3, 6 * ind + 3, uint32_t(coord) & 7));
+ }
+ void GXSetNumIndStages(u8 n) { bpField(BP_GENMODE, 3, 16, n); }
+@@ -1067,7 +1211,7 @@
+     apiBP(BP_FOG_RANGE, (uint32_t(center) + 342) | (uint32_t(enable) << 10));
+ }
+ void GXSetBlendMode(GXBlendMode type, GXBlendFactor src, GXBlendFactor dst, GXLogicOp op) {
+-    uint32_t r = g.bp[BP_CMODE0];
++    uint32_t r = GS.bp[BP_CMODE0];
+     r = setField(r, 1, 0, type == GX_BM_BLEND || type == GX_BM_SUBTRACT);
+     r = setField(r, 1, 1, type == GX_BM_LOGIC);
+     r = setField(r, 1, 11, type == GX_BM_SUBTRACT);
+@@ -1084,7 +1228,7 @@
+ }
+ void GXSetZCompLoc(GXBool before) { bpField(BP_PE_CONTROL, 1, 6, before); }
+ void GXSetPixelFmt(GXPixelFmt pix, GXZFmt16 z) {
+-    uint32_t r = setField(g.bp[BP_PE_CONTROL], 3, 0, pix);
++    uint32_t r = setField(GS.bp[BP_PE_CONTROL], 3, 0, pix);
+     apiBP(BP_PE_CONTROL, setField(r, 3, 3, z));
+     bpField(BP_GENMODE, 1, 9, pix == GX_PF_RGB565_Z16);
+ }
+@@ -1105,8 +1249,25 @@
+ void GXPokeDither(GXBool) {}
+ void GXPokeZMode(GXBool, GXCompare, GXBool) {}
+ void GXPokeARGB(u16, u16, u32) {}
+-void GXPeekARGB(u16 x, u16 y, u32* color) { *color = peekColor(x, y); }
+-void GXPeekZ(u16 x, u16 y, u32* z) { *z = peekZ(x, y); }
++// With the graphics worker: the game's peeks (the sun's 17 depth probes and
++// Mario's visibility test) are made by TDrawSyncManager's handlers, each
++// just after its draw sync token comes back, and look at the picture as it is
++// at that token. The worker takes that snapshot as it reaches the token
++// (peekAtToken), for the tokens and kinds peeked at before, and the answer
++// comes from the newest one read back (gx_render.cpp).
++static bool peekWorker(bool depth, u16 x, u16 y, u32* out) {
++    return peekThreaded(peekKindToken(gxt::lastToken(), depth), depth, x, y, out);
++}
++void GXPeekARGB(u16 x, u16 y, u32* color) {
++    if (gxt::on() && peekWorker(false, x, y, color)) return;
++    gxt::sync("peek");
++    *color = peekColor(x, y);
++}
++void GXPeekZ(u16 x, u16 y, u32* z) {
++    if (gxt::on() && peekWorker(true, x, y, z)) return;
++    gxt::sync("peekZ");
++    *z = peekZ(x, y);
++}
+ void GXPokeZ(u16, u16, u32) {}
+ u32 GXCompressZ16(u32 z24, GXZFmt16) { return z24 >> 8; }
+ u32 GXDecompressZ16(u32 z16, GXZFmt16) { return z16 << 8; }
+@@ -1176,19 +1337,23 @@
+     if (disp) apiBP(BP_COPY_YSCALE, s_dispYScale);
+     // the renderer needs the host pointer; commands carry a physical address
+     apiBP(BP_COPY_DST, ptrToPhys(dest) >> 5);
+-    if (!s_recording) g.copyDest = dest;  // keep the full host pointer (64-bit hosts)
++    if (!s_recording) {
++        GS.copyDest = dest;  // keep the full host pointer (64-bit hosts)
++        mirror(&GS.copyDest, sizeof GS.copyDest);
++    }
+     uint32_t ctrl = disp ? s_dispCtrl : s_texCtrl;
+     ctrl = setField(ctrl, 1, 11, clear);
+     ctrl = setField(ctrl, 1, 14, disp);
+     if (!disp && s_texCopyZ) {
+         // the SDK switches PE_CONTROL to Z24 for depth copies
+-        uint32_t pe = g.bp[BP_PE_CONTROL];
++        uint32_t pe = GS.bp[BP_PE_CONTROL];
+         apiBP(BP_PE_CONTROL, setField(pe, 3, 0, 3));
+         apiBP(BP_COPY_EXEC, ctrl);
+         apiBP(BP_PE_CONTROL, pe);
+     } else {
+         apiBP(BP_COPY_EXEC, ctrl);
+     }
++    if (disp && !s_recording) gxt::frameQueued();  // the worker at most a frame behind
+ }
+ void GXCopyDisp(void* dest, GXBool clear) { doCopy(dest, clear, true); }
+ void GXCopyTex(void* dest, GXBool clear) { doCopy(dest, clear, false); }
+@@ -1335,7 +1500,10 @@
+         uint32_t fmt = idx < 20 ? s_tlutLoaded[idx].fmt : 0;
+         apiBP(bpTexReg(BP_TX_TLUT, map), ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | fmt << 10);
+     }
+-    if (!s_recording) g.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
++    if (!s_recording) {
++        GS.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
++        mirror(&GS.texImage[map], sizeof GS.texImage[map]);
++    }
+ }
+ void GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
+     if (s_texRegionCb) s_texRegionCb(obj, id);
+@@ -1362,8 +1530,15 @@
+     uint32_t off = r->tmemAddr - TMEM_TLUT_BASE;
+     uint32_t bytes = uint32_t(t->entries) * 2;
+     if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
++    if (gxt::on()) {
++        if (t->data) {
++            memcpy(GS.tlutMem + off, t->data, bytes);
++            mirror(GS.tlutMem + off, bytes);
++        }
++        return;
++    }
+     onStateChange();
+-    if (t->data) memcpy(g.tlutMem + off, t->data, bytes);
++    if (t->data) memcpy(GS.tlutMem + off, t->data, bytes);
+ }
+ void GXInitTexCacheRegion(GXTexRegion* region, u8 is32b, u32 even, GXTexCacheSize, u32 odd, GXTexCacheSize) {
+     TexRegionInt* r = reinterpret_cast<TexRegionInt*>(region);
+@@ -1383,8 +1558,15 @@
+     r->tmemAddr = uint32_t(addr);
+     r->size = uint32_t(size);
+ }
+-void GXInvalidateTexRegion(GXTexRegion*) { textureInvalidateAll(); }
++void GXInvalidateTexRegion(GXTexRegion*) {
++    if (gxt::on()) return gxt::call([] { textureInvalidateAll(); });
++    textureInvalidateAll();
++}
+ void GXInvalidateTexAll(void) {
++    if (gxt::on()) return gxt::call([] {
++            flushBatch();
++            textureInvalidateAll();
++        });
+     flushBatch();
+     textureInvalidateAll();
+ }
+@@ -1401,7 +1583,8 @@
+ void GXPreLoadEntireTexture(GXTexObj*, GXTexRegion*) {}
+ void GXSetTexCoordScaleManually(GXTexCoordID coord, u8 enable, u16 ss, u16 ts) {
+     if (coord >= 8) return;
+-    g.tcManual[coord] = enable != 0;
++    GS.tcManual[coord] = enable != 0;
++    mirror(&GS.tcManual[coord], sizeof GS.tcManual[coord]);
+     if (enable) {
+         bpField(BP_SU_SSIZE + 2 * coord, 16, 0, ss - 1u);
+         bpField(BP_SU_SSIZE + 2 * coord + 1, 16, 0, ts - 1u);
+@@ -1492,11 +1675,22 @@
+ // top/bottom pixels in and colour pixels in all report the pixels that
+ // passed (plus 4 per triangle, see gx_render.cpp); the rest read zero.
+ void GXReadPixMetric(u32* topIn, u32* topOut, u32* botIn, u32* botOut, u32* clrIn, u32* copyClks) {
+-    u32 n = pixMetricRead();
++    u32 n;
++    if (!gxt::on()) n = pixMetricRead();
++    else if (!gxt::inDrawSyncCallback(&n)) {  // read where the worker reached the token; elsewhere, after it
++        gxt::sync("metric");
++        n = pixMetricRead();
++    }
+     *topIn = *botIn = *clrIn = n;
+     *topOut = *botOut = *copyClks = 0;
+ }
+-void GXClearPixMetric(void) { pixMetricClear(); }
++void GXClearPixMetric(void) {
++    if (gxt::on()) return gxt::call([] {
++            gxt::g_metricArmed = true;
++            pixMetricClear();
++        });
++    pixMetricClear();
++}
+ void GXSetVCacheMetric(GXVCachePerf) {}
+ void GXReadVCacheMetric(u32* a, u32* b, u32* c) { *a = *b = *c = 0; }
+ void GXClearVCacheMetric(void) {}
+@@ -1507,8 +1701,8 @@
+ 
+ // ================================================================== GXDraw (SDK helper shapes)
+ static void drawWithPosNrm(void (*body)()) {
+-    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi;
+-    uint32_t A = g.cpVatA[GX_VTXFMT3], B = g.cpVatB[GX_VTXFMT3], C = g.cpVatC[GX_VTXFMT3];
++    uint32_t lo = GS.cpVcdLo, hi = GS.cpVcdHi;
++    uint32_t A = GS.cpVatA[GX_VTXFMT3], B = GS.cpVatB[GX_VTXFMT3], C = GS.cpVatC[GX_VTXFMT3];
+     GXClearVtxDesc();
+     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+     GXSetVtxDesc(GX_VA_NRM, GX_DIRECT);
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -1,5 +1,8 @@
+ // Register file, command-stream parser and vertex loader.
+ #include "gx_internal.h"
++#include "gx_thread.h"
++
++#include <vector>
+ #include <time.h>
+ #ifdef __APPLE__
+ #include <mach/mach_time.h>
+@@ -24,7 +27,14 @@
+ 
+ // ------------------------------------------------------------------ utilities
+ double monoSeconds() {
+-#ifdef __APPLE__
++#if defined(__SWITCH__) && defined(__aarch64__)
++    // the counter itself (19.2 MHz): clock_gettime went through newlib and
++    // libnx's tick conversion, about 1% of the game thread with a timer
++    // around every batch
++    uint64_t t;
++    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
++    return double(t) * (1.0 / 19200000.0);
++#elif defined(__APPLE__)
+     static double tick = 0;
+     if (tick == 0) {
+         mach_timebase_info_data_t tb;
+@@ -239,7 +249,16 @@
+         g.drawSyncToken = uint16_t(data & 0xFFFF);
+         if (reg == BP_PE_TOKEN_INT && drawSyncCallback) {
+             flushBatch();
+-            drawSyncCallback(g.drawSyncToken);
++            if (gxt::onWorker()) {  // the game's side runs it
++                static uint32_t metric = 0;
++                if (gxt::g_metricArmed) {
++                    gxt::g_metricArmed = false;
++                    metric = pixMetricRead();
++                }
++                peekAtToken(g.drawSyncToken);  // what its callback will peek at, as it is here
++                gxt::drawSyncReached(g.drawSyncToken, metric);
++            }
++            else drawSyncCallback(g.drawSyncToken);
+         }
+         return;
+     case BP_DRAWDONE:
+@@ -404,6 +423,36 @@
+     L.size = s;
+ }
+ 
++// The vertex size buildLayout finds, from given registers (the front scan).
++static uint32_t vertexSizeOf(uint32_t lo, uint32_t hi, uint32_t A, uint32_t B, uint32_t C) {
++    const uint32_t texA[8][2] = {{hi & 3, (A >> 21) & 1}, {(hi >> 2) & 3, B & 1}, {(hi >> 4) & 3, (B >> 9) & 1},
++                                 {(hi >> 6) & 3, (B >> 18) & 1}, {(hi >> 8) & 3, (B >> 27) & 1},
++                                 {(hi >> 10) & 3, (C >> 5) & 1}, {(hi >> 12) & 3, (C >> 14) & 1},
++                                 {(hi >> 14) & 3, (C >> 23) & 1}};
++    const uint32_t texT[8] = {(A >> 22) & 7, (B >> 1) & 7, (B >> 10) & 7, (B >> 19) & 7,
++                              (B >> 28) & 7, (C >> 6) & 7, (C >> 15) & 7, (C >> 24) & 7};
++    auto idxSize = [](uint32_t mode) -> uint32_t { return mode == 2 ? 1 : mode == 3 ? 2 : 0; };
++    auto comp = [](uint32_t type) -> uint32_t { return type < 5 ? kCompSize[type] : 4; };
++    uint32_t s = lo & 1;
++    for (int i = 0; i < 8; i++) s += (lo >> (1 + i)) & 1;
++    const uint32_t posMode = (lo >> 9) & 3, nrmMode = (lo >> 11) & 3;
++    const bool nbt = ((A >> 9) & 1) == 1, nbt3 = nbt && (A >> 31) != 0;
++    if (posMode == 1) s += comp((A >> 1) & 7) * ((A & 1) ? 3 : 2);
++    else s += idxSize(posMode);
++    if (nrmMode == 1) s += comp((A >> 10) & 7) * (nbt ? 9 : 3);
++    else s += idxSize(nrmMode) * (nbt3 ? 3 : 1);
++    const uint32_t clrMode[2] = {(lo >> 13) & 3, (lo >> 15) & 3}, clrType[2] = {(A >> 14) & 7, (A >> 18) & 7};
++    for (int c = 0; c < 2; c++) {
++        if (clrMode[c] == 1) s += clrType[c] < 6 ? kColorSize[clrType[c]] : 4;
++        else s += idxSize(clrMode[c]);
++    }
++    for (int t = 0; t < 8; t++) {
++        if (texA[t][0] == 1) s += comp(texT[t]) * (texA[t][1] ? 2 : 1);
++        else s += idxSize(texA[t][0]);
++    }
++    return s;
++}
++
+ // buildLayout for the current registers, rebuilt only when they change
+ static const VtxLayout& layoutFor(int vat) {
+     struct Cached {
+@@ -892,6 +941,139 @@
+ 
+ // Executes complete commands from [p, p+n).  Returns bytes consumed; if the
+ // tail holds an incomplete command, *need receives its total length.
++// ------------------------------------------------------------------ the API's copy (gx_thread.h)
++// Register writes as they land in a State, without anything they set off:
++// the API's copy of the registers follows the stream the worker will parse.
++void applyBP(State& st, uint32_t value) {
++    uint32_t reg = value >> 24, data = value & 0xFFFFFF;
++    if (reg == BP_MASK) {
++        st.bpMask = data;
++        return;
++    }
++    if (st.bpMask != 0xFFFFFF) {
++        data = (st.bp[reg] & ~st.bpMask) | (data & st.bpMask);
++        st.bpMask = 0xFFFFFF;
++    }
++    if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) st.kreg[reg & 7] = data;
++    else st.bp[reg] = data;
++}
++void applyCP(State& st, uint8_t reg, uint32_t v) {
++    switch (reg & 0xF0) {
++    case CP_MATIDX_A: st.cpMatA = v; break;
++    case CP_MATIDX_B: st.cpMatB = v; break;
++    case CP_VCD_LO: st.cpVcdLo = v; break;
++    case CP_VCD_HI: st.cpVcdHi = v; break;
++    case CP_VAT_A: st.cpVatA[reg & 7] = v; break;
++    case CP_VAT_B: st.cpVatB[reg & 7] = v; break;
++    case CP_VAT_C: st.cpVatC[reg & 7] = v; break;
++    default: break;
++    }
++}
++void applyXF(State& st, uint16_t addr, uint32_t n, const uint32_t* w) {
++    for (uint32_t i = 0; i < n; i++, addr++) {
++        if (addr < XF_MEM_WORDS) st.xfMem[addr] = w[i];
++        else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) st.xfReg[addr - XF_REG_BASE] = w[i];
++    }
++}
++
++// vertexSizeOf for a format of st, recomputed only when its registers change
++static uint32_t frontVertexSize(const State& st, int vat) {
++    struct Cached {
++        uint32_t lo, hi, A, B, C, size;
++        bool valid;
++    };
++    static Cached c[8];
++    Cached& e = c[vat];
++    if (!e.valid || e.lo != st.cpVcdLo || e.hi != st.cpVcdHi || e.A != st.cpVatA[vat] || e.B != st.cpVatB[vat] ||
++        e.C != st.cpVatC[vat]) {
++        e = {st.cpVcdLo, st.cpVcdHi, st.cpVatA[vat], st.cpVatB[vat], st.cpVatC[vat],
++             vertexSizeOf(st.cpVcdLo, st.cpVcdHi, st.cpVatA[vat], st.cpVatB[vat], st.cpVatC[vat]), true};
++    }
++    return e.size;
++}
++
++// A register write a scan applied, for replaying a display list's.
++struct FrontOp {
++    uint8_t kind;  // 0 CP, 1 BP, 2 XF
++    uint8_t reg;
++    uint16_t addr;
++    uint32_t v;
++};
++struct FrontRecord {
++    std::vector<FrontOp>* ops;
++    bool nested, draws;
++};
++
++static uint32_t frontScanRec(State& st, const uint8_t* p, uint32_t n, uint32_t* need, int depth, FrontRecord* rec);
++
++// The commands in [p, p + n) applied to st (display lists followed, vertices
++// skipped); returns the bytes of whole commands, *need the length of an
++// incomplete last one.
++uint32_t frontScan(State& st, const uint8_t* p, uint32_t n, uint32_t* need, int depth) {
++    return frontScanRec(st, p, n, need, depth, nullptr);
++}
++
++static uint32_t frontScanRec(State& st, const uint8_t* p, uint32_t n, uint32_t* need, int depth, FrontRecord* rec) {
++    const uint8_t* start = p;
++    const uint8_t* end = p + n;
++    uint32_t len = 1;
++    while (p < end) {
++        const uint8_t op = p[0];
++        const uint32_t avail = uint32_t(end - p);
++        if (op == 0x00 || op == 0x48 || op == 0x44) {
++            p++;
++            continue;
++        }
++        if (op == 0x08) {
++            len = 6;
++            if (avail < len) break;
++            applyCP(st, p[1], be32(p + 2));
++            if (rec) rec->ops->push_back({0, p[1], 0, be32(p + 2)});
++        } else if (op == 0x10) {
++            if (avail < 5) { len = 5; break; }
++            const uint32_t hdr = be32(p + 1), cnt = (hdr >> 16) + 1;
++            len = 5 + cnt * 4;
++            if (avail < len) break;
++            for (uint32_t i = 0; i < cnt; i++) {
++                const uint32_t w = be32(p + 5 + i * 4);
++                applyXF(st, uint16_t((hdr & 0xFFFF) + i), 1, &w);
++                if (rec) rec->ops->push_back({2, 0, uint16_t((hdr & 0xFFFF) + i), w});
++            }
++        } else if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) {
++            len = 5;  // matrices from arrays: the API never reads them back
++            if (avail < len) break;
++        } else if (op == 0x40) {
++            len = 9;
++            if (avail < len) break;
++            const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(be32(p + 1)));
++            if (rec) rec->nested = true;
++            if (dl && depth < 4) frontScanRec(st, dl, be32(p + 5), nullptr, depth + 1, nullptr);
++        } else if (op == 0x61) {
++            len = 5;
++            if (avail < len) break;
++            applyBP(st, be32(p + 1));
++            if (rec) rec->ops->push_back({1, 0, 0, be32(p + 1)});
++        } else if (op >= 0x80 && op < 0xC0) {
++            if (avail < 3) { len = 3; break; }
++            len = 3 + be16(p + 1) * frontVertexSize(st, op & 7);
++            if (avail < len) break;
++            if (rec) rec->draws = true;
++        } else if (op == 0xF1) {
++            if (avail < 16) { len = 16; break; }
++            uint32_t m;
++            memcpy(&m, p + 4, 4);
++            len = 16 + m;
++            if (avail < len) break;
++        } else {
++            p++;  // as the worker's parser skips it
++            continue;
++        }
++        p += len;
++    }
++    if (need) *need = p < end ? len : 0;
++    return uint32_t(p - start);
++}
++
+ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
+     const uint8_t* start = p;
+     const uint8_t* end = p + n;
+@@ -940,6 +1122,15 @@
+             len = 5;
+             if (avail < len) break;
+             writeBP(be32(p + 1));
++        } else if (op == 0xF1) {  // the graphics worker's private command (gx_thread.h)
++            if (avail < 16) { len = 16; break; }
++            uint32_t n;
++            memcpy(&n, p + 4, 4);
++            len = 16 + n;
++            if (avail < len) break;
++            gxt::HostFn fn;
++            memcpy(&fn, p + 8, sizeof fn);
++            fn(p + 16, n);
+         } else if (op >= 0x80 && op < 0xC0) {
+             if (avail < 3) { len = 3; break; }
+             const VtxLayout& L = layoutFor(op & 7);
+@@ -973,7 +1164,11 @@
+         else if (op >= 0x20 && op <= 0x38) len = 5;
+         else if (op == 0x40) len = 9;
+         else if (op == 0x61) len = 5;
+-        else if (op >= 0x80 && op < 0xC0) {
++        else if (op == 0xF1) {
++            uint32_t n = 0;
++            if (avail >= 8) memcpy(&n, p + 4, 4);
++            len = avail < 16 ? 16 : 16 + n;
++        } else if (op >= 0x80 && op < 0xC0) {
+             if (avail < 3) len = 3;
+             else {
+                 len = 3 + be16(p + 1) * layoutFor(op & 7).size;
+@@ -984,6 +1179,8 @@
+     return uint32_t(p - start);
+ }
+ 
++uint32_t parseStream(const uint8_t* p, uint32_t n, uint32_t* need) { return parse(p, n, need); }
++
+ void runCommands(const uint8_t* data, uint32_t size) {
+     uint32_t need = 0;
+     uint32_t used = parse(data, size, &need);
+@@ -1350,7 +1547,13 @@
+ #define s_pipeBuf GXPC_PipeBuf
+ #define s_pipeLen GXPC_PipeLen
+ namespace gx {
+-static void pipeFastUpdate() { GXPC_PipeFast = s_redirect ? 0 : std::min(s_pipeCap, s_pipeNeed - 1); }
++// With the graphics worker the pipe is only filled, and handed over in
++// pieces of up to kStreamPublish bytes (gx_thread.h); its parser is the worker's.
++enum : uint32_t { kStreamPublish = 32u << 10 };
++static void pipeFastUpdate() {
++    if (gxt::on()) GXPC_PipeFast = s_redirect ? 0 : std::min<uint32_t>(s_pipeCap, kStreamPublish);
++    else GXPC_PipeFast = s_redirect ? 0 : std::min(s_pipeCap, s_pipeNeed - 1);
++}
+ 
+ // Writes through a redirected pipe go to memory directly (uncached on the
+ // GameCube, so the game flushes nothing): stamp them when the redirect ends.
+@@ -1396,9 +1599,114 @@
+     if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
+     memcpy(s_pipeBuf + s_pipeLen, bytes, n);
+     s_pipeLen += n;
++    if (gxt::on()) {
++        if (s_pipeLen >= kStreamPublish) gxt::publish();
++        return;
++    }
+     if (s_pipeLen >= s_pipeNeed) pipeRun();
+ }
+ 
++// A display list's effect on the API's copy, kept by address: replayed while
++// its bytes are unwritten (the write stamps) and, if it draws, the vertex
++// formats it starts with are the same; a list that calls others is scanned
++// each time. J3D calls the same lists every frame, mostly draws.
++struct FrontMemo {
++    uint32_t size = 0, clock = 0;
++    uint32_t vcdLo, vcdHi, vatA[8], vatB[8], vatC[8];
++    bool valid = false, draws = false;
++    std::vector<FrontOp> ops;
++};
++static std::unordered_map<const uint8_t*, FrontMemo> s_frontMemo;
++
++void frontScanList(State& st, const uint8_t* dl, uint32_t n) {
++    FrontMemo& m = s_frontMemo[dl];
++    if (m.valid && m.size == n && trustWriteStamps() && unwrittenSince(dl, n, m.clock) &&
++        (!m.draws || (m.vcdLo == st.cpVcdLo && m.vcdHi == st.cpVcdHi && !memcmp(m.vatA, st.cpVatA, sizeof m.vatA) &&
++                      !memcmp(m.vatB, st.cpVatB, sizeof m.vatB) && !memcmp(m.vatC, st.cpVatC, sizeof m.vatC)))) {
++        for (const FrontOp& o : m.ops) {
++            if (o.kind == 0) applyCP(st, o.reg, o.v);
++            else if (o.kind == 1) applyBP(st, o.v);
++            else applyXF(st, o.addr, 1, &o.v);
++        }
++        return;
++    }
++    m.vcdLo = st.cpVcdLo;
++    m.vcdHi = st.cpVcdHi;
++    memcpy(m.vatA, st.cpVatA, sizeof m.vatA);
++    memcpy(m.vatB, st.cpVatB, sizeof m.vatB);
++    memcpy(m.vatC, st.cpVatC, sizeof m.vatC);
++    m.clock = writeClock();
++    m.size = n;
++    m.ops.clear();
++    FrontRecord rec{&m.ops, false, false};
++    frontScanRec(st, dl, n, nullptr, 0, &rec);
++    m.draws = rec.draws;
++    m.valid = !rec.nested;
++}
++
++// The API's copy follows the staged bytes (frontCatchUp): how far it has
++// read the pipe's buffer, and an incomplete command carried over a hand-off.
++static uint64_t s_pipePublished = 0;  // bytes handed to the worker so far
++uint64_t pipeWrittenTotal() { return s_pipePublished + s_pipeLen; }
++
++static State* s_frontState = nullptr;
++static uint32_t s_frontPos = 0;
++static std::vector<uint8_t> s_frontRest;
++
++void frontFollow(State* st) {
++    s_frontState = st;
++    s_frontPos = s_pipeLen;
++}
++
++void frontCatchUp() {
++    if (!s_frontState || s_frontPos >= s_pipeLen) return;
++    uint32_t need = 0;
++    if (s_frontRest.empty()) {
++        s_frontPos += frontScan(*s_frontState, s_pipeBuf + s_frontPos, s_pipeLen - s_frontPos, &need, 0);
++        return;
++    }
++    const size_t old = s_frontRest.size();
++    s_frontRest.insert(s_frontRest.end(), s_pipeBuf + s_frontPos, s_pipeBuf + s_pipeLen);
++    const uint32_t used = frontScan(*s_frontState, s_frontRest.data(), uint32_t(s_frontRest.size()), &need, 0);
++    if (used >= old) {
++        s_frontPos += uint32_t(used - old);
++        s_frontRest.clear();
++    } else {  // still inside the carried command: the new bytes are read again later
++        s_frontRest.erase(s_frontRest.begin(), s_frontRest.begin() + used);
++        s_frontRest.resize(old - used);
++    }
++}
++
++void pipeWriteStream(const uint8_t* bytes, uint32_t n) {
++    if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
++    memcpy(s_pipeBuf + s_pipeLen, bytes, n);
++    s_pipeLen += n;
++    if (s_pipeLen >= kStreamPublish) gxt::publish();
++}
++
++void pipeTakeForWorker(uint8_t** buf, uint32_t* len, uint32_t* cap) {
++    uint8_t* old = s_pipeBuf;
++    const uint32_t oldLen = s_pipeLen, oldCap = s_pipeCap;
++    if (!oldLen) {  // keep the one there
++        *len = 0;
++        return;
++    }
++    if (s_frontState) {  // the copy reads what is left before the bytes go
++        frontCatchUp();
++        if (s_frontPos < oldLen) s_frontRest.insert(s_frontRest.end(), old + s_frontPos, old + oldLen);
++        s_frontPos = 0;
++    }
++    s_pipePublished += oldLen;
++    s_pipeBuf = *buf;
++    s_pipeCap = *cap;
++    s_pipeLen = 0;
++    s_pipeNeed = 1;
++    pipeFastUpdate();
++    *buf = old;
++    *len = oldLen;
++    *cap = oldCap;
++}
++
+ void pipeWrite(const uint8_t* bytes, uint32_t n) { pipePut(bytes, n); }
+ 
+ }  // namespace gx
+@@ -1416,6 +1724,7 @@
+ void GXPC_MemoryWritten(const void* p, uint32_t size) { memoryWritten(p, size); }
+ 
+ void GXPC_AddBigEndianRange(const void* p, uint32_t size) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([p, size] { GXPC_AddBigEndianRange(p, size); });  // in stream order, on the worker
+     if (!p || !size) return;
+     uintptr_t a = reinterpret_cast<uintptr_t>(p);
+     s_beRanges[a] = a + size;
+@@ -1424,6 +1733,7 @@
+     s_beHitHi = 0;
+ }
+ void GXPC_RemoveBigEndianRange(const void* p) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([p] { GXPC_RemoveBigEndianRange(p); });  // in stream order, on the worker
+     s_beRanges.erase(reinterpret_cast<uintptr_t>(p));
+     s_beGen++;
+     s_beHitLo = 1;
+@@ -1433,6 +1743,7 @@
+ void* GXPC_PhysToPtr(uint32_t phys) { return physToPtr(phys); }
+ 
+ void GXPC_SetArrayBigEndian(int attr, int bigEndian) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([attr, bigEndian] { GXPC_SetArrayBigEndian(attr, bigEndian); });  // in stream order, on the worker
+     int slot;
+     if (attr == 25) slot = 1;           // GX_VA_NBT shares the normal array
+     else if (attr >= 9 && attr <= 24) slot = attr - 9;
+@@ -1441,6 +1752,7 @@
+     g_arrayGen++;
+ }
+ void GXPC_SetDefaultArrayBigEndian(int bigEndian) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([bigEndian] { GXPC_SetDefaultArrayBigEndian(bigEndian); });  // in stream order, on the worker
+     s_defaultArrayBE = bigEndian != 0;
+     for (int i = 0; i < 16; i++) g.arrayBigEndian[i] = s_defaultArrayBE;
+     g_arrayGen++;
+--- a/platform/gx/src/gx_hires.cpp
++++ b/platform/gx/src/gx_hires.cpp
+@@ -1403,6 +1403,23 @@
+ // request/look up replacements; uploads happen at frame boundaries/loading.
+ // SMS_TEXTURE_PACK_SYNC=1 decodes on the spot (repeatable captures).
+ GLuint hiresTexture(const std::string& name, int unit, uint32_t gxW, uint32_t gxH, int* scale) {
++    // A texture bound again in the frame it was found in (most are, by every
++    // batch that draws with it) takes what was found: looking the name up
++    // hashed it each time, half of what the pack cost the game's thread.
++    // Keyed by the cache entry's name, which stays where it is; replacements
++    // are only freed between frames (hiresEndFrame, hiresSetActive).
++    struct Seen {
++        uint32_t frame;
++        GLuint tex;
++        int scale;
++        std::string name;
++    };
++    static std::unordered_map<const std::string*, Seen> s_seen;
++    auto seen = s_seen.find(&name);
++    if (seen != s_seen.end() && seen->second.frame == s_frame && seen->second.name == name) {
++        *scale = seen->second.scale;
++        return seen->second.tex;
++    }
+     auto it = s_repl.find(name);
+     if (it == s_repl.end()) {
+         s_repl[name];
+@@ -1423,6 +1440,11 @@
+     if (it->second.state != Replacement::READY) return 0;
+     it->second.used = s_frame;
+     *scale = it->second.scale;
++    Seen& sn = s_seen[&name];
++    sn.frame = s_frame;
++    sn.tex = it->second.tex;
++    sn.scale = it->second.scale;
++    sn.name = name;
+     return it->second.tex;
+ }
+ 
+--- a/platform/gx/src/gx_render.cpp
++++ b/platform/gx/src/gx_render.cpp
+@@ -2,6 +2,7 @@
+ // derived from the BP/XF registers, EFB copies (display and texture) and XFB
+ // presentation.
+ #include "gx_internal.h"
++#include "gx_thread.h"
+ #include "gl_funcs.h"
+ #include "gx_glcache.h"
+ #include "gx_glthread.h"
+@@ -16,6 +17,9 @@
+ #include <time.h>
+ #include <string.h>
+ #include <atomic>
++#include <deque>
++#include <functional>
++#include <mutex>
+ #include <unordered_map>
+ 
+ namespace gx {
+@@ -143,6 +147,73 @@
+ // never touches data a queued draw still reads. Replaces a glBufferData
+ // reallocation (or a glBufferSubData into a buffer every queued draw uses) per
+ // batch, and a map per piece (map/unmap were half of all GL calls).
++static uint32_t frameNumber();  // s_frameNo, from before it is declared
++
++// The newest frame the GPU has finished, as the GL thread finds it: a fence at
++// the end of each shown frame (frameShownFence), polled there without
++// waiting. ~0u until the first one passes.
++static std::atomic<uint32_t> s_gpuDoneFrame{~0u};
++
++// Read-backs on the GL thread (metrics, write-backs, peeks) wait for the GPU
++// only when asked to: one whose result has not come in is kept here and tried
++// again without waiting as each frame ends, so the GL thread goes on with the
++// next frame's commands meanwhile (at 2x it waited for the GPU to finish each
++// frame, most of its time, and the GPU then for its commands). Whoever needs
++// a result first has the GL thread finish them, waiting (waitFetched).
++static std::vector<std::function<bool(bool)>> s_glPending;  // GL thread only
++static void glPendingRun(bool block) {
++    size_t keep = 0;
++    for (size_t i = 0; i < s_glPending.size(); i++) {
++        if (s_glPending[i](block)) continue;
++        if (keep != i) s_glPending[keep] = std::move(s_glPending[i]);
++        keep++;
++    }
++    s_glPending.resize(keep);
++}
++static void glPendingAdd(std::function<bool(bool)> fn) {
++    if (!fn(false)) s_glPending.push_back(std::move(fn));
++}
++static void waitFetched(std::atomic<int>& flag) {
++    if (flag.load(std::memory_order_acquire)) return;
++    glt::post([] { glPendingRun(true); });
++    glt::waitFlag(flag);
++}
++static bool gpuFinishedFrame(uint32_t frame) {
++    const uint32_t done = s_gpuDoneFrame.load(std::memory_order_acquire);
++    return glt::active() && done != ~0u && int32_t(done - frame) >= 0;
++}
++// With the graphics worker: the GL thread marks each frame's end as it gets
++// there, and the worker keeps it at most a frame behind (glFrameThrottle).
++// Presenting does not wait for the swap, so without this the worker ran
++// frames ahead of the GL thread, and a read-back it needed then waited for
++// that whole backlog and the GPU.
++static std::atomic<int> s_glFrameReached[4];
++static void glFrameThrottle(uint32_t frame) {
++    if (!gxt::onWorker()) return;
++    s_glFrameReached[frame & 3].store(0);
++    std::atomic<int>* f = &s_glFrameReached[frame & 3];
++    glt::post([f] { glt::signalFlag(*f); });
++    if (frame == 0) return;
++    GxTimer tw(&s_waitSeconds);
++    glt::waitFlag(s_glFrameReached[(frame - 1) & 3]);
++}
++
++static void frameShownFence(uint32_t frame) {
++    glFrameThrottle(frame);
++    glt::post([frame] {  // on the GL thread
++        glPendingRun(false);
++        static std::deque<std::pair<uint32_t, GLsync>> pending;
++        pending.emplace_back(frame, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
++        while (!pending.empty()) {
++            const GLenum r = glClientWaitSync(pending.front().second, 0, 0);
++            if (r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED) break;
++            s_gpuDoneFrame.store(pending.front().first, std::memory_order_release);
++            glDeleteSync(pending.front().second);
++            pending.pop_front();
++        }
++    });
++}
++
+ struct StreamPiece {
+     const void* data;
+     size_t bytes, align;
+@@ -153,6 +224,7 @@
+     GLuint buf = 0;
+     size_t size = 0, pos = 0;
+     GLsync fence[kSegments] = {};
++    uint32_t fenceFrame[kSegments] = {};  // s_frameNo when each was made
+ 
+     // With ARB_buffer_storage (GL 4.4; not macOS) the buffer stays mapped:
+     // writes go straight into it, without a map/unmap pair per batch.
+@@ -201,10 +273,21 @@
+     // segments from `unfenced` through `last`.
+     void fenceThrough(size_t last) {
+         for (size_t sg = unfenced; sg <= last && sg < kSegments; sg++)
+-            if (!fence[sg]) fence[sg] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++            if (!fence[sg]) {
++                fence[sg] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++                fenceFrame[sg] = frameNumber();
++            }
+     }
+     void waitSegment(size_t seg) {
+         if (!fence[seg]) return;
++        // A lap of the ring is many frames: its fence has long passed, and
++        // asking (glClientWaitSync through the GL thread) only waited for that
++        // thread to catch up, several ms at 2x each time.
++        if (gpuFinishedFrame(fenceFrame[seg])) {
++            glDeleteSync(fence[seg]);
++            fence[seg] = 0;
++            return;
++        }
+         GxTimer tw(&s_waitSeconds);
+         glClientWaitSync(fence[seg], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+         glDeleteSync(fence[seg]);
+@@ -1781,6 +1864,7 @@
+ // from the same read one frame earlier instead (as Dolphin does), which the
+ // game cannot tell apart; SMS_GX_SYNC_READS=1 goes back to synchronous reads.
+ static uint32_t s_frameNo = 0;   // display copies so far
++static uint32_t frameNumber() { return s_frameNo; }
+ uint32_t g_displayFrames = 0;    // the same, for the rest of sms_gx
+ static uint32_t s_drawGen = 0;   // bumped by anything that changes the EFB
+ static bool asyncReads() {
+@@ -1798,26 +1882,33 @@
+ // so the count is the samples that passed plus 4 per triangle. Copy passes
+ // in between are left out: they end the running query, which is summed at
+ // the read. Each clear/read pair of a frame is a slot; a slot that drew the
+-// same number of triangles one frame earlier, in one query, is answered from
+-// that frame's query, otherwise the queries are waited for.
+-enum { kMetricSlots = 32 };
+-static GLuint s_mq[2][kMetricSlots];
+-static uint32_t s_mqTris[2][kMetricSlots], s_mqFrame[2][kMetricSlots];
++// same number of triangles one or two frames earlier, in one query, is
++// answered from that frame's query (the newest one already read back),
++// otherwise the queries are waited for.
++// Up to 5 frames old: presenting waits for a free swapchain image in the
++// GPU's queue, so at 60 fps the GPU runs that far behind; the newest result
++// that has come back is still taken, waiting only for the oldest.
++enum { kMetricSlots = 32, kMetricFrames = 6 };
++static GLuint s_mq[kMetricFrames][kMetricSlots];
++static uint32_t s_mqTris[kMetricFrames][kMetricSlots], s_mqFrame[kMetricFrames][kMetricSlots];
+ // With the GL thread, the results of a frame's queries are read once it is
+-// shown (prefetchMetrics), so the next frame's reads do not wait for them.
+-static uint32_t s_mqResult[2][kMetricSlots];
+-static std::atomic<int> s_mqReady[2][kMetricSlots];
+-static bool s_mqFetching[2][kMetricSlots];
++// shown (prefetchMetrics), so later frames' reads do not wait for them: the
++// one before a read is often not finished on the GPU yet, the one before
++// that is, so a read takes the newest that has come back.
++static uint32_t s_mqResult[kMetricFrames][kMetricSlots];
++static std::atomic<int> s_mqReady[kMetricFrames][kMetricSlots];
++static bool s_mqFetching[kMetricFrames][kMetricSlots], s_mqHave[kMetricFrames][kMetricSlots];
+ 
+ static uint32_t takeFetchedMetric(int par, int slot) {
+     {
+         GxTimer tw(&s_waitSeconds);
+-        glt::waitFlag(s_mqReady[par][slot]);
++        waitFetched(s_mqReady[par][slot]);
+     }
+     s_mqFetching[par][slot] = false;
++    s_mqHave[par][slot] = true;
+     return s_mqResult[par][slot];
+ }
+-static bool s_mqUsed[2][kMetricSlots];
++static bool s_mqUsed[kMetricFrames][kMetricSlots];
+ static int s_mqSlot = -1;
+ static uint32_t s_mqSlotFrame = ~0u;
+ static bool s_pixActive = false, s_pixTaint = false;
+@@ -1863,9 +1954,10 @@
+         s_mqSlot = -1;
+     }
+     s_mqSlot++;
+-    int cur = s_frameNo & 1;
++    int cur = int(s_frameNo % kMetricFrames);
+     if (s_mqSlot < kMetricSlots) {
+         if (s_mqFetching[cur][s_mqSlot]) takeFetchedMetric(cur, s_mqSlot);  // its last result was never asked for
++        s_mqHave[cur][s_mqSlot] = false;
+         if (!s_mq[cur][s_mqSlot]) glGenQueries(1, &s_mq[cur][s_mqSlot]);
+         s_pixCur = s_mq[cur][s_mqSlot];
+         s_pixCurPooled = false;
+@@ -1885,15 +1977,22 @@
+     if (!s_ready || !s_pixActive) return 0;
+     glEndQuery(GL_SAMPLES_PASSED);
+     uint64_t samples = 0;
+-    int cur = s_frameNo & 1, slot = s_mqSlot;
++    int cur = int(s_frameNo % kMetricFrames), slot = s_mqSlot;
+     bool fromPrev = false;
+     if (!s_pixTaint) {
+         s_mqUsed[cur][slot] = true;
+         s_mqTris[cur][slot] = s_pixTris;
+         s_mqFrame[cur][slot] = s_frameNo;
+-        int prev = cur ^ 1;
+-        if (s_mqUsed[prev][slot] && s_mqFrame[prev][slot] + 1 == s_frameNo && s_mqTris[prev][slot] == s_pixTris) {
+-            samples = s_mqFetching[prev][slot] ? takeFetchedMetric(prev, slot) : queryResult(s_mq[prev][slot]);
++        // an earlier frame's count of the same slot and triangles: the newest
++        // that has come back, waiting only for the older one
++        for (uint32_t age = 1; age < kMetricFrames && !fromPrev; age++) {
++            const int p = int((s_frameNo + kMetricFrames - age) % kMetricFrames);
++            if (!s_mqUsed[p][slot] || s_mqFrame[p][slot] + age != s_frameNo || s_mqTris[p][slot] != s_pixTris) continue;
++            const bool last = age + 1 == kMetricFrames;
++            if (s_mqHave[p][slot]) samples = s_mqResult[p][slot];
++            else if (s_mqFetching[p][slot] && (last || s_mqReady[p][slot].load())) samples = takeFetchedMetric(p, slot);
++            else if (!s_mqFetching[p][slot] && last) samples = queryResult(s_mq[p][slot]);
++            else continue;
+             fromPrev = true;
+         }
+     }
+@@ -1917,19 +2016,27 @@
+ 
+ static void prefetchMetrics() {
+     const uint32_t frame = s_frameNo - 1;
+-    const int par = int(frame & 1);
++    const int par = int(frame % kMetricFrames);
+     for (int slot = 0; slot < kMetricSlots; slot++) {
+-        if (!s_mqUsed[par][slot] || s_mqFrame[par][slot] != frame || s_mqFetching[par][slot]) continue;
++        if (!s_mqUsed[par][slot] || s_mqFrame[par][slot] != frame || s_mqFetching[par][slot] || s_mqHave[par][slot])
++            continue;
+         s_mqFetching[par][slot] = true;
+         s_mqReady[par][slot].store(0);
+         const GLuint q = s_mq[par][slot];
+         uint32_t* out = &s_mqResult[par][slot];
+         std::atomic<int>* ready = &s_mqReady[par][slot];
+         glt::post([=] {
+-            GLuint n = 0;
+-            glGetQueryObjectuiv(q, GL_QUERY_RESULT, &n);
+-            *out = n;
+-            glt::signalFlag(*ready);
++            glPendingAdd([=](bool block) {
++                GLuint n = 0;
++                if (!block) {
++                    glGetQueryObjectuiv(q, GL_QUERY_RESULT_AVAILABLE, &n);
++                    if (!n) return false;
++                }
++                glGetQueryObjectuiv(q, GL_QUERY_RESULT, &n);
++                *out = n;
++                glt::signalFlag(*ready);
++                return true;
++            });
+         });
+     }
+ }
+@@ -2083,22 +2190,24 @@
+             glVertexAttribI4ui(14, m[0], m[1], m[2], 0);
+         }
+     }
+-    // this batch's XF block (when it changed), vertices and indices, in one map
+-    static uint32_t xfBlock[736];
++    // this batch's XF block (when it changed), vertices and indices, in one
++    // map; the block's four parts go straight from XF memory, one after
++    // another (2.9 KiB, for most batches: copying it twice was the most of
++    // the game thread's memcpy)
++    const size_t kXfBlockBytes = 736 * 4;
+     static size_t s_xfOffset = 0;
+-    StreamPiece pc[3];
++    StreamPiece pc[6];
+     int np = 0;
+-    size_t worst = sizeof(xfBlock) + size_t(s_uboAlign) + s_bdata.size + s_bstride + s_bidx.size * 4 + 4;
++    size_t worst = kXfBlockBytes + size_t(s_uboAlign) + s_bdata.size + s_bstride + s_bidx.size * 4 + 4;
+     // Starting a new lap of the stream overwrites older data, possibly the
+     // block still bound: write it again with this batch.
+     if (s_stream.wouldWrap(worst)) s_xfDirty = true;
+     bool xfWritten = s_xfDirty;
+     if (s_xfDirty) {
+-        memcpy(xfBlock, &g.xfMem[0], 256 * 4);
+-        memcpy(xfBlock + 256, &g.xfMem[0x400], 96 * 4);
+-        memcpy(xfBlock + 352, &g.xfMem[0x500], 256 * 4);
+-        memcpy(xfBlock + 608, &g.xfMem[0x600], 128 * 4);
+-        pc[np++] = {xfBlock, sizeof(xfBlock), size_t(s_uboAlign), 0};
++        pc[np++] = {&g.xfMem[0], 256 * 4, size_t(s_uboAlign), 0};
++        pc[np++] = {&g.xfMem[0x400], 96 * 4, 1, 0};
++        pc[np++] = {&g.xfMem[0x500], 256 * 4, 1, 0};
++        pc[np++] = {&g.xfMem[0x600], 128 * 4, 1, 0};
+         s_xfDirty = false;
+     }
+     const bool streamed = s_bidx.size != 0;
+@@ -2109,7 +2218,7 @@
+     if (np) s_stream.appendAll(pc, np);
+     if (xfWritten) s_xfOffset = pc[0].at;
+     if (xfWritten || g_glc.uniformBuffer == ~0u) {
+-        glBindBufferRange(GL_UNIFORM_BUFFER, 0, s_stream.buf, GLintptr(s_xfOffset), sizeof(xfBlock));
++        glBindBufferRange(GL_UNIFORM_BUFFER, 0, s_stream.buf, GLintptr(s_xfOffset), GLsizeiptr(kXfBlockBytes));
+         g_glc.uniformBuffer = s_stream.buf;  // the range bind also sets the generic binding
+     }
+     const size_t vOff = streamed ? pc[np - 2].at : 0, iOff = streamed ? pc[np - 1].at : 0;
+@@ -2372,33 +2481,77 @@
+ struct WbFetch {
+     std::atomic<int> ready{0};
+     bool ok = false;
++    uint64_t hash = 0;  // of bytes, made on the GL thread
+     std::vector<uint8_t> bytes;
+ };
+ struct PendingWriteBack {
+     const void* dest;
+     uint32_t bytes;
+-    uint64_t hash;
++    uint64_t hash;       // of the destination when the copy was issued
+     GLuint pbo;
+     GLsync fence;
+     uint32_t readBytes;  // the pixel buffer's size
+     uint32_t frame;
+     bool cancelled;
+     WbFetch* fetch;      // the GL thread's read of it, or null
++    uint32_t clock;      // writeClock() when the copy was issued
+ };
+ static std::vector<PendingWriteBack> s_writeBacks;
+ static std::vector<GLuint> s_freePbos;
+ 
++// The game's own bytes at a copy's destination must not be overwritten by a
++// write-back that comes later, so a write-back is stored only if the
++// destination still holds what it did when the copy was issued. Hashing it
++// at both ends cost the game's thread more than any other part of a copy
++// (the plaza writes back three, 330 KiB, every frame), so the write stamps
++// answer instead where they can: what the last write-back stored at a
++// destination (hashed on the GL thread as it came in) is still there while no
++// write is stamped on it since, and nothing changed it while no write is
++// stamped after the copy. Every kWbRecheckFrames-th frame hashes as before;
++// SMS_GX_HASH_ALWAYS=1 always does.
++struct StoredWriteBack {
++    uint64_t hash;
++    uint32_t clock;  // writeClock() after storing it
++    uint32_t bytes;
++};
++static std::unordered_map<const void*, StoredWriteBack> s_storedWriteBacks;
++enum : uint32_t { kWbRecheckFrames = 16 };
++
++static bool wbTrustStamps(uint32_t frame) { return trustWriteStamps() && frame % kWbRecheckFrames != 0; }
++
++static uint64_t writeBackDestHash(const void* dest, uint32_t bytes) {
++    auto it = s_storedWriteBacks.find(dest);
++    if (it != s_storedWriteBacks.end() && it->second.bytes == bytes && wbTrustStamps(s_frameNo) &&
++        unwrittenSince(dest, bytes, it->second.clock))
++        return it->second.hash;
++    return hashBytes(dest, bytes);
++}
++
++// An earlier copy to the same place that was still pending when this one was
++// issued has been stored since: what it stored counts as what was there.
++static bool writeBackDestUnchanged(const PendingWriteBack& w) {
++    auto it = s_storedWriteBacks.find(w.dest);
++    const bool after = it != s_storedWriteBacks.end() && it->second.bytes == w.bytes &&
++                       int32_t(it->second.clock - w.clock) > 0;
++    if (wbTrustStamps(w.frame) && unwrittenSince(w.dest, w.bytes, after ? it->second.clock : w.clock)) return true;
++    const uint64_t h = hashBytes(w.dest, w.bytes);
++    return h == w.hash || (after && h == it->second.hash);
++}
++
+ static void resolveWriteBack(PendingWriteBack& w) {
+     if (w.fetch) {
+         {
+             GxTimer tw(&s_waitSeconds);
+-            glt::waitFlag(w.fetch->ready);
++            waitFetched(w.fetch->ready);
+         }
+-        if (!w.cancelled && w.fetch->ok && hashBytes(w.dest, w.bytes) == w.hash)
++        if (!w.cancelled && w.fetch->ok && writeBackDestUnchanged(w)) {
+             storeEncoded(w.fetch->bytes.data(), w.dest, w.bytes);
++            s_storedWriteBacks[w.dest] = StoredWriteBack{w.fetch->hash, writeClock(), w.bytes};
++        }
+         delete w.fetch;
+         w.fetch = nullptr;
+-    } else if (!w.cancelled && hashBytes(w.dest, w.bytes) == w.hash) {
++    } else if (!w.cancelled && writeBackDestUnchanged(w)) {
++        s_storedWriteBacks.erase(w.dest);
+         const void* px;
+         {
+             GxTimer tw(&s_waitSeconds);
+@@ -2414,13 +2567,24 @@
+     s_freePbos.push_back(w.pbo);
+ }
+ 
+-// Stores the write-backs issued before this frame (all of them with `all`).
++// A write-back whose bytes the GL thread has read already: storing it waits
++// for nothing.
++static bool writeBackArrived(const PendingWriteBack& w) {
++    return w.fetch && w.fetch->ready.load(std::memory_order_acquire) != 0;
++}
++
++// Stores the write-backs issued before this frame that have come back, and
++// any older (all of them with `all`). The previous frame's are often not
++// finished on the GPU yet when this frame ends; waiting for them kept the
++// game from starting the next frame while the GPU caught up, so they are
++// stored a frame later unless they are in already.
+ static void resolveWriteBacks(bool all) {
+     size_t keep = 0;
+     for (size_t i = 0; i < s_writeBacks.size(); i++) {
+         PendingWriteBack& w = s_writeBacks[i];
+-        if (!all && !w.cancelled && w.frame >= s_frameNo) s_writeBacks[keep++] = w;
+-        else resolveWriteBack(w);
++        const bool due = all || w.cancelled || w.frame + 4 < s_frameNo || (w.frame < s_frameNo && writeBackArrived(w));
++        if (due) resolveWriteBack(w);
++        else s_writeBacks[keep++] = w;
+     }
+     s_writeBacks.resize(keep);
+ }
+@@ -2447,13 +2611,17 @@
+     }
+     // A copy to the same place supersedes one of this frame; one from an
+     // earlier frame (most games copy to the same buffer every frame) is
+-    // stored first, as the CPU may have read it in between.
++    // stored first, as the CPU may have read it in between: now if it has
++    // come back or is older than the previous frame, else it stays pending
++    // and is stored before this one (resolveWriteBacks keeps their order).
+     size_t keep = 0;
+     for (size_t i = 0; i < s_writeBacks.size(); i++) {
+         PendingWriteBack& w = s_writeBacks[i];
+         if (w.dest != dest) s_writeBacks[keep++] = w;
+-        else if (w.frame < s_frameNo) resolveWriteBack(w);
+-        else {
++        else if (w.frame < s_frameNo) {
++            if (w.frame + 4 < s_frameNo || writeBackArrived(w)) resolveWriteBack(w);
++            else s_writeBacks[keep++] = w;
++        } else {
+             w.cancelled = true;
+             resolveWriteBack(w);
+         }
+@@ -2470,8 +2638,8 @@
+     glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(readBytes), nullptr, GL_STREAM_READ);
+     glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+-    PendingWriteBack w{dest, bytes, hashBytes(dest, bytes), pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
+-                       readBytes, s_frameNo, false, nullptr};
++    PendingWriteBack w{dest,     bytes,     writeBackDestHash(dest, bytes), pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
++                       readBytes, s_frameNo, false, nullptr, writeClock()};
+     s_writeBacks.push_back(w);
+ }
+ 
+@@ -2491,16 +2659,22 @@
+         const GLuint pbo = w.pbo;
+         const uint32_t n = w.bytes;
+         glt::post([=] {
+-            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+-            GLint prev = 0;
+-            bindPack(pbo, &prev);
+-            if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
+-                memcpy(f->bytes.data(), px, n);
+-                f->ok = true;
+-                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+-            }
+-            bindPack(GLuint(prev), nullptr);
+-            glt::signalFlag(f->ready);
++            glPendingAdd([=](bool block) {
++                if (glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, block ? 1000000000ull : 0) == GL_TIMEOUT_EXPIRED &&
++                    !block)
++                    return false;
++                GLint prev = 0;
++                bindPack(pbo, &prev);
++                if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(n), GL_MAP_READ_BIT)) {
++                    memcpy(f->bytes.data(), px, n);
++                    f->hash = hashBytes(f->bytes.data(), n);
++                    f->ok = true;
++                    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++                }
++                bindPack(GLuint(prev), nullptr);
++                glt::signalFlag(f->ready);
++                return true;
++            });
+         });
+         w.fetch = f;
+     }
+@@ -2642,7 +2816,9 @@
+     copyEfb(ctrl);
+     // presenting (the hook) is timed apart from sms_gx: GXPC_GetTimes
+     if (disp && g_displayCopyHook) g_displayCopyHook(dest);
++    if (disp) gxt::frameDone();  // presented: the game may write the next but one
+     if (disp && glt::active()) {  // the frame is shown: the GL thread reads its results (see gx_glthread.h)
++        frameShownFence(s_frameNo - 1);
+         prefetchWriteBacks();
+         prefetchPeeks();
+         prefetchMetrics();
+@@ -2714,6 +2890,7 @@
+ }
+ 
+ void GXPC_PreloadTextures(void) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([] { GXPC_PreloadTextures(); });  // in stream order, on the worker
+     if (!s_ready) return;
+     flushBatch();
+     glcInvalidate();
+@@ -2721,6 +2898,7 @@
+ }
+ 
+ void GXPC_PrepareStage(int stage) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([stage] { GXPC_PrepareStage(stage); });  // in stream order, on the worker
+     if (!s_ready) return;
+     flushBatch();
+     glcInvalidate();
+@@ -2729,6 +2907,7 @@
+ }
+ 
+ void GXPC_Shutdown(void) {
++    gxt::sync();
+     if (!s_ready) return;
+     textureShutdown();
+     shaderShutdown();
+@@ -2750,6 +2929,11 @@
+ 
+ void GXPC_InvalidateRange(const void* p, uint32_t size) {
+     memoryWritten(p, size);
++    if (gxt::on() && !gxt::onWorker())  // the texture cache is the worker's: in stream order
++        return gxt::call([p, size] {
++            if (copyWriteBackEnabled()) textureCpuWrote(p, size);
++            else textureInvalidateRange(p, size);
++        });
+     if (copyWriteBackEnabled()) textureCpuWrote(p, size);
+     else textureInvalidateRange(p, size);
+ }
+@@ -2762,7 +2946,9 @@
+ // group; the first peek of a group starts an asynchronous read of the whole
+ // buffer, and the group is answered from the same group's read one frame
+ // earlier (synchronously the first time a group appears).
+-enum { kPeekGroups = 8 };
++// groups 0-7 as peeks come (peekRaw, or numbered by the game), 8-11 taken
++// where a draw sync token is reached (peekAtToken)
++enum { kPeekGroups = 12, kTokenGroupBase = 8 };
+ struct PeekSnap {
+     GLuint pbo = 0;
+     GLsync fence = 0;
+@@ -2773,7 +2959,13 @@
+     std::atomic<int> ready{0};
+     const uint8_t* fetched = nullptr;
+ };
+-static PeekSnap s_peek[2][kPeekGroups][2];  // [frame parity][group][colour, depth]
++// Peeks are answered from an earlier frame's snapshot: the newest that has
++// come back of the two frames before, waiting only for the older one. At 2x
++// the frame before is often still on the GPU when the game peeks (Mario's
++// visibility test, every frame), and waiting for it cost the game's thread
++// about 2 ms a frame.
++enum { kPeekFrames = 6 };
++static PeekSnap s_peek[kPeekFrames][kPeekGroups][2];  // [frame % kPeekFrames][group][colour, depth]
+ static uint32_t s_peekDrawGen = ~0u, s_peekFrame = ~0u, s_peekIssued = 0;
+ static int s_peekGroup = -1;
+ 
+@@ -2782,11 +2974,12 @@
+     if (!p.fetching) return;
+     {
+         GxTimer tw(&s_waitSeconds);
+-        glt::waitFlag(p.ready);
++        waitFetched(p.ready);
+     }
+     p.map = p.fetched;
+     p.fetching = false;
+ }
++static std::mutex s_peekMu;  // see peekIssue
+ 
+ // Maps the snapshots of the frame just shown on the GL thread, which waits
+ // for the GPU there instead of the game at its next peek.
+@@ -2795,20 +2988,30 @@
+     const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
+     for (int gi = 0; gi < kPeekGroups; gi++)
+         for (int t = 0; t < 2; t++) {
+-            PeekSnap& p = s_peek[frame & 1][gi][t];
++            PeekSnap& p = s_peek[frame % kPeekFrames][gi][t];
+             if (!p.pbo || p.frame != frame || p.map || p.fetching) continue;
+-            p.fetching = true;
+-            p.ready.store(0);
++            {
++                std::lock_guard<std::mutex> lk(s_peekMu);
++                p.fetching = true;
++                p.ready.store(0);
++            }
+             PeekSnap* ps = &p;
+             const GLsync fence = p.fence;
+             const GLuint pbo = p.pbo;
+             glt::post([=] {
+-                glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+-                GLint prev = 0;
+-                bindPack(pbo, &prev);
+-                ps->fetched = static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
+-                bindPack(GLuint(prev), nullptr);
+-                glt::signalFlag(ps->ready);
++                glPendingAdd([=](bool block) {
++                    if (glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, block ? 1000000000ull : 0) ==
++                            GL_TIMEOUT_EXPIRED &&
++                        !block)
++                        return false;
++                    GLint prev = 0;
++                    bindPack(pbo, &prev);
++                    ps->fetched =
++                        static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
++                    bindPack(GLuint(prev), nullptr);
++                    glt::signalFlag(ps->ready);
++                    return true;
++                });
+             });
+         }
+ }
+@@ -2874,9 +3077,9 @@
+         s_peekFrame = s_frameNo;
+         s_peekIssued = 0;
+     }
+-    if (s_peekGroup >= kPeekGroups) return peekSync(x, y, depth);
++    if (s_peekGroup >= kTokenGroupBase) return peekSync(x, y, depth);
+     const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
+-    int cur = s_frameNo & 1, t = depth ? 1 : 0;
++    int cur = int(s_frameNo % kPeekFrames), t = depth ? 1 : 0;
+     if (!(s_peekIssued & (1u << t))) {
+         s_peekIssued |= 1u << t;
+         PeekSnap& now = s_peek[cur][s_peekGroup][t];
+@@ -2898,8 +3101,19 @@
+         now.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+         now.frame = s_frameNo;
+     }
+-    PeekSnap& prev = s_peek[cur ^ 1][s_peekGroup][t];
+-    if (prev.pbo && prev.frame + 1 == s_frameNo) {
++    PeekSnap* earlier[kPeekFrames] = {};  // by age, those of the frames before
++    for (uint32_t age = 1; age < kPeekFrames; age++) {
++        PeekSnap& p = s_peek[(s_frameNo + kPeekFrames - age) % kPeekFrames][s_peekGroup][t];
++        if (p.pbo && p.frame + age == s_frameNo) earlier[age] = &p;
++    }
++    PeekSnap* use = nullptr;
++    for (uint32_t age = 1; age < kPeekFrames && !use; age++)  // the newest already in
++        if (earlier[age] && (earlier[age]->map || (earlier[age]->fetching && earlier[age]->ready.load())))
++            use = earlier[age];
++    for (uint32_t age = kPeekFrames - 1; age >= 1 && !use; age--)  // else the oldest there is, waited for
++        use = earlier[age];
++    if (use) {
++        PeekSnap& prev = *use;
+         takeFetchedPeek(prev);
+         if (!prev.map) {
+             GxTimer tw(&s_waitSeconds);
+@@ -2917,6 +3131,108 @@
+     return peekSync(x, y, depth);
+ }
+ 
++// Peeks with the graphics worker (gx_thread.h): the worker takes a group's
++// snapshot where the game peeked, in stream order (peekIssue), and the game
++// answers at once from the newest snapshot read back (peekThreaded), 1 to 3
++// frames old, instead of waiting for the worker to catch up (Mario's
++// visibility test peeks every frame). The game numbers the groups itself
++// (gx_api.cpp). The slots' fields change under s_peekMu where the game
++// reads them; a slot is marked gone before its mapping is released.
++
++void peekIssue(int group, bool depth) {
++    flushBatch();
++    glcInvalidate();
++    if (group < 0 || group >= kPeekGroups || !asyncReads()) return;
++    const int cur = int(s_frameNo % kPeekFrames), t = depth ? 1 : 0;
++    PeekSnap& now = s_peek[cur][group][t];
++    if (now.frame == s_frameNo && now.pbo) return;  // taken already this frame
++    const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
++    {
++        std::lock_guard<std::mutex> lk(s_peekMu);
++        takeFetchedPeek(now);
++        now.frame = ~0u;  // gone for the game's side before its mapping is
++        now.map = nullptr;
++        now.fetched = nullptr;
++        now.fetching = false;
++        now.ready.store(0);
++    }
++    if (!now.pbo) glGenBuffers(1, &now.pbo);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, now.pbo);
++    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++    if (now.fence) glDeleteSync(now.fence);
++    glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, peekSource(depth));
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    if (depth) glReadPixels(0, 0, s_efbW, EFB_H, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
++    else glReadPixels(0, 0, s_efbW, EFB_H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
++    now.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    std::lock_guard<std::mutex> lk(s_peekMu);
++    now.frame = s_frameNo;
++}
++
++// Peeks inside a draw sync callback (the sun's 17 depth probes at token 0x7D,
++// Mario's visibility test at 0x7C) see the picture where the token is in the
++// stream; with the worker they run later, so the worker takes their
++// snapshot as it reaches the token. Each kind has its peeker (the sun the
++// depth, Mario the colour) and its token: the one most often last when the
++// game peeks that kind (peekKindToken), which a peek made a little late
++// cannot move. A kind's snapshot is group kTokenGroupBase + kind.
++static std::atomic<uint32_t> s_kindToken[2];  // token + 1, 0 none yet
++
++int peekKindToken(uint16_t token, bool depth) {  // the game's side
++    struct Seen {
++        uint16_t token;
++        uint32_t n;
++    };
++    static Seen seen[2][8];
++    Seen* s = seen[depth ? 1 : 0];
++    int at = -1;
++    for (int i = 0; i < 8; i++)
++        if (s[i].n && s[i].token == token) at = i;
++    if (at < 0) {  // a new one takes the least seen place
++        at = 0;
++        for (int i = 1; i < 8; i++)
++            if (s[i].n < s[at].n) at = i;
++        s[at] = {token, 0};
++    }
++    s[at].n++;
++    int best = 0;
++    for (int i = 1; i < 8; i++)
++        if (s[i].n > s[best].n) best = i;
++    s_kindToken[depth ? 1 : 0].store(uint32_t(s[best].token) + 1);
++    return kTokenGroupBase + (depth ? 1 : 0);
++}
++
++void peekAtToken(uint16_t token) {  // the worker, at the token
++    if (s_kindToken[0].load() == uint32_t(token) + 1) peekIssue(kTokenGroupBase, false);
++    if (s_kindToken[1].load() == uint32_t(token) + 1) peekIssue(kTokenGroupBase + 1, true);
++}
++
++bool peekThreaded(int group, bool depth, int x, int y, uint32_t* out) {
++    if (s_efbW != EFB_W && x >= 0) x = int((float(x) + 0.5f) * s_wide);
++    if (group < 0 || group >= kPeekGroups || x < 0 || y < 0 || x >= s_efbW || y >= EFB_H) return false;
++    const int t = depth ? 1 : 0;
++    std::lock_guard<std::mutex> lk(s_peekMu);
++    const uint8_t* best = nullptr;
++    uint32_t bestFrame = 0;
++    for (int f = 0; f < kPeekFrames; f++) {
++        PeekSnap& p = s_peek[f][group][t];
++        if (p.frame == ~0u || !p.pbo) continue;
++        const uint8_t* m = p.map ? p.map : (p.fetching && p.ready.load(std::memory_order_acquire) ? p.fetched : nullptr);
++        if (m && (!best || int32_t(p.frame - bestFrame) > 0)) {
++            best = m;
++            bestFrame = p.frame;
++        }
++    }
++    if (!best) return false;
++    uint32_t v;
++    memcpy(&v, best + (size_t(y) * s_efbW + x) * 4, 4);
++    *out = depth ? v >> 8 : (v >> 24) << 24 | (v & 0xFF) << 16 | ((v >> 8) & 0xFF) << 8 | ((v >> 16) & 0xFF);
++    return true;
++}
++
+ uint32_t peekColor(int x, int y) {
+     uint32_t p = peekRaw(x, y, false);
+     uint32_t c = (p >> 24) << 24 | (p & 0xFF) << 16 | ((p >> 8) & 0xFF) << 8 | ((p >> 16) & 0xFF);
+@@ -2933,6 +3249,7 @@
+ extern "C" {
+ 
+ int GXPC_PresentXFB(const void* xfb, int winW, int winH) {
++    gxt::sync();
+     flushBatch();
+     glcInvalidate();
+     if (!xfb) xfb = s_lastXfb;
+@@ -2972,6 +3289,7 @@
+ }
+ 
+ void GXPC_ReadEFB(uint8_t* rgba, int* w, int* h) {
++    gxt::sync();
+     flushBatch();
+     glcInvalidate();
+     *w = scaled(s_efbW);
+@@ -2983,6 +3301,7 @@
+ }
+ 
+ int GXPC_ReadXFB(const void* xfb, uint8_t* rgba, int* w, int* h) {
++    gxt::sync();
+     flushBatch();
+     glcInvalidate();
+     if (!xfb) xfb = s_lastXfb;
+@@ -3006,6 +3325,7 @@
+ }
+ 
+ void GXPC_SetHud(int on) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([on] { GXPC_SetHud(on); });  // in stream order, on the worker
+     if (!s_hudEdges || s_hud == (on != 0)) return;
+     flushBatch();
+     s_hud = on != 0;
+@@ -3029,24 +3349,28 @@
+ }
+ 
+ void GXPC_HudPaneBegin(float x1, float x2) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([x1, x2] { GXPC_HudPaneBegin(x1, x2); });  // in stream order, on the worker
+     if (!s_hud) return;
+     s_hudPanes.push_back({std::min(x1, x2), std::max(x1, x2)});
+     hudReanchor();
+ }
+ 
+ void GXPC_HudPaneEnd(void) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([] { GXPC_HudPaneEnd(); });  // in stream order, on the worker
+     if (!s_hud || s_hudPanes.empty()) return;
+     s_hudPanes.pop_back();
+     hudReanchor();
+ }
+ 
+ void GXPC_SetStretch2D(int on) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([on] { GXPC_SetStretch2D(on); });  // in stream order, on the worker
+     if (s_efbW == EFB_W || s_stretch2D == (on != 0)) return;
+     flushBatch();  // what was queued keeps its own mapping
+     s_stretch2D = on != 0;
+ }
+ 
+ void GXPC_SetWide2D(int on) {
++    if (gxt::on() && !gxt::onWorker()) return gxt::call([on] { GXPC_SetWide2D(on); });  // in stream order, on the worker
+     if (s_efbW == EFB_W || s_wide2D == (on != 0)) return;
+     flushBatch();
+     s_wide2D = on != 0;
+--- a/platform/os/os_core.cpp
++++ b/platform/os/os_core.cpp
+@@ -7,6 +7,7 @@
+ #include <dolphin/os/OSAlloc.h>
+ #include <dolphin/os/OSCache.h>
+ #include <dolphin/os/OSStopwatch.h>
++#include <vector>
+ #include <dolphin/os/OSRtc.h>
+ #include <dolphin/os/OSReset.h>
+ #include <dolphin/os/OSResetSW.h>
+@@ -170,22 +171,49 @@
+ // The GX layer caches decoded textures by address; a flush tells it the CPU
+ // rewrote memory (weak: absent without platform/gx).
+ extern "C" __attribute__((weak)) void GXPC_InvalidateRange(const void* p, u32 n);
++// A thread doing host work away from the CPU (port_os_host_work_begin) keeps
++// its flushes until it has the CPU again: the GX layer is the CPU's.
++struct DeferredFlush {
++	void* p;
++	u32 n;
++	bool written;
++};
++static thread_local bool t_away;
++static thread_local std::vector<DeferredFlush> t_flushes;
+ static inline void gx_invalidate(void* p, u32 n)
+ {
++	if (t_away) {
++		t_flushes.push_back({ p, n, false });
++		return;
++	}
+ 	if (GXPC_InvalidateRange)
+ 		GXPC_InvalidateRange(p, n);
+ }
+ extern "C" __attribute__((weak)) void GXPC_MemoryWritten(const void* p, u32 n);
+ static inline void gx_written(void* p, u32 n)
+ {
++	if (t_away) {
++		t_flushes.push_back({ p, n, true });
++		return;
++	}
+ 	if (GXPC_MemoryWritten)
+ 		GXPC_MemoryWritten(p, n);
+ }
++extern "C" void port_os_cache_away(int away)
++{
++	t_away = away != 0;
++	if (t_away)
++		return;
++	for (const DeferredFlush& f : t_flushes)
++		f.written ? gx_written(f.p, f.n) : gx_invalidate(f.p, f.n);
++	t_flushes.clear();
++}
+ extern "C" void DCInvalidateRange(void*, u32) {}
+ extern "C" void DCFlushRange(void* p, u32 n)
+ {
+ 	gx_invalidate(p, n);
+-	port_irq_check();
++	if (!t_away)
++		port_irq_check();
+ }
+ extern "C" void DCStoreRange(void* p, u32 n) { gx_invalidate(p, n); }
+ extern "C" void DCFlushRangeNoSync(void* p, u32 n) { gx_invalidate(p, n); }
+--- a/platform/os/os_thread.cpp
++++ b/platform/os/os_thread.cpp
+@@ -66,9 +66,23 @@
+ 	return it == g_hosts.end() ? NULL : it->second;
+ }
+ 
++// Threads doing host work away from the CPU (port_os_host_work_begin).
++OSThread* g_away[8];
++int g_away_n;
++pthread_cond_t g_away_cv = PTHREAD_COND_INITIALIZER; // one came back
++
++bool is_away(OSThread* t)
++{
++	for (int i = 0; i < g_away_n; i++)
++		if (g_away[i] == t)
++			return true;
++	return false;
++}
++
+ bool runnable(OSThread* t)
+ {
+-	return (t->state == OS_THREAD_STATE_READY || t->state == OS_THREAD_STATE_RUNNING) && t->suspend <= 0;
++	return (t->state == OS_THREAD_STATE_READY || t->state == OS_THREAD_STATE_RUNNING) && t->suspend <= 0
++	    && !(g_away_n && is_away(t));
+ }
+ 
+ // Highest priority (lowest number) runnable thread; among equals the one that
+@@ -530,7 +544,11 @@
+ 	}
+ 	return n;
+ }
+-extern "C" int port_os_irq_work_pending(void) { return !g_deferred.empty(); }
++extern "C" int port_audio_dsp_busy(void) __attribute__((weak)); // audio/dsp_hle.cpp: a subframe being mixed
++extern "C" int port_os_irq_work_pending(void)
++{
++	return !g_deferred.empty() || g_away_n || (port_audio_dsp_busy && port_audio_dsp_busy());
++}
+ 
+ extern "C" void port_os_threads_init(void)
+ {
+@@ -620,6 +638,75 @@
+ 		lower_restore();
+ }
+ 
++// Host work that touches only memory no other game thread uses until it is
++// done (a movie frame's decoding): the CPU goes to the other threads
++// meanwhile, as if the caller were blocked, and port_os_host_work_end waits
++// for its turn again. Nothing in between may call the OS or GX layers; cache
++// flushes are kept until the end (os_core.cpp). Returns the thread for the
++// end, or NULL when the CPU stayed (no other thread to run, or not allowed
++// here), in which case the work just runs on it.
++extern "C" void port_os_cache_away(int away); // os_core.cpp
++extern "C" void* port_os_host_work_begin(void)
++{
++	OSThread* self = g_cur;
++	Host* hs = host_of(self);
++	if (!hs || g_in_irq || g_sched_disabled || !g_irq_enabled || g_away_n == (int)(sizeof g_away / sizeof g_away[0]))
++		return NULL;
++	g_away[g_away_n++] = self;
++	OSThread* next = pick(self, false);
++	Host* hn = next ? host_of(next) : NULL;
++	if (!hn || !hn->started) {
++		g_away_n--;
++		return NULL;
++	}
++	// switch_to's hand-over, without waiting for the turn
++	hs->irq_enabled = g_irq_enabled;
++	self->state = OS_THREAD_STATE_READY;
++	g_cur = next;
++	g_cur_spin.store(next, std::memory_order_release);
++	__gCurrentThread = next;
++	next->state = OS_THREAD_STATE_RUNNING;
++	hn->last_ran = ++g_switch_seq;
++	g_irq_enabled = hn->irq_enabled;
++	pthread_cond_signal(&hn->cv);
++	port_os_cache_away(1);
++	pthread_mutex_unlock(&g_cpu);
++	return self;
++}
++
++extern "C" void port_os_host_work_end(void* away)
++{
++	if (!away)
++		return;
++	OSThread* self = (OSThread*)away;
++	pthread_mutex_lock(&g_cpu);
++	for (int i = 0; i < g_away_n; i++)
++		if (g_away[i] == self) {
++			g_away[i] = g_away[--g_away_n];
++			break;
++		}
++	pthread_cond_broadcast(&g_away_cv);
++	// runnable again: the running thread looks at the scheduler at its next
++	// check point (or the idle loop at once)
++	port_irq_kick();
++	Host* hs = host_of(self);
++	for (;;) {
++		if (hs->cancelled && (g_cur != self || host_of(self) != hs)) {
++			pthread_mutex_unlock(&g_cpu);
++#ifdef PORT_LOW_STACK_CALL
++			port_win64_thread_exit();
++#else
++			pthread_exit(NULL);
++#endif
++		}
++		if (g_cur == self)
++			break;
++		pthread_cond_wait(&hs->cv, &g_cpu);
++	}
++	g_irq_enabled = hs->irq_enabled;
++	port_os_cache_away(0);
++}
++
+ extern "C" int OSCreateThread(OSThread* t, void* (*func)(void*), void* param, void* stack, u32 stackSize,
+                               OSPriority prio, u16 attr)
+ {
+@@ -691,6 +778,8 @@
+ 		OSExitThread(NULL);
+ 		return;
+ 	}
++	while (g_away_n && is_away(t)) // its work may use memory the canceller frees next
++		pthread_cond_wait(&g_away_cv, &g_cpu);
+ 	if (t->state == OS_THREAD_STATE_WAITING && t->queue)
+ 		queue_remove(t->queue, t);
+ 	t->state = OS_THREAD_STATE_MORIBUND;
+--- a/platform/pad/pad.cpp
++++ b/platform/pad/pad.cpp
+@@ -60,6 +60,8 @@
+ extern "C" {
+ __attribute__((weak)) void sms_gx_set_event_callback(void (*cb)(const union SDL_Event* ev));
+ __attribute__((weak)) void sms_gx_pump_events(void);
++// With the graphics worker it pumps the events as it presents (gx_thread.h)
++__attribute__((weak)) int GXPC_GraphicsWorker(void);
+ __attribute__((weak)) int sms_gx_rumble(unsigned short strength);
+ __attribute__((weak)) int GXPC_IsHeadless(void);
+ __attribute__((weak)) int GXPC_MouseCaptured(void);
+@@ -732,7 +734,7 @@
+ 		autoInited = true;
+ 		autopress_init();
+ 	}
+-	if (sms_gx_pump_events)
++	if (sms_gx_pump_events && !(GXPC_GraphicsWorker && GXPC_GraphicsWorker()))
+ 		sms_gx_pump_events();
+ 	for (int i = 0; i < 4; i++) {
+ 		memset(&status[i], 0, sizeof status[i]);
+--- /dev/null
++++ b/platform/gx/src/gx_thread.h
+@@ -0,0 +1,113 @@
++// The graphics worker (SMS_GX_THREAD=1): the GX front end on a thread of its
++// own, as a GameCube's GPU reads its FIFO while the CPU goes on.
++//
++// The game's thread then only writes the command stream: its GX calls go
++// into the write-gather pipe as the FIFO bytes the hardware would read (the
++// way a display list is recorded), the API keeping its own copy of the
++// registers for the getters and the setters that change part of one. Filled
++// pieces of the pipe go to the worker, which parses them with the same code
++// as before (state, batches, textures, shaders, copies, presenting) and is
++// the GL thread's only producer.
++//
++// Port calls that are not FIFO bytes travel in the same stream as private
++// commands (call), so they happen in the order the game made them. What
++// needs an answer from the worker's side (peeks, GXDrawDone, reading the
++// picture back) first waits for the worker to finish what came before
++// (sync), and then runs on the game's thread while the worker is idle. Draw
++// sync callbacks (GXSetDrawSync) run in the game's interrupt context once the
++// worker reaches their token, with the pixel metric read at that point.
++#ifndef SMS_GX_THREAD_H
++#define SMS_GX_THREAD_H
++
++#include <cstdint>
++#include <cstring>
++#include <new>
++#include <type_traits>
++
++namespace gx {
++namespace gxt {
++
++extern bool g_on;  // set once, at the end of GXInit
++extern double g_workerWaitSeconds;  // the game's side waiting for the worker
++inline bool on() { return g_on; }
++bool onWorker();
++
++// GXInit, once its own setup is done: SMS_GX_THREAD=1 starts the worker.
++void start();
++
++// The pipe's bytes so far, to the worker.
++void publish();
++// publish, then wait until the worker has run everything before (`why`
++// names the caller in the log's counts).
++void sync(const char* why = "other");
++// A display copy was written: waits while the worker is more than a frame
++// behind (frameDone, from the worker as it executes one).
++void frameQueued();
++void frameDone();
++uint64_t framesQueued();  // display copies the game has written
++// writeClock() as the game started writing the frame `ago` frames back (0:
++// this one), for telling a display list built lately from one loaded long ago
++uint32_t frameStartClock(unsigned ago);
++
++// fn(data, n) on the worker, in stream order (a private FIFO command).
++using HostFn = void (*)(const uint8_t* data, uint32_t n);
++void callRaw(HostFn fn, const void* data, uint32_t n);
++void callRaw2(HostFn fn, const void* a, uint32_t na, const void* b, uint32_t nb);  // the two pieces as one
++template <class F> void call(const F& f) {
++    static_assert(std::is_trivially_copyable<F>::value, "commands are copied bytewise");
++    callRaw(
++        [](const uint8_t* d, uint32_t) {
++            alignas(F) unsigned char buf[sizeof(F)];
++            memcpy(buf, d, sizeof(F));
++            (*reinterpret_cast<F*>(buf))();
++        },
++        &f, uint32_t(sizeof(F)));
++}
++
++// The draw sync token the worker reached (GXSetDrawSync), its callback to run
++// on the game's side, and the pixel metric then: for GXReadPixMetric inside
++// that callback (PollutionCount's counts).
++void drawSyncReached(uint16_t token, uint32_t metric);
++// The worker reads the pixel metric at the first token after a clear (the
++// pollution counts' pattern: clear, draw, token, token 0) and no other: each
++// read takes one of the frame's query slots.
++extern bool g_metricArmed;
++uint16_t lastToken();
++bool inDrawSyncCallback(uint32_t* metric);
++bool inDrawSyncCallbackToken(uint16_t* token);
++
++}  // namespace gxt
++
++// The API's copy of the registers (gx_api.cpp) follows the stream the worker
++// will parse, display lists included (gx_fifo.cpp): register writes applied,
++// vertices skipped. frontFollow starts it at the pipe's present end;
++// frontCatchUp reads what was written since; frontScan reads a list.
++struct State;
++void frontFollow(State* st);
++void frontCatchUp();
++uint32_t frontScan(State& st, const uint8_t* p, uint32_t n, uint32_t* need, int depth);
++void frontScanList(State& st, const uint8_t* dl, uint32_t n);  // a called list, memoized
++
++// Peeks with the worker (gx_render.cpp): a group's snapshot taken where the
++// game peeked, in stream order, and the game's answer from the newest one
++// read back (false: none yet).
++void peekIssue(int group, bool depth);
++bool peekThreaded(int group, bool depth, int x, int y, uint32_t* out);
++int peekKindToken(uint16_t token, bool depth);  // a peek after a token: its kind's group
++void peekAtToken(uint16_t token);                // the worker, as it reaches a token
++// Bytes written into the stream so far (gx_fifo.cpp).
++uint64_t pipeWrittenTotal();
++
++// The parser for the worker (gx_fifo.cpp): bytes used, and the length of an
++// incomplete command at the end in *need.
++uint32_t parseStream(const uint8_t* p, uint32_t n, uint32_t* need);
++// The pipe's buffer handed over / a fresh one in its place (gx_fifo.cpp):
++// *buf/*cap in are the fresh one, out the old one with its *len.
++void pipeTakeForWorker(uint8_t** buf, uint32_t* len, uint32_t* cap);
++// Bytes into the pipe's stream even while it is redirected to a display list
++// (the worker's private commands are never part of a list).
++void pipeWriteStream(const uint8_t* bytes, uint32_t n);
++
++}  // namespace gx
++
++#endif
+--- /dev/null
++++ b/platform/gx/src/gx_thread.cpp
+@@ -0,0 +1,302 @@
++// The graphics worker: see gx_thread.h.
++#include "gx_thread.h"
++
++#include "gx_glthread.h"
++#include "gx_internal.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdlib>
++#include <deque>
++#include <mutex>
++#include <pthread.h>
++#include <thread>
++#include <vector>
++
++// The emulated CPU's interrupt plumbing (platform/os): the draw sync
++// callbacks run there, on the game's side.
++extern "C" __attribute__((weak)) void port_irq_add_source(void (*fn)(void));
++extern "C" __attribute__((weak)) void port_irq_kick(void);
++extern "C" __attribute__((weak)) void sms_switch_gx_thread(void);  // the Switch runtime: its core
++
++namespace gx {
++extern void (*drawSyncCallback)(uint16_t);
++
++namespace gxt {
++
++bool g_on = false;
++bool g_metricArmed = false;
++double g_workerWaitSeconds = 0;
++
++namespace {
++
++struct Chunk {
++    uint8_t* data;
++    uint32_t len, cap;
++};
++
++enum : uint32_t { kChunkBytes = 64u << 10 };
++
++std::mutex s_mu;
++std::condition_variable s_work, s_idle, s_frame;
++std::deque<Chunk> s_queue;  // published, in order
++std::vector<Chunk> s_free;
++bool s_busy = false;  // the worker is running a chunk
++thread_local bool t_worker = false;
++uint64_t s_framesQueued = 0;            // display copies written (game side)
++std::atomic<uint64_t> s_framesDone{0};  // and executed (worker)
++
++// An incomplete command at the end of a chunk waits here for the rest.
++std::vector<uint8_t> s_rest;
++
++void runChunk(const Chunk& c) {
++    uint32_t need = 0;
++    if (s_rest.empty()) {
++        const uint32_t used = parseStream(c.data, c.len, &need);
++        if (used < c.len) s_rest.assign(c.data + used, c.data + c.len);
++        return;
++    }
++    s_rest.insert(s_rest.end(), c.data, c.data + c.len);
++    const uint32_t used = parseStream(s_rest.data(), uint32_t(s_rest.size()), &need);
++    s_rest.erase(s_rest.begin(), s_rest.begin() + used);
++}
++
++// Time the game's side spends waiting for the worker (sync, frameQueued).
++struct WaitTimer {
++    double t0 = monoSeconds();
++    ~WaitTimer() { g_workerWaitSeconds += monoSeconds() - t0; }
++};
++
++void* workerMain(void*) {
++    t_worker = true;
++    if (sms_switch_gx_thread) sms_switch_gx_thread();
++    for (;;) {
++        Chunk c;
++        {
++            std::unique_lock<std::mutex> lk(s_mu);
++            s_work.wait(lk, [] { return !s_queue.empty(); });
++            c = s_queue.front();
++            s_queue.pop_front();
++            s_busy = true;
++        }
++        runChunk(c);
++        {
++            std::lock_guard<std::mutex> lk(s_mu);
++            c.len = 0;
++            s_free.push_back(c);
++            s_busy = false;
++            if (s_queue.empty()) s_idle.notify_all();
++        }
++    }
++    return nullptr;
++}
++
++// Draw sync tokens the worker reached, for the game's side.
++struct Reached {
++    uint16_t token;
++    uint32_t metric;
++};
++std::mutex s_syncMu;
++std::vector<Reached> s_reached;
++std::atomic<uint32_t> s_lastToken{0};
++bool s_inCallback = false;  // game side
++uint32_t s_callbackMetric = 0;
++uint16_t s_callbackToken = 0;
++
++// Interrupt source, on the game's side: the callbacks of the tokens reached.
++void deliverDrawSyncs() {
++    // one token a pass: TDrawSyncManager's thread handles each (and peeks)
++    // before the next one is the last token
++    std::vector<Reached> now;
++    {
++        std::lock_guard<std::mutex> lk(s_syncMu);
++        if (s_reached.empty()) return;
++        now.push_back(s_reached.front());
++        s_reached.erase(s_reached.begin());
++        if (!s_reached.empty()) port_irq_kick();
++    }
++    for (const Reached& r : now) {
++        s_lastToken.store(r.token, std::memory_order_relaxed);
++        if (!drawSyncCallback) continue;
++        s_inCallback = true;
++        s_callbackMetric = r.metric;
++        s_callbackToken = r.token;
++        drawSyncCallback(r.token);
++        s_inCallback = false;
++    }
++}
++
++}  // namespace
++
++bool onWorker() { return t_worker; }
++
++void start() {
++    const char* e = getenv("SMS_GX_THREAD");
++    if (!(e && e[0] == '1') || g_on) return;
++    if (!port_irq_add_source || !port_irq_kick || !glt::active()) {
++        logmsg("graphics worker: not available here (no interrupt plumbing or GL thread)");
++        return;
++    }
++    // a thread of the host's own (std::thread's on the Switch did not start
++    // from here), with room for the parser's and the batches' frames
++    pthread_attr_t a;
++    pthread_attr_init(&a);
++    pthread_attr_setstacksize(&a, 1u << 20);
++    pthread_t th;
++    const int rc = pthread_create(&th, &a, workerMain, nullptr);
++    pthread_attr_destroy(&a);
++    if (rc != 0) {
++        logmsg("graphics worker: no thread (%d)", rc);
++        return;
++    }
++    pthread_detach(th);
++    port_irq_add_source(deliverDrawSyncs);
++    g_on = true;
++    logmsg("graphics worker: the GX front end runs on a thread of its own");
++}
++
++void publish() {
++    if (!g_on || onWorker()) return;
++    Chunk fresh{nullptr, 0, 0};
++    {
++        std::lock_guard<std::mutex> lk(s_mu);
++        if (!s_free.empty()) {
++            fresh = s_free.back();
++            s_free.pop_back();
++        }
++    }
++    if (!fresh.data) {
++        fresh.data = static_cast<uint8_t*>(malloc(kChunkBytes));
++        if (!fresh.data) fatal("out of memory for the graphics worker's stream");
++        fresh.cap = kChunkBytes;
++    }
++    Chunk out{nullptr, 0, 0};
++    uint8_t* buf = fresh.data;
++    uint32_t len = 0, cap = fresh.cap;
++    pipeTakeForWorker(&buf, &len, &cap);  // swaps: the old buffer comes back
++    out.data = buf;
++    out.len = len;
++    out.cap = cap;
++    std::lock_guard<std::mutex> lk(s_mu);
++    if (!out.len) {  // nothing written: the buffer handed in is simply back
++        s_free.push_back(out);
++        return;
++    }
++    s_queue.push_back(out);
++    s_work.notify_one();
++}
++
++// The game's waits for the worker by reason, logged every 600 frames.
++struct WaitCount {
++    const char* why;
++    uint32_t n;
++    double seconds;
++};
++WaitCount s_waits[16];
++void countWait(const char* why, double seconds) {
++    for (WaitCount& w : s_waits) {
++        if (!w.why || w.why == why || !strcmp(w.why, why)) {
++            w.why = why;
++            w.n++;
++            w.seconds += seconds;
++            return;
++        }
++    }
++}
++
++void sync(const char* why) {
++    if (!g_on || onWorker()) return;
++    publish();
++    struct Count {
++        const char* why;
++        double t0 = monoSeconds();
++        ~Count() { countWait(why, monoSeconds() - t0); }
++    } count{why};
++    WaitTimer tw;
++    std::unique_lock<std::mutex> lk(s_mu);
++    s_idle.wait(lk, [] { return s_queue.empty() && !s_busy; });
++}
++
++static uint32_t s_frameClock[8];  // writeClock() at each frame's start, by framesQueued
++
++void frameQueued() {
++    if (!g_on || onWorker()) return;
++    publish();
++    s_framesQueued++;
++    s_frameClock[s_framesQueued & 7] = writeClock();
++    if (s_framesQueued % 600 == 0) {
++        char line[512];
++        int k = snprintf(line, sizeof line, "graphics worker: waits per frame over 600:");
++        for (WaitCount& w : s_waits) {
++            if (!w.why) break;
++            k += snprintf(line + k, sizeof line - size_t(k), " %s %.2f (%.3f ms)", w.why, w.n / 600.0,
++                          w.seconds * 1000.0 / 600.0);
++            w.n = 0;
++            w.seconds = 0;
++        }
++        logmsg("%s", line);
++    }
++    struct Count {
++        double t0 = monoSeconds();
++        ~Count() { countWait("frame", monoSeconds() - t0); }
++    } count;
++    if (s_framesQueued - s_framesDone.load(std::memory_order_acquire) <= 1) return;
++    WaitTimer tw;
++    std::unique_lock<std::mutex> lk(s_mu);
++    s_frame.wait(lk, [] { return s_framesQueued - s_framesDone.load(std::memory_order_acquire) <= 1; });
++}
++
++uint64_t framesQueued() { return s_framesQueued; }
++
++uint32_t frameStartClock(unsigned ago) {
++    if (ago > 7) ago = 7;
++    if (ago > s_framesQueued) return 0;
++    return s_frameClock[(s_framesQueued - ago) & 7];
++}
++
++void frameDone() {
++    if (!g_on) return;
++    s_framesDone.fetch_add(1, std::memory_order_release);
++    std::lock_guard<std::mutex> lk(s_mu);
++    s_frame.notify_all();
++}
++
++void callRaw(HostFn fn, const void* data, uint32_t n) { callRaw2(fn, data, n, nullptr, 0); }
++
++void callRaw2(HostFn fn, const void* a, uint32_t na, const void* b, uint32_t nb) {
++    uint8_t hdr[16] = {0xF1, 0, 0, 0};
++    const uint32_t n = na + nb;
++    memcpy(hdr + 4, &n, 4);
++    memcpy(hdr + 8, &fn, sizeof fn);
++    pipeWriteStream(hdr, sizeof hdr);
++    if (na) pipeWriteStream(static_cast<const uint8_t*>(a), na);
++    if (nb) pipeWriteStream(static_cast<const uint8_t*>(b), nb);
++}
++
++void drawSyncReached(uint16_t token, uint32_t metric) {
++    {
++        std::lock_guard<std::mutex> lk(s_syncMu);
++        s_reached.push_back({token, metric});
++    }
++    port_irq_kick();
++}
++
++uint16_t lastToken() { return uint16_t(s_lastToken.load(std::memory_order_relaxed)); }
++
++bool inDrawSyncCallbackToken(uint16_t* token) {
++    if (!s_inCallback) return false;
++    *token = s_callbackToken;
++    return true;
++}
++
++bool inDrawSyncCallback(uint32_t* metric) {
++    if (!s_inCallback) return false;
++    *metric = s_callbackMetric;
++    return true;
++}
++
++}  // namespace gxt
++}  // namespace gx
++
++// For the port (pad.cpp): the events are pumped by the worker as it presents.
++extern "C" int GXPC_GraphicsWorker(void) { return gx::gxt::on() ? 1 : 0; }

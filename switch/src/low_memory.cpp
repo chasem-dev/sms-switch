@@ -42,6 +42,25 @@ constexpr u64 kStackZoneSize = 64 << 20;
 constexpr u64 kMem1Zone = 0x80000000;     // the game's MEM1 (cached) address
 constexpr u64 kMem1ZoneSize = 64 << 20;   // 64-bit MEM1 default (SMS_MEM_MB)
 
+// A line with two hex numbers in an emulator's or debugger's log (this runs
+// before the C library is ready).
+void trace_hex(const char* text, u64 a, u64 b)
+{
+	char buf[96];
+	size_t n = 0;
+	while (*text && n < 60)
+		buf[n++] = *text++;
+	const u64 values[2] = {a, b};
+	for (u64 v : values) {
+		buf[n++] = '0';
+		buf[n++] = 'x';
+		for (int shift = 36; shift >= 0; shift -= 4)
+			buf[n++] = "0123456789abcdef"[(v >> shift) & 15];
+		buf[n++] = ' ';
+	}
+	svcOutputDebugString(buf, n);
+}
+
 struct Mod0Header {
 	u32 magic_mod0;
 	s32 dyn_offset;
@@ -353,12 +372,51 @@ void __libnx_initheap(void)
 		if (heap_size < w.size + (64 << 20))
 			continue;
 		u64 at = range_unmapped(w.at, w.size) ? w.at : find_free(w.lo, w.hi, w.size, 0x200000);
-		if (!at || R_FAILED(svcMapProcessCodeMemory(proc, at, heap, w.size)))
-			continue;
-		if (R_FAILED(svcSetProcessMemoryPermission(proc, at, w.size, Perm_Rw))) {
-			svcUnmapProcessCodeMemory(proc, at, heap, w.size);
-			continue;
+		bool mapped = false;
+		if (at && R_SUCCEEDED(svcMapProcessCodeMemory(proc, at, heap, w.size))) {
+			mapped = R_SUCCEEDED(svcSetProcessMemoryPermission(proc, at, w.size, Perm_Rw));
+			if (!mapped)
+				svcUnmapProcessCodeMemory(proc, at, heap, w.size);
 		}
+		if (!mapped) {
+			// An emulator that gives homebrew no process handle (Ryubing):
+			// svcMapMemory needs none, but maps only into the stack region,
+			// so the window goes there if that region reaches below hi.
+			u64 region = 0, region_size = 0;
+			svcGetInfo(&region, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0);
+			svcGetInfo(&region_size, InfoType_StackRegionSize, CUR_PROCESS_HANDLE, 0);
+			trace_hex("[switch] stack region ", region, region_size);
+			const u64 lo = region > w.lo ? region : w.lo;
+			const u64 hi = region + region_size < w.hi ? region + region_size : w.hi;
+			// MEM1 on an address aligned to 1 GiB, as its own 0x80000000 is:
+			// code that turns a MEM1 pointer into an offset by masking it (as
+			// the GameCube's addresses allow) then still gets the offset
+			const u64 want = w.mem1 ? 0x40000000 : 0x20000000;
+			at = want >= lo && want + w.size <= hi && range_unmapped(want, w.size) ? want
+			     : hi > lo + w.size                                                  ? find_free(lo, hi, w.size, 0x200000)
+			                                                                         : 0;
+			mapped = at && R_SUCCEEDED(svcMapMemory((void*)at, (void*)heap, w.size));
+			if (w.mem1 && !(mapped && at == w.at)) {
+				// MEM1 at its own address if the alias region holds it, with
+				// memory of its own (svcMapPhysicalMemory): where the console
+				// has it, so an emulator runs the same code paths
+				u64 alias = 0, alias_size = 0;
+				svcGetInfo(&alias, InfoType_AliasRegionAddress, CUR_PROCESS_HANDLE, 0);
+				svcGetInfo(&alias_size, InfoType_AliasRegionSize, CUR_PROCESS_HANDLE, 0);
+				trace_hex("[switch] alias region ", alias, alias_size);
+				if (w.at >= alias && w.at + w.size <= alias + alias_size && range_unmapped(w.at, w.size) &&
+				    R_SUCCEEDED(svcMapPhysicalMemory((void*)w.at, w.size))) {
+					if (mapped)
+						svcUnmapMemory((void*)at, (void*)heap, w.size);
+					at = w.at;
+					mapped = true;
+					trace_hex("[switch] MEM1 by svcMapPhysicalMemory ", at, w.size);
+					// (the heap piece stays the process's: it is not passed on below)
+				}
+			}
+		}
+		if (!mapped)
+			continue;
 		LowZone& z = g_info.zones[g_info.zone_count++];
 		z.base = at;
 		z.size = w.size;
@@ -484,6 +542,20 @@ extern "C" int munmap(void* addr, size_t length)
 	}
 	mutexUnlock(&g_mmap_lock);
 	return 0;
+}
+
+// (diagnostics.cpp's memory lines)
+extern "C" void sms_switch_low_mmap_used(u64* bytes, int* ranges)
+{
+	mutexLock(&g_mmap_lock);
+	*bytes = 0;
+	*ranges = 0;
+	for (int z = 0; z < g_info.zone_count; z++) {
+		for (int i = 0; i < g_used_count[z]; i++)
+			*bytes += g_used[z][i].size;
+		*ranges += g_used_count[z];
+	}
+	mutexUnlock(&g_mmap_lock);
 }
 
 extern "C" int mprotect(void*, size_t, int) { return 0; }

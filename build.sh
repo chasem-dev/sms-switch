@@ -204,6 +204,18 @@ elif [[ -n "${SMS_SWITCH_KEYS+set}" ]]; then
 	rm -f "$keys_memory" "$here/build/nsp/sms-switch.nsp" "$here/build/nsp/sms-eclipse.nsp"
 fi
 
+# The build's name, the log's first line and on the screen at start: git
+# describe (the last tag, commits since, the commit), + when built with
+# changes not committed (the sms-port submodule's own patches aside), and the
+# date (UTC)
+build_name="$(git -C "$here" describe --tags --always 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "$here" status --porcelain --ignore-submodules=dirty 2>/dev/null)" ]]; then
+	build_name+="+"
+fi
+build_name+=" $(date -u +%Y-%m-%d)"
+disc_args+=(-DSMS_SWITCH_BUILD_NAME="$build_name")
+eclipse_disc_args+=(-DSMS_SWITCH_BUILD_NAME="$build_name")
+
 # The Eclipse build: its own tree, build/eclipse, beside the plain one, with
 # the same Mesa (build/mesa from tools/mesa/build-mesa.sh, when it is there).
 eclipse_cmd=""

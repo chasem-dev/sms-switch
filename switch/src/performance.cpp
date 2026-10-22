@@ -1,5 +1,4 @@
-// Performance on the console: which cores the program's threads run on, and
-// the CPU and GPU clocks.
+// Performance on the console: which cores the program's threads run on.
 //
 // Threads. libnx creates every pthread (and SDL every thread) on the
 // process's default core, core 0, and pthreads at the lowest application
@@ -7,23 +6,25 @@
 // mixer and the retrace timer as host threads, so all of them shared core 0
 // with the game, the GL thread only getting the core when the game waited.
 // threadCreate is wrapped (-Wl,--wrap=threadCreate, which also covers libnx's
-// own pthread_create and SDL): each new thread gets the next of cores 0-2 as
-// its ideal core, may run on any of them, and pthreads get the main thread's
-// priority.
+// own pthread_create and SDL): each new thread may run on any of cores 0-2,
+// and pthreads get the main thread's priority. The two threads that do most
+// of the work get a core each to start from: the main thread, which runs the
+// game, core 0, and the GL thread (the driver's work, sms_switch_gl_thread)
+// core 1; every other thread starts on core 2 or 0 in turn. Horizon does not
+// share a core between threads of the same priority by time: a thread keeps
+// it until it waits, and one that is woken there waits for it unless another
+// core is idle. So the texture pack's background work
+// (sms_switch_background_thread) runs below the game's priority, where the
+// game's threads take a core from it rather than wait for it.
+// SMS_SWITCH_SPREAD_THREADS=0 leaves all of this to libnx.
 //
-// Clocks. Homebrew runs at the console's default profile (CPU 1020 MHz, GPU
-// 307-384 MHz handheld, 768 MHz docked). The game's own CPU work is native
-// code, but the GX layer and Mesa add a lot of driver work per draw, so the
-// CPU goes to 1785 MHz (what the system's own load boost uses) and the GPU to
-// 460.8 MHz handheld / 768 MHz docked, through clkrst (pcv before 8.0.0).
-// The system resets them on a docking change, so a thread re-applies them.
-// SMS_SWITCH_CLOCKS=0 keeps the default profile; SMS_SWITCH_CPU_MHZ and
-// SMS_SWITCH_GPU_MHZ override the rates.
+// Clocks: the console's own (CPU 1020 MHz, GPU 307-384 MHz handheld, 768 MHz
+// docked); the port never changes them. Raised clocks (CPU 1785 MHz, what the
+// system's load boost uses) ran the fan hard for a few more frames a second.
 #include <switch.h>
 #include <atomic>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 extern "C" Result __real_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem, size_t stack_sz,
                                       int prio, int cpuid);
@@ -31,124 +32,128 @@ extern "C" Result __real_threadCreate(Thread* t, ThreadFunc entry, void* arg, vo
 namespace {
 constexpr u32 kAllCores = 0x7; // the cores applications may use
 constexpr int kMainPriority = 0x2C;
-std::atomic<int> g_next_core(1);
+constexpr int kBackgroundPriority = 0x2E;
+constexpr int kGlCore = 1;
+constexpr int kDspCore = 2;
+constexpr int kOtherCores[] = {2, 0}; // the cores other threads start on, in turn
+std::atomic<int> g_next_core(0);
+std::atomic<unsigned> g_threads_created(0); // (diagnostics.cpp's memory lines)
 
-u32 env_mhz(const char* name, u32 fallback)
-{
-	const char* e = getenv(name);
-	const long v = e ? strtol(e, nullptr, 10) : 0;
-	return v > 0 ? u32(v) : fallback;
-}
-} // namespace
-
-extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem, size_t stack_sz,
-                                      int prio, int cpuid)
+bool spread_threads()
 {
 	static int on = -1;
 	if (on < 0) {
 		const char* e = getenv("SMS_SWITCH_SPREAD_THREADS");
 		on = !(e && *e == '0');
 	}
-	if (!on)
-		return __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
+	return on != 0;
+}
+
+} // namespace
+
+extern "C" void sms_switch_profile_created(Handle h, void* entry); // profiler.cpp
+
+extern "C" unsigned sms_switch_threads_created(void) { return g_threads_created.load(std::memory_order_relaxed); }
+
+extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem, size_t stack_sz,
+                                      int prio, int cpuid)
+{
+	g_threads_created.fetch_add(1, std::memory_order_relaxed);
+	if (!spread_threads()) {
+		const Result r = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
+		if (R_SUCCEEDED(r))
+			sms_switch_profile_created(t->handle, (void*)entry);
+		return r;
+	}
 	if (prio == 0x3B) // libnx's pthread_create
 		prio = kMainPriority;
 	const bool spread = cpuid == -2;
-	const int core = spread ? g_next_core.fetch_add(1) % 3 : cpuid;
+	const int core = spread ? kOtherCores[g_next_core.fetch_add(1) % 2] : cpuid;
 	Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, core);
+	if (R_SUCCEEDED(rc))
+		sms_switch_profile_created(t->handle, (void*)entry);
 	if (R_SUCCEEDED(rc) && spread)
 		svcSetThreadCoreMask(t->handle, core, kAllCores);
+	static int trace = -1;
+	if (trace < 0) {
+		const char* e = getenv("SMS_SWITCH_TRACE_THREADS");
+		trace = e && *e == '1';
+	}
+	if (trace && R_SUCCEEDED(rc)) {
+		// where each thread's stack is: an emulator's bad address in the
+		// stack region names its thread
+		char line[128];
+		const int n = snprintf(line, sizeof line, "[switch] thread %p: stack %p-%p (mirror of %p), entry %p",
+		                       (void*)t, t->stack_mirror, (char*)t->stack_mirror + t->stack_sz, t->stack_mem,
+		                       (void*)entry);
+		svcOutputDebugString(line, size_t(n));
+	}
 	return rc;
 }
 
+extern "C" void sms_switch_profile_thread(int slot); // profiler.cpp
+void sms_switch_profile_add_current(const char* label); // profiler.cpp
+
 extern "C" void sms_switch_spread_main_thread(void)
 {
+	sms_switch_profile_thread(0);
 	svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, kAllCores);
 }
 
-// --- clocks -----------------------------------------------------------------
-namespace {
-bool g_clocks_open;
-bool g_use_clkrst;
-Thread g_clock_thread;
-std::atomic<bool> g_clock_stop(false);
-
-void set_rate(bool gpu, u32 hz)
+// The port's GL thread, as it starts (gx_glthread.cpp).
+extern "C" void sms_switch_gl_thread(void)
 {
-	const PcvModuleId module = gpu ? PcvModuleId_GPU : PcvModuleId_CpuBus;
-	if (g_use_clkrst) {
-		ClkrstSession s;
-		if (R_SUCCEEDED(clkrstOpenSession(&s, module, 3))) {
-			clkrstSetClockRate(&s, hz);
-			clkrstCloseSession(&s);
-		}
-	} else {
-		pcvSetClockRate(gpu ? PcvModule_GPU : PcvModule_CpuBus, hz);
-	}
+	sms_switch_profile_thread(1);
+	if (spread_threads())
+		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kGlCore, kAllCores);
 }
 
-u32 get_rate(bool gpu)
+// The DSP's mixing thread (sms-port's audio/dsp_hle.cpp): the audio thread
+// waits for each subframe it mixes, so it starts on the core the game's own
+// threads leave least busy.
+extern "C" void sms_switch_dsp_thread(void)
 {
-	const PcvModuleId module = gpu ? PcvModuleId_GPU : PcvModuleId_CpuBus;
-	u32 hz = 0;
-	if (g_use_clkrst) {
-		ClkrstSession s;
-		if (R_SUCCEEDED(clkrstOpenSession(&s, module, 3))) {
-			clkrstGetClockRate(&s, &hz);
-			clkrstCloseSession(&s);
-		}
-	} else {
-		pcvGetClockRate(gpu ? PcvModule_GPU : PcvModule_CpuBus, &hz);
-	}
-	return hz;
+	sms_switch_profile_add_current("dsp");
+	if (spread_threads())
+		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kDspCore, kAllCores);
 }
 
-void wanted(u32* cpu_hz, u32* gpu_hz)
+// The graphics worker (sms-port's gx_thread.h, SMS_GX_THREAD=1): the GX
+// front end beside the game, on the core the GL thread does not use.
+extern "C" void sms_switch_gx_thread(void)
 {
-	const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
-	*cpu_hz = env_mhz("SMS_SWITCH_CPU_MHZ", 1785) * 1000000u;
-	*gpu_hz = env_mhz("SMS_SWITCH_GPU_MHZ", docked ? 768 : 460) * 1000000u;
-	if (*gpu_hz == 460000000u)
-		*gpu_hz = 460800000u; // the GPU's table value
+	sms_switch_profile_add_current("gx");
+	if (spread_threads())
+		svcSetThreadCoreMask(CUR_THREAD_HANDLE, kDspCore, kAllCores);
 }
 
-void apply(bool log)
+// A movie frame (the THP player's decoding thread, below the game's priority):
+// it touches only the movie's own buffers until it is done, so the game's
+// other threads have the CPU meanwhile (sms-port's port_os_host_work_begin)
+// and the decoding runs on another core beside the game instead of in the
+// game's turn (when a late frame steps down for it, a quarter frame at most).
+// SMS_SWITCH_THP_AWAY=0 decodes on the CPU as before.
+extern "C" s32 __real_THPVideoDecode(void* file, void* tileY, void* tileU, void* tileV, void* work);
+extern "C" void* port_os_host_work_begin(void);
+extern "C" void port_os_host_work_end(void* away);
+
+extern "C" s32 __wrap_THPVideoDecode(void* file, void* tileY, void* tileU, void* tileV, void* work)
 {
-	u32 cpu, gpu;
-	wanted(&cpu, &gpu);
-	if (get_rate(false) != cpu)
-		set_rate(false, cpu);
-	if (get_rate(true) != gpu)
-		set_rate(true, gpu);
-	if (log)
-		fprintf(stderr, "[switch] clocks: CPU %u MHz, GPU %u MHz (%s)\n", get_rate(false) / 1000000,
-		        get_rate(true) / 1000000,
-		        appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld");
+	static int on = -1;
+	if (on < 0) {
+		const char* e = getenv("SMS_SWITCH_THP_AWAY");
+		on = !(e && *e == '0');
+	}
+	void* away = on ? port_os_host_work_begin() : nullptr;
+	const s32 r = __real_THPVideoDecode(file, tileY, tileU, tileV, work);
+	port_os_host_work_end(away);
+	return r;
 }
 
-void clock_thread(void*)
+// A thread of work that may wait for idle time (gx_hires.cpp: the texture
+// pack's levels it makes itself).
+extern "C" void sms_switch_background_thread(void)
 {
-	while (!g_clock_stop.load()) {
-		svcSleepThread(2000000000ull); // the system resets them on docking changes
-		apply(false);
-	}
-}
-} // namespace
-
-extern "C" void sms_switch_start_clocks(void)
-{
-	const char* e = getenv("SMS_SWITCH_CLOCKS");
-	if (e && *e == '0') {
-		fprintf(stderr, "[switch] clocks: the console's default profile (SMS_SWITCH_CLOCKS=0)\n");
-		return;
-	}
-	g_use_clkrst = hosversionAtLeast(8, 0, 0);
-	if (R_FAILED(g_use_clkrst ? clkrstInitialize() : pcvInitialize())) {
-		fprintf(stderr, "[switch] clocks: no clock service; default profile\n");
-		return;
-	}
-	g_clocks_open = true;
-	apply(true);
-	if (R_SUCCEEDED(threadCreate(&g_clock_thread, clock_thread, nullptr, nullptr, 0x4000, 0x3B, 2)))
-		threadStart(&g_clock_thread);
+	if (spread_threads())
+		svcSetThreadPriority(CUR_THREAD_HANDLE, kBackgroundPriority);
 }

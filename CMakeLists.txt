@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(sms_switch VERSION 0.1.0 LANGUAGES C CXX ASM)
+# Release builds at -O3, without semantic interposition: the program is linked
+# statically, so the -fPIC libraries (the game, sms_gx) may inline and
+# optimise across their own exported functions (about 5% less CPU time in
+# Delfino Plaza; the pictures the same).
+foreach(lang C CXX)
+  set(CMAKE_${lang}_FLAGS_RELEASE "-g -O3 -DNDEBUG -fno-semantic-interposition")
+endforeach()
 
 if(NOT NINTENDO_SWITCH)
   message(FATAL_ERROR "Configure with the devkitPro toolchain: "
@@ -40,8 +47,11 @@ set(SMS_GX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(sms-port ${CMAKE_BINARY_DIR}/port)
 
 target_sources(sms PRIVATE
+  ${SMS_SWITCH_DIR}/src/dev_link.cpp
+  ${SMS_SWITCH_DIR}/src/diagnostics.cpp
   ${SMS_SWITCH_DIR}/src/low_memory.cpp
   ${SMS_SWITCH_DIR}/src/performance.cpp
+  ${SMS_SWITCH_DIR}/src/profiler.cpp
   ${SMS_SWITCH_DIR}/src/posix_shims.cpp
   ${SMS_SWITCH_DIR}/src/stack_switch.cpp
   ${SMS_SWITCH_DIR}/src/switch_main.cpp)
@@ -62,6 +72,10 @@ set_source_files_properties(${SMS_SWITCH_DIR}/src/switch_main.cpp TARGET_DIRECTO
   "SMS_SWITCH_APP=\"${SMS_SWITCH_APP}\";SMS_SWITCH_TITLE=\"${SMS_SWITCH_TITLE}\"")
 # Every thread spread over cores 0-2 (switch/src/performance.cpp).
 target_link_options(sms PRIVATE -Wl,--wrap=threadCreate)
+# main with an argument list even when the loader gives none (switch_main.cpp)
+target_link_options(sms PRIVATE -Wl,--wrap=main)
+# Movie frames decoded off the game's CPU (switch/src/performance.cpp)
+target_link_options(sms PRIVATE -Wl,--wrap=THPVideoDecode)
 
 # Mesa (OpenGL over nouveau). Its pkg-config files carry an unexpanded
 # $(DEVKITPRO), so the libraries are named directly; order matters.
@@ -91,6 +105,52 @@ else()
   message(STATUS "sms-switch: the installed switch-mesa (no shader cache; tools/mesa/build-mesa.sh builds one)")
 endif()
 target_link_libraries(sms PRIVATE ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouveau z)
+
+# dkgl (switch/src/dkgl): the renderer's GL calls on deko3d, with
+# SMS_SWITCH_RENDERER=deko3d. It compiles shaders with uam built as a library
+# (tools/uam/build-uam.sh, into build/uam/); without it, only Mesa's GL.
+set(SMS_SWITCH_UAM_DIR "${CMAKE_BINARY_DIR}/uam" CACHE PATH "libuam built by tools/uam/build-uam.sh")
+# deko3d with this project's fixes (tools/deko3d/build-deko3d.sh, into
+# build/deko3d/) when built, else devkitPro's: its blend states use the
+# colour's destination factor for alpha too (the game's shadows draw solid)
+set(SMS_SWITCH_DEKO3D_DIR "${CMAKE_BINARY_DIR}/deko3d" CACHE PATH "deko3d built by tools/deko3d/build-deko3d.sh")
+if(EXISTS "${SMS_SWITCH_DEKO3D_DIR}/lib/libdeko3d.a")
+  set(SMS_SWITCH_DEKO3D ${SMS_SWITCH_DEKO3D_DIR}/lib/libdeko3d.a)
+  set(SMS_SWITCH_DEKO3DD ${SMS_SWITCH_DEKO3D_DIR}/lib/libdeko3dd.a)
+  message(STATUS "sms-switch: deko3d from ${SMS_SWITCH_DEKO3D_DIR}")
+else()
+  set(SMS_SWITCH_DEKO3D deko3d)
+  set(SMS_SWITCH_DEKO3DD deko3dd)
+  message(WARNING "sms-switch: devkitPro's deko3d (tools/deko3d/build-deko3d.sh builds the fixed one): shadows draw solid")
+endif()
+if(EXISTS "${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
+  add_library(dkgl STATIC
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_api.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_device.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_draw.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_glsl.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_program.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_sdl.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_test.cpp
+    ${SMS_SWITCH_DIR}/src/dkgl/dkgl_texture.cpp)
+  # (SDL itself is linked by the program)
+  target_include_directories(dkgl PRIVATE ${SMS_SWITCH_UAM_DIR}/include ${DEVKITPRO}/portlibs/switch/include/SDL2)
+  target_compile_features(dkgl PRIVATE cxx_std_17)
+  # (deko3d itself: the program's choice, deko3dd being its checked build)
+  target_link_libraries(dkgl PUBLIC ${SMS_SWITCH_UAM_DIR}/lib/libuam.a)
+  # SDL's GL calls go to dkgl when it is chosen (dkgl_sdl.cpp)
+  set(SMS_SWITCH_DKGL_WRAPS
+    -Wl,--wrap=SDL_GL_CreateContext -Wl,--wrap=SDL_GL_MakeCurrent -Wl,--wrap=SDL_GL_SwapWindow
+    -Wl,--wrap=SDL_GL_SetSwapInterval -Wl,--wrap=SDL_GL_GetSwapInterval -Wl,--wrap=SDL_GL_DeleteContext
+    -Wl,--wrap=SDL_GL_GetProcAddress -Wl,--wrap=SDL_GL_GetDrawableSize -Wl,--wrap=SDL_EGL_CreateSurface
+    -Wl,--wrap=SDL_EGL_DestroySurface -Wl,--wrap=nwindowSetDimensions)
+  target_link_libraries(sms PRIVATE dkgl ${SMS_SWITCH_DEKO3D})
+  target_link_options(sms PRIVATE ${SMS_SWITCH_DKGL_WRAPS})
+  target_compile_definitions(sms PRIVATE SMS_SWITCH_DKGL=1)
+  message(STATUS "sms-switch: the deko3d renderer (dkgl) with ${SMS_SWITCH_UAM_DIR}/lib/libuam.a")
+else()
+  message(STATUS "sms-switch: no libuam (tools/uam/build-uam.sh): Mesa's GL only")
+endif()
 
 # The icon (homebrew menu, HOME menu): SMS_SWITCH_ICON=
 #   steamgriddb (default)  the box art from SteamGridDB, fetched at build time,
@@ -126,6 +186,15 @@ elseif(_icon_args)
   else()
     message(WARNING "sms-switch: no icon (${_icon_err}); using libnx's default")
   endif()
+endif()
+
+# The build's name (build.sh passes it: git describe, + when built with
+# uncommitted changes, and the date): the log's first line and on the screen
+# at start. Only switch_main.cpp sees it, so a new name rebuilds one file.
+set(SMS_SWITCH_BUILD_NAME "" CACHE STRING "the build's name (build.sh sets it)")
+if(SMS_SWITCH_BUILD_NAME)
+  set_property(SOURCE ${SMS_SWITCH_DIR}/src/switch_main.cpp TARGET_DIRECTORY sms APPEND PROPERTY
+    COMPILE_DEFINITIONS "SMS_SWITCH_BUILD_NAME=\"${SMS_SWITCH_BUILD_NAME}\"")
 endif()
 
 nx_generate_nacp(sms.nacp
@@ -197,6 +266,7 @@ if(SMS_SWITCH_GX_SELFTEST)
     ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/msl_math.c
     ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/port_cheats.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sms-port/platform/misc/port_warp.cpp
+    ${SMS_SWITCH_DIR}/src/dev_link.cpp
     ${SMS_SWITCH_DIR}/src/gx_selftest_main.cpp
     ${SMS_SWITCH_DIR}/src/low_memory.cpp
     ${SMS_SWITCH_DIR}/src/posix_shims.cpp)
@@ -210,5 +280,14 @@ if(SMS_SWITCH_GX_SELFTEST)
     ${_gx}/src ${SMS_SWITCH_DIR}/src)
   target_compile_features(gx_selftest PRIVATE cxx_std_17)
   target_link_libraries(gx_selftest PRIVATE sms_gx ${SMS_SWITCH_EGL} ${SMS_SWITCH_GLAPI} drm_nouveau z)
-  nx_create_nro(gx_selftest OUTPUT ${CMAKE_BINARY_DIR}/gx_selftest.nro NOICON NONACP)
+  if(TARGET dkgl)
+    # SMS_SWITCH_RENDERER=deko3d runs the self-test on dkgl
+    # deko3d's checked build: it reports misuse in the log (dkgl's debug callback)
+    target_link_libraries(gx_selftest PRIVATE dkgl ${SMS_SWITCH_DEKO3DD})
+    target_link_options(gx_selftest PRIVATE ${SMS_SWITCH_DKGL_WRAPS})
+    target_compile_definitions(gx_selftest PRIVATE SMS_SWITCH_DKGL=1)
+  endif()
+  # (with a NACP: emulators such as Ryubing load no NRO without one)
+  nx_generate_nacp(gx_selftest.nacp NAME "gx_selftest" AUTHOR "sms-switch" VERSION "${PROJECT_VERSION}")
+  nx_create_nro(gx_selftest OUTPUT ${CMAKE_BINARY_DIR}/gx_selftest.nro NACP gx_selftest.nacp)
 endif()

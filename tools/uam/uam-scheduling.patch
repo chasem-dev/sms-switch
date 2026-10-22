@@ -1,0 +1,45 @@
+uam's Maxwell scheduler (Mesa 19's nv50_ir, SchedDataCalculatorGM107): the
+stall of a block's last instruction when it sets a barrier.
+
+A barrier becomes active a cycle after the instruction that sets it, so an
+instruction followed by one waiting on its barrier must stall 2 cycles.
+Every block but the first starts by waiting on all six barriers, but
+setDelay() looked at the next block's first instruction before visit() had
+reached that block: its sched word was still whatever the instruction's
+memory held (Instruction::init never set it). The stall was then 2 or not by
+chance, so the same shader compiled differently from run to run, and on the
+console the next block could read a register its load had not written yet
+(the GPU, not emulators, keeps these timings). Now the next block's first
+instruction counts as waiting on every barrier, and sched (and serial) start
+at 0.
+
+diff --git a/mesa-imported/codegen/nv50_ir.cpp b/mesa-imported/codegen/nv50_ir.cpp
+index a7adec0..f616d8d 100644
+--- a/mesa-imported/codegen/nv50_ir.cpp
++++ b/mesa-imported/codegen/nv50_ir.cpp
+@@ -590,6 +590,9 @@ void Instruction::init()
+    predSrc = -1;
+    flagsDef = -1;
+    flagsSrc = -1;
++
++   serial = 0;
++   sched = 0;
+ }
+ 
+ Instruction::Instruction()
+diff --git a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+index 04717c8..8114d25 100644
+--- a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
++++ b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+@@ -4122,7 +4122,10 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+       if (!next) {
+          delay = 0x2;
+       } else {
+-         int wt = getWtDepBar(next);
++         // The first instruction of another block waits on every barrier
++         // (visit() emits that when it reaches the block, so its sched is
++         // not set yet here).
++         int wt = next->bb != insn->bb ? 0x3f : getWtDepBar(next);
+          if ((wt & (1 << wr)) | (wt & (1 << rd)))
+             delay = 0x2;
+       }

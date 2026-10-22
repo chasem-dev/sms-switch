@@ -8,6 +8,8 @@
 //   settings.txt, bindings.txt
 //   save/    memory card files      cache/   shader cache
 //   sms.log  the port's log (stderr), unless started with nxlink
+//   (tools/switch-dev.py run --file sends other files here as it starts;
+//   dev_link.cpp)
 #include <switch.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -20,7 +22,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string>
+#include "dev_link.h"
 #include "low_memory.h"
+#ifdef SMS_SWITCH_DKGL
+#include "dkgl/dkgl.h"
+#endif
 
 // The program's name and title (CMakeLists.txt): sms and Super Mario Sunshine,
 // or sms-eclipse and Super Mario Eclipse.
@@ -38,7 +44,15 @@ extern "C" const unsigned long sms_switch_prompts_png_size;
 extern "C" int __system_argc; // libnx's argv, before main
 extern "C" char** __system_argv;
 extern "C" void sms_switch_spread_main_thread(void); // performance.cpp
-extern "C" void sms_switch_start_clocks(void);
+extern "C" void sms_switch_start_profiler(void);     // profiler.cpp
+extern "C" void sms_switch_diagnostics_start(void);  // diagnostics.cpp
+extern "C" void GXPC_SetBuildLabel(const char* label, double seconds); // sms_gx
+
+// The build's name (build.sh: git describe, + when built with uncommitted
+// changes, and the date), the log's first line and on the screen at start.
+#ifndef SMS_SWITCH_BUILD_NAME
+#define SMS_SWITCH_BUILD_NAME "unknown"
+#endif
 
 // A line in the emulator's or debugger's log, before stderr is set up.
 void sms_switch_trace(const char* text)
@@ -103,7 +117,7 @@ void load_env_file(const std::string& path)
 		for (size_t n = strlen(s); n && (s[n - 1] == ' ' || s[n - 1] == '\t');)
 			s[--n] = 0;
 		setenv(s, value, 1);
-		fprintf(stderr, "[switch] env.txt: %s=%s\n", s, value);
+		fprintf(stderr, "[switch] %s: %s=%s\n", path.substr(path.find_last_of('/') + 1).c_str(), s, value);
 	}
 	fclose(f);
 }
@@ -193,6 +207,8 @@ bool settings_has(const std::string& dir, const char* name)
 // disc path.
 void take_env_arguments()
 {
+	if (!__system_argv)
+		return;  // no arguments at all (see __wrap_main)
 	int out = 1;
 	for (int i = 1; i < __system_argc; i++) {
 		char* a = __system_argv[i];
@@ -263,6 +279,8 @@ void write_prompts(const std::string& dir)
 
 void log_layout()
 {
+	fprintf(stderr, "[switch] sms-switch %s\n", SMS_SWITCH_BUILD_NAME);
+	GXPC_SetBuildLabel("sms-switch " SMS_SWITCH_BUILD_NAME, 10.0);
 	const LowMemoryInfo* m = sms_switch_low_memory();
 	fprintf(stderr, "[switch] image at 0x%lx (%lu KiB)%s, loaded at 0x%lx\n", (unsigned long)m->image_base,
 	        (unsigned long)(m->image_size >> 10), m->image_moved ? ", moved below 4 GiB" : "",
@@ -292,8 +310,10 @@ __attribute__((constructor(101))) static void switch_start(void)
 	mkdir(g_dir.c_str(), 0777);
 	chdir(g_dir.c_str());
 
+	// tools/switch-dev.py's link (its files written here first), else nxlink -s
+	g_nxlink_socket = sms_dev_link_start(g_dir);
 	extern struct in_addr __nxlink_host;
-	if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault()))
+	if (g_nxlink_socket < 0 && __nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault()))
 		g_nxlink_socket = nxlinkStdio();
 	if (g_nxlink_socket < 0 && !freopen((g_dir + "/sms.log").c_str(), "w", stderr)) {
 		char line[600];
@@ -305,11 +325,30 @@ __attribute__((constructor(101))) static void switch_start(void)
 	log_layout();
 
 	load_env_file(g_dir + "/env.txt");
+	// the graphics preset last chosen in the game (L3 + D-pad Right, gx_platform.cpp
+	// in sms-port): after env.txt, before the launch arguments
+	load_env_file(g_dir + "/graphics.txt");
 	take_env_arguments();
-	// Gameplay at the GameCube's 30 fps unless settings.txt or env.txt asks
-	// for 60 or 120 (the PC port's default is 60, twice the work per second).
+	// SMS_SWITCH_NO_AUTOSLEEP=1 (tools/switch-dev.py's runs): the console's
+	// Auto-Sleep off, handheld and TV, as System Settings > Sleep Mode sets it
+	// (and sets it back): asleep, the console turns Wi-Fi off and the PC
+	// cannot reach it
+	if (const char* e = getenv("SMS_SWITCH_NO_AUTOSLEEP"); e && atoi(e) && R_SUCCEEDED(setsysInitialize())) {
+		SetSysSleepSettings sleep;
+		if (R_SUCCEEDED(setsysGetSleepSettings(&sleep)) &&
+		    (sleep.handheld_sleep_plan != SetSysHandheldSleepPlan_Never ||
+		     sleep.console_sleep_plan != SetSysConsoleSleepPlan_Never)) {
+			sleep.handheld_sleep_plan = SetSysHandheldSleepPlan_Never;
+			sleep.console_sleep_plan = SetSysConsoleSleepPlan_Never;
+			const Result r = setsysSetSleepSettings(&sleep);
+			fprintf(stderr, "[switch] auto-sleep set to never: 0x%x\n", (unsigned)r);
+		}
+		setsysExit();
+	}
+	// Gameplay at 60 fps unless settings.txt or env.txt asks for 30 (the
+	// GameCube's, half the work per second) or 120.
 	if (!getenv("SMS_FRAME_RATE") && !settings_has(g_dir, "frame_rate"))
-		setenv("SMS_FRAME_RATE", "30", 1);
+		setenv("SMS_FRAME_RATE", "60", 1);
 	// The screen is 16:9: a wider view, with the menus kept 4:3 in the
 	// middle (widescreen = off in settings.txt for the original 4:3).
 	if (!getenv("SMS_WIDESCREEN") && !settings_has(g_dir, "widescreen"))
@@ -351,12 +390,18 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// stage load) stalled a load for 6 s. Serial: a stage's own programs, and
 	// extras only within 250 ms.
 	setenv("SMS_GX_SHADER_WARMUP_SERIAL", "1", 0);
+	// The graphics worker (sms-port's gx_thread.h): the GX front end on a core
+	// of its own, a few fps more where the CPU is the limit (2x, the HD pack)
+	// for about a frame more input latency; testers found it much smoother.
+	// SMS_GX_THREAD=0 in env.txt turns it off.
+	setenv("SMS_GX_THREAD", "1", 0);
 	// HD texture packs (mods/textures here): at most 1 GiB resident, not the
 	// PC's 1.5 GiB; the console has about 3 GiB for everything.
 	if (!getenv("SMS_TEXTURE_PACK_MB") && !settings_has(g_dir, "texture_pack_mb"))
 		setenv("SMS_TEXTURE_PACK_MB", "1024", 1);
 	sms_switch_spread_main_thread();
-	sms_switch_start_clocks();
+	sms_switch_start_profiler();
+	sms_switch_diagnostics_start();
 	if (applet_mode()) {
 		const char* allow = getenv("SMS_SWITCH_ALLOW_APPLET");
 		fprintf(stderr, "[switch] started in applet mode (applet type %d)%s\n", (int)appletGetAppletType(),
@@ -372,6 +417,11 @@ __attribute__((constructor(101))) static void switch_start(void)
 	setenv("SMS_FULLSCREEN", "1", 0);
 	setenv("XDG_DATA_HOME", (g_dir + "/save").c_str(), 0);
 	setenv("XDG_CACHE_HOME", (g_dir + "/cache").c_str(), 0);
+#ifdef SMS_SWITCH_DKGL
+	// the deko3d renderer's compiled programs (SMS_SWITCH_RENDERER=deko3d):
+	// the pack of the known ones (tools/dkgl/make-pack), then those made here
+	dkgl::setShaderCache((g_dir + "/cache/dkgl").c_str(), (g_dir + "/dkgl-programs.pack").c_str());
+#endif
 	if (!getenv("SMS_DISC_IMAGE") && !getenv("SMS_DISC_ROOT")) {
 		// sms-standalone.nro carries the image in its RomFS; else the SD card.
 		std::string disc = find_bundled_disc_image();
@@ -390,6 +440,12 @@ __attribute__((constructor(101))) static void switch_start(void)
 	// A program without one of its own (Super Mario Eclipse) reads the one in
 	// Sunshine's sms-standalone.nro, beside it or in sdmc:/switch/sms/: the
 	// same textures, without a second 1.4 GB copy on the card.
+	// SMS_TEXTURE_PACKS=0 starts with the packs off but still finds them, so
+	// the game's graphics presets can turn them on.
+	if (const char* e = getenv("SMS_TEXTURE_PACKS"); e && !strcmp(e, "0")) {
+		setenv("SMS_TEXTURE_PACKS_ACTIVE", "0", 0);
+		unsetenv("SMS_TEXTURE_PACKS");
+	}
 	if (!getenv("SMS_TEXTURE_PACKS")) {
 		auto is_dir = [](const char* dir) {
 			struct stat st;
@@ -424,8 +480,21 @@ extern "C" void NX_NORETURN __libnx_exit(int rc)
 	snprintf(line, sizeof line, "[switch] exit %d", rc);
 	sms_switch_trace(line);
 	fflush(NULL);
-	if (g_nxlink_socket >= 0)
-		close(g_nxlink_socket);
+	sms_dev_link_end(g_nxlink_socket);
 	__appExit();
 	svcExitProcess();
+}
+
+// main, with an argument list even from a loader that passes none (Ryubing
+// starts an NRO with argv NULL): just the program's name, as the port
+// expects (-Wl,--wrap=main).
+extern "C" int __real_main(int argc, char** argv);
+extern "C" int __wrap_main(int argc, char** argv)
+{
+	if (!argv) {
+		static char name[] = SMS_SWITCH_APP ".nro";
+		static char* args[2] = {name, NULL};
+		return __real_main(1, args);
+	}
+	return __real_main(argc, argv);
 }
