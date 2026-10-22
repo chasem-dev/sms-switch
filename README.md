@@ -5,8 +5,7 @@ The [Super Mario Sunshine PC port](https://github.com/chasem-dev/sms-pc-port) bu
 No game data is included.
 Like the PC port, it reads the models, textures, levels, music and movies from **your own disc image** (GMSE01, North America, Rev 0) at run time.
 
-**Status: early.** It builds, and in an emulator (Eden) it boots, plays the opening logos, and renders through the Switch's OpenGL stack.
-It has not been run on a console yet; see [Status](#status).
+**Status: playable on a console**, at 60 fps at the console's own clocks at 1x and 2x internal resolution with the deko3d renderer; see [Status](#status).
 
 ## Build
 
@@ -78,7 +77,13 @@ Everything else lives in the same folder:
 | `env.txt` | `NAME=value` lines set as environment variables, for the PC port's switches (`SMS_SKIP_MOVIES=1`, `SMS_OVERLAY=1`, `SMS_FRAME_RATE=30`, ...) |
 | `save/sms-port/card-a/` | the memory card |
 | `cache/` | the shader cache |
-| `sms.log` | the log of the last run (or the nxlink console, when started with `nxlink -s`) |
+| `sms.log` | the log of the last run (or the nxlink console, when started with `nxlink -s`); its first line names the build, which the screen also shows in its lower-left corner for the first 10 seconds |
+| `dkgl-programs.pack`, `env.txt`'s `SMS_SWITCH_RENDERER=deko3d` | the deko3d renderer (below) and its shaders compiled ahead of time; releases' `sms-switch-deko3d.zip` has both |
+
+**Renderers.** `SMS_SWITCH_RENDERER=deko3d` in `env.txt` draws through deko3d, the Switch's own GPU API (dkgl, `switch/src/dkgl/`), with `dkgl-programs.pack` beside the NRO so that no shader compiles while you play; without that line the game draws through Mesa's OpenGL, as before.
+
+**Bug reports:** attach `sms.log`, and after a crash the newest file in `sdmc:/atmosphere/crash_reports/`.
+The log has a `[mem]` line every 10 seconds (`SMS_MEM_LOG=seconds`, 0 for none), and on a crash the error, the registers and the return addresses as offsets into `sms.elf`; a GPU error is described with the memory it concerns.
 
 The game fills the screen (720p handheld, 1080p docked) in 16:9 widescreen at 60 fps, with the gameplay HUD at the screen's edges and the camera stick inverted on both axes; `settings.txt` changes any of that (`widescreen = off` for the original 4:3, `widescreen_hud = centre`, `frame_rate = 30`, `camera_invert_x = 0`, `camera_invert_y = 0`).
 Button prompts in the game's text show the Switch's buttons (`button_prompts = gamecube` for the game's own); the images are `prompts/switch.png` beside the NRO, written there on the first start, and can be replaced (eight 64x64 icons in a row: A B X Y Z L R C-stick, here A B X Y R ZL ZR and the right stick; `tools/make_prompts.py` draws the default).
@@ -141,6 +146,9 @@ What the Switch build does about it:
 - **Threads** (`switch/src/performance.cpp`): the game's thread starts on core 0, the GL thread on core 1 and the rest on core 2 or 0, each free to move to any of the three; the texture pack's background work runs below the game's priority, since Horizon does not share a core between threads of equal priority by time.
   The CPU and GPU run at the console's own clocks; the port never raises them.
 - **Widescreen** draws are placed without scanning their vertices over and over (`patches/sms-port/0006`, from the Android build).
+- **The deko3d renderer** (`SMS_SWITCH_RENDERER=deko3d`): the GL calls go to deko3d directly instead of through Mesa, about half the GL thread's time.
+- **The graphics worker** (`SMS_GX_THREAD`, on by default): the game's GX calls only write the command stream, and a thread of its own on another core parses it into draws, so the game's code and the GX front end run side by side; a few fps more where the CPU is the limit (2x, the HD pack), for about a frame more input latency.
+  `SMS_GX_THREAD=0` in `env.txt` turns it off.
 
 To see where a frame's time goes, show the overlay (L3 + R3): `game`, `GX`, `present`, `swap` and `idle` are the game thread's milliseconds per frame, and `GL thread: busy` the GL thread's (`swapping` is the part of it in `SDL_GL_SwapWindow`, which waits for the display and the GPU).
 With the swap queued, `swap` on the game thread is its wait for the GL thread to finish the last frame: high there means the GL thread is the limit, high `game` that the game's own code is.
@@ -162,8 +170,9 @@ This repository adds what the Switch needs:
   - `src/stack_switch.cpp`: libnx maps every thread's stack again above 4 GiB, so threads that run game code switch onto their low stacks (as the 64-bit Windows build does).
   - `src/posix_shims.cpp`, `include/`: what newlib lacks (`dlsym` over the static SDL2, `backtrace`, `pread`, `sysconf`, ...).
   - `src/switch_main.cpp`: paths, the log, `env.txt`, the disc image search, exit.
-- **Graphics**: the PC renderer unchanged in kind: OpenGL 3.3 core through SDL2 on devkitPro's Mesa (nouveau, OpenGL 4.3 on the Tegra X1).
-  The GX shaders are generated at run time, which rules out deko3d without a shader compiler in the game.
+- **Graphics**: the PC renderer unchanged in kind, OpenGL 3.3 core through SDL2, on devkitPro's Mesa (nouveau, OpenGL 4.3 on the Tegra X1) or on dkgl (`switch/src/dkgl/`), the GL calls the renderer makes implemented on deko3d.
+  The GX shaders are generated at run time, so dkgl compiles them in the game with uam (deko3d's shader compiler, `tools/uam/build-uam.sh`, built as a library), and `dkgl-programs.pack` (`tools/dkgl/make-pack.sh`) has every known one compiled ahead of time.
+  deko3d is built from source with fixes (`tools/deko3d/build-deko3d.sh`, `tools/deko3d/*.patch`); without `build/uam/` the build has Mesa's GL only, as GitHub Actions' does.
 
 ## HD textures
 
@@ -228,9 +237,10 @@ Verified in Eden 0.2.1 on this machine:
 - disc, memory card, audio (DSP HLE), threads and the OpenGL 4.3 context come up;
 - the opening logos render, the same picture as the PC build (compared by eye at field 300), full screen at 1080p.
 
+On consoles, at the console's own clocks: the game plays at 60 fps with the deko3d renderer and the graphics worker at 1x and 2x internal resolution (Delfino Plaza, Bianco Hills; 2x with the HD pack about 58 to 60), and a tester's console ran it for over an hour without a crash.
+
 Not yet:
 
-- **A console.** Nothing here has run on hardware: performance (four 1 GHz Cortex-A57 cores), memory in practice, controllers (SDL's Joy-Con/Pro Controller mapping) and docked/handheld switching are untested.
 - **Further in the emulator.** Past the logos Eden stops with `PRET flow analysis is not implemented`: Mesa's nouveau compiles some shader as a subroutine call, which Nintendo's compiler never emits and Eden cannot translate.
   Which shader that is was not found yet; the console runs such code natively.
 - Leaving to the homebrew menu instead of ending the process (the game's threads and the low windows would have to be torn down first).
